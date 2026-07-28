@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -18,7 +19,7 @@ type Source struct {
 	Platform            string     `json:"platform"`
 	BaseURL             string     `json:"baseUrl"`
 	Status              string     `json:"status"`
-	AssetMode           string     `json:"assetMode"`
+	ValueDivisor        float64    `json:"valueDivisor"`
 	UsernameHint        string     `json:"usernameHint"`
 	Version             string     `json:"version"`
 	ScanIntervalSeconds int        `json:"scanIntervalSeconds"`
@@ -38,7 +39,7 @@ type sourceCredentials struct {
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.status,s.asset_mode,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
+	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.status,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
 		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id) FROM sources s ORDER BY s.created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -49,7 +50,7 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		var item Source
 		var lastScan sql.NullTime
 		var balance sql.NullFloat64
-		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.Status, &item.AssetMode, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.Status, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount); err != nil {
 			return nil, err
 		}
 		if lastScan.Valid {
@@ -65,8 +66,9 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 
 func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	var input struct {
-		Name, Platform, Type, BaseURL, Username, Password, AssetMode string
-		ScanIntervalSeconds                                          int
+		Name, Platform, Type, BaseURL, Username, Password string
+		ValueNumerator, ValueDenominator                  float64
+		ScanIntervalSeconds                               int
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		return err
@@ -89,26 +91,92 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	assetMode := strings.ToUpper(input.AssetMode)
-	if assetMode != "PRODUCTION" {
-		assetMode = "OBSERVE"
+	divisor, err := sourceValueDivisor(input.ValueNumerator, input.ValueDenominator)
+	if err != nil {
+		return err
 	}
 	interval := input.ScanIntervalSeconds
 	if interval < 60 {
 		interval = 900
 	}
 	id := uuid.NewString()
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,asset_mode,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, strings.TrimSpace(input.Name), platform, baseURL, assetMode, credential, mask(input.Username), interval)
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,value_divisor,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, strings.TrimSpace(input.Name), platform, baseURL, divisor, credential, mask(input.Username), interval)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") {
 			return &apiError{409, "SOURCE_ALREADY_EXISTS", "该平台地址已添加"}
 		}
 		return err
 	}
-	a.audit(r.Context(), "CREATE", "source", id, map[string]any{"name": input.Name, "platform": platform, "base_url": baseURL})
+	a.audit(r.Context(), "CREATE", "source", id, map[string]any{"name": input.Name, "platform": platform, "base_url": baseURL, "value_divisor": divisor})
 	go a.scanSource(context.Background(), id)
 	writeData(w, map[string]any{"id": id, "status": "ACCEPTED"})
 	return nil
+}
+
+func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) error {
+	var input struct {
+		Name                             string
+		ValueNumerator, ValueDenominator float64
+		ScanIntervalSeconds              int
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	if strings.TrimSpace(input.Name) == "" {
+		return &apiError{400, "INVALID_INPUT", "请填写数据源名称"}
+	}
+	divisor, err := sourceValueDivisor(input.ValueNumerator, input.ValueDenominator)
+	if err != nil {
+		return err
+	}
+	if input.ScanIntervalSeconds < 60 {
+		input.ScanIntervalSeconds = 900
+	}
+
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var oldDivisor float64
+	if err = tx.QueryRowContext(r.Context(), `SELECT value_divisor FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&oldDivisor); err == sql.ErrNoRows {
+		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
+	} else if err != nil {
+		return err
+	}
+	scale := oldDivisor / divisor
+	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET name=$2,value_divisor=$3,scan_interval_seconds=$4,balance=balance*$5,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name), divisor, input.ScanIntervalSeconds, scale); err != nil {
+		return err
+	}
+	if oldDivisor != divisor {
+		if _, err = tx.ExecContext(r.Context(), `UPDATE source_groups SET multiplier=multiplier*$2 WHERE source_id=$1 AND multiplier IS NOT NULL`, id, scale); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(r.Context(), `UPDATE group_samples SET multiplier=multiplier*$2,balance=balance*$2 WHERE source_id=$1`, id, scale); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	a.audit(r.Context(), "UPDATE", "source", id, map[string]any{"name": strings.TrimSpace(input.Name), "value_divisor": divisor, "previous_value_divisor": oldDivisor})
+	go a.scanSource(context.Background(), id)
+	writeData(w, map[string]any{"id": id, "valueDivisor": divisor, "status": "ACCEPTED"})
+	return nil
+}
+
+func sourceValueDivisor(numerator, denominator float64) (float64, error) {
+	if numerator == 0 && denominator == 0 {
+		return 1, nil
+	}
+	if numerator <= 0 || denominator <= 0 {
+		return 0, &apiError{400, "INVALID_VALUE_RATIO", "余额/倍率换算比例必须大于 0"}
+	}
+	divisor := denominator / numerator
+	if math.IsNaN(divisor) || math.IsInf(divisor, 0) || divisor <= 0 || divisor > 1e9 {
+		return 0, &apiError{400, "INVALID_VALUE_RATIO", "余额/倍率换算比例无效"}
+	}
+	return divisor, nil
 }
 
 func mask(value string) string {
@@ -122,7 +190,7 @@ func mask(value string) string {
 func (a *App) sourceCredentials(ctx context.Context, id string) (Source, sourceCredentials, error) {
 	var source Source
 	var encrypted []byte
-	err := a.db.QueryRowContext(ctx, `SELECT id,name,platform,base_url,status,asset_mode,credential_cipher,scan_interval_seconds FROM sources WHERE id=$1`, id).Scan(&source.ID, &source.Name, &source.Platform, &source.BaseURL, &source.Status, &source.AssetMode, &encrypted, &source.ScanIntervalSeconds)
+	err := a.db.QueryRowContext(ctx, `SELECT id,name,platform,base_url,status,value_divisor,credential_cipher,scan_interval_seconds FROM sources WHERE id=$1`, id).Scan(&source.ID, &source.Name, &source.Platform, &source.BaseURL, &source.Status, &source.ValueDivisor, &encrypted, &source.ScanIntervalSeconds)
 	if err == sql.ErrNoRows {
 		return source, sourceCredentials{}, &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 	}
@@ -255,6 +323,22 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 		return err
 	}
 	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, `SELECT value_divisor FROM sources WHERE id=$1 FOR UPDATE`, source.ID).Scan(&source.ValueDivisor); err != nil {
+		return err
+	}
+	if source.ValueDivisor <= 0 {
+		source.ValueDivisor = 1
+	}
+	for index := range groups {
+		if groups[index].Multiplier != nil {
+			value := *groups[index].Multiplier / source.ValueDivisor
+			groups[index].Multiplier = &value
+		}
+	}
+	if balance != nil {
+		value := *balance / source.ValueDivisor
+		balance = &value
+	}
 	for _, item := range groups {
 		var groupID string
 		err = tx.QueryRowContext(ctx, `INSERT INTO source_groups(source_id,remote_id,name,multiplier,models,captured_at) VALUES($1,$2,$3,$4,$5,now()) ON CONFLICT(source_id,remote_id) DO UPDATE SET name=excluded.name,multiplier=excluded.multiplier,models=excluded.models,captured_at=now() RETURNING id`, source.ID, item.RemoteID, item.Name, item.Multiplier, jsonValue(item.Models)).Scan(&groupID)

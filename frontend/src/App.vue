@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   Activity, AlertTriangle, BarChart3, Bot, Check, ChevronRight, CircleDollarSign, ClipboardList,
-  Database, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Play, Plus,
+  Database, FileClock, Gauge, History, KeyRound, Layers3, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
 import ModalShell from './components/ModalShell.vue'
@@ -31,6 +31,7 @@ const nav = [
 ]
 const routeNames = Object.fromEntries(nav.flatMap(group => group.items.map(([path,label]) => [path,label])))
 const pageTitle = computed(() => routeNames[route.value] || '渠道管家')
+const pageIcon = computed(() => nav.flatMap(group => group.items).find(([path]) => path === route.value)?.[2] || Gauge)
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
 
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/overview'; mobileOpen.value = false })
@@ -82,7 +83,9 @@ async function loadPage(){
 function open(name, initial={}){Object.keys(form).forEach(key=>delete form[key]);Object.assign(form,initial);modal.value=name;clearMessages()}
 function close(){modal.value='';sourceDetail.value=null;selectedSource.value='';targetGroups.value=[]}
 async function submit(action, success){loading.value=true;clearMessages();try{await action();notice.value=success;close();await loadPage()}catch(reason){showError(reason)}finally{loading.value=false}}
-async function createSource(){await submit(()=>api('/sources',{method:'POST',body:body({name:form.name,platform:form.platform,baseURL:form.baseURL,username:form.username,password:form.password,assetMode:form.assetMode,scanIntervalSeconds:Number(form.interval||900)})}),'数据源已保存，首次扫描已开始')}
+async function createSource(){await submit(()=>api('/sources',{method:'POST',body:body({name:form.name,platform:form.platform,baseURL:form.baseURL,username:form.username,password:form.password,valueNumerator:Number(form.valueNumerator),valueDenominator:Number(form.valueDenominator),scanIntervalSeconds:Number(form.interval||900)})}),'数据源已保存，首次扫描已开始')}
+function editSource(row){open('source-edit',{id:row.id,name:row.name,baseURL:row.baseUrl,valueNumerator:1,valueDenominator:Number(row.valueDivisor||1),interval:row.scanIntervalSeconds||900})}
+async function updateSource(){await submit(()=>api(`/sources/${form.id}`,{method:'PATCH',body:body({name:form.name,valueNumerator:Number(form.valueNumerator),valueDenominator:Number(form.valueDenominator),scanIntervalSeconds:Number(form.interval||900)})}),'数据源设置已更新，余额与倍率已按新比例重算')}
 async function viewSource(id){selectedSource.value=id;loading.value=true;try{sourceDetail.value=await api(`/sources/${id}`);modal.value='source-detail'}catch(reason){showError(reason)}finally{loading.value=false}}
 async function addKey(){await submit(()=>api(`/sources/${selectedSource.value}/keys`,{method:'POST',body:body({name:form.name,apiKey:form.apiKey,productionAuthorized:!!form.productionAuthorized,concurrency:Number(form.concurrency||1)})}),'Key 已保存')}
 async function createTarget(){await submit(()=>api('/targets',{method:'POST',body:body({name:form.name,baseURL:form.baseURL,username:form.username,password:form.password,writeEnabled:!!form.writeEnabled})}),'目标节点已保存并开始同步')}
@@ -113,17 +116,18 @@ async function rescanSource(row){await action(()=>api(`/sources/${row.id}/scan`,
 async function syncTarget(row){await action(()=>api(`/targets/${row.id}/test-connection`,{method:'POST'}),'同步任务已提交')}
 
 function statusTone(value){if(['ACTIVE','ONLINE','HEALTHY','SUCCESS','EXECUTED','RESOLVED','SYNCED'].includes(value))return'success';if(['FAILED','OFFLINE','QUARANTINED','CREDENTIAL_BLOCKED','P0','P1'].includes(value))return'danger';if(['PENDING','VALIDATING','SUSPECT','ACKNOWLEDGED','DRAFT'].includes(value))return'warning';return'neutral'}
-function statusText(value){return {ACTIVE:'启用',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',PENDING:'待审批',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',OBSERVE:'观察',PRODUCTION:'生产',SUCCESS:'成功',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
+function statusText(value){return {ACTIVE:'启用',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',PENDING:'待审批',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',SUCCESS:'成功',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
 function date(value){return value?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)):'--'}
 function money(value){return value==null?'--':`$${Number(value).toFixed(2)}`}
 function ratio(value){return value==null?'--':`${Number(value).toFixed(4)}x`}
+function valueRatio(value){return `1 : ${Number(value||1).toLocaleString('zh-CN',{maximumFractionDigits:8,useGrouping:false})}`}
 function minimumRatio(items){const values=items.map(item=>Number(item.multiplier)).filter(value=>Number.isFinite(value));return values.length?Math.min(...values):null}
 </script>
 
 <template>
   <div v-if="!token" class="login-page">
     <section class="login-panel">
-      <div class="brand brand-login"><span class="brand-mark"><BarChart3 :size="20" /></span><div><strong>渠道管家</strong><small>Sub2API Control Plane</small></div></div>
+      <div class="brand brand-login"><span class="brand-mark"><Layers3 :size="22" /></span><div><strong>渠道管家</strong><small>Channel Control Plane</small></div></div>
       <form class="login-form" @submit.prevent="login">
         <header><h1>管理员登录</h1></header>
         <label><span>邮箱</span><input name="email" type="email" autocomplete="username" required autofocus /></label>
@@ -132,19 +136,19 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <button class="btn primary full" :disabled="loading"><span v-if="loading" class="spinner" />登录</button>
       </form>
     </section>
-    <aside class="login-scene"><div class="scene-grid"/><div class="scene-copy"><ShieldCheck :size="34"/><strong>生产安全控制面</strong><span>采集、判定与执行彼此隔离</span></div></aside>
+    <aside class="login-scene" aria-hidden="true"><div class="scene-copy"><ShieldCheck :size="34"/><strong>生产安全控制面</strong><span>采集、判定与执行彼此隔离</span></div></aside>
   </div>
 
   <div v-else class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><span class="brand-mark"><BarChart3 :size="18" /></span><div><strong>渠道管家</strong><small>v{{ data.summary.version || data.settings.version || '0.1.0' }}</small></div></div>
+      <div class="brand"><span class="brand-mark"><Layers3 :size="19" /></span><div><strong>渠道管家</strong><small>v{{ data.summary.version || data.settings.version || '0.1.0' }}</small></div></div>
       <nav>
         <section v-for="group in nav" :key="group.label"><label>{{ group.label }}</label><a v-for="([path,label,Icon]) in group.items" :key="path" :href="`#${path}`" :class="{active:route===path}"><component :is="Icon" :size="18"/><span>{{ label }}</span><ChevronRight :size="14" /></a></section>
       </nav>
-      <div class="sidebar-foot"><span class="online-dot" />控制面在线<button class="icon-btn" title="退出登录" @click="logout()"><LogOut :size="17" /></button></div>
+      <div class="sidebar-foot"><span class="sidebar-avatar">{{ (operator?.email||'管').slice(0,1).toUpperCase() }}</span><span class="sidebar-user-copy"><strong>{{ operator?.email||'管理员' }}</strong><small><i class="online-dot"/>管理员 · 在线</small></span><button class="icon-btn" title="退出登录" @click="logout()"><LogOut :size="17" /></button></div>
     </aside>
     <section class="workspace">
-      <header class="topbar"><button class="icon-btn mobile-menu" title="打开导航" @click="mobileOpen=true"><Menu :size="19" /></button><div><small>SUB2API / CHANNEL MANAGE</small><strong>{{ pageTitle }}</strong></div><div class="top-actions"><label class="search"><Search :size="16"/><input v-model="search" placeholder="筛选当前列表" /></label><button class="icon-btn" title="刷新" @click="loadPage"><RefreshCw :size="18" /></button><button class="account-button" title="修改账号与密码" @click="open('account',{email:operator?.email||''})"><UserCog :size="17"/><span>{{ operator?.email||'账号设置' }}</span></button></div></header>
+      <header class="topbar"><button class="icon-btn mobile-menu" title="打开导航" @click="mobileOpen=true"><Menu :size="19" /></button><div class="topbar-title"><component :is="pageIcon" :size="18"/><strong>{{ pageTitle }}</strong></div><div class="top-actions"><label class="search"><Search :size="16"/><input v-model="search" placeholder="筛选当前列表" /></label><button class="icon-btn" title="刷新" @click="loadPage"><RefreshCw :size="18" /></button><button class="account-button" title="修改账号与密码" @click="open('account',{email:operator?.email||''})"><span class="account-avatar">{{ (operator?.email||'管').slice(0,1).toUpperCase() }}</span><span class="account-copy"><strong>{{ operator?.email||'账号设置' }}</strong><small>管理员</small></span><ChevronRight :size="14"/></button></div></header>
       <main>
         <div v-if="notice" class="message success"><Check :size="16"/>{{ notice }}</div><div v-if="error" class="message error"><AlertTriangle :size="16"/>{{ error }}</div>
         <template v-if="route==='/overview'">
@@ -156,9 +160,9 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         </template>
 
         <template v-else-if="route==='/sources'">
-          <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',assetMode:'OBSERVE',interval:900})"><Plus :size="16"/>接入数据源</button></div>
-          <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API'})"><Plus :size="16"/>接入数据源</button></StateBlock>
-          <div v-else class="table-wrap"><table><thead><tr><th>平台</th><th>类型</th><th>资产模式</th><th>连接</th><th>余额</th><th>分组 / Key</th><th>上次扫描</th><th></th></tr></thead><tbody><tr v-for="row in filtered(data.sources)" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td><span :class="['badge',statusTone(row.assetMode)]">{{ statusText(row.assetMode) }}</span></td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td>{{ row.groupCount }} / {{ row.keyCount }}</td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div>
+          <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></div>
+          <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></StateBlock>
+          <div v-else class="table-wrap"><table><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额</th><th>分组 / Key</th><th>上次扫描</th><th></th></tr></thead><tbody><tr v-for="row in filtered(data.sources)" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td>{{ row.groupCount }} / {{ row.keyCount }}</td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div>
         </template>
 
         <template v-else-if="route==='/market'">
@@ -209,10 +213,11 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         </template>
       </main>
     </section>
-    <button v-if="mobileOpen" class="mobile-backdrop" title="关闭导航" @click="mobileOpen=false"/><aside v-if="mobileOpen" class="mobile-drawer"><header class="brand"><span class="brand-mark"><BarChart3 :size="18"/></span><strong>渠道管家</strong><button class="icon-btn" title="关闭" @click="mobileOpen=false"><X :size="18"/></button></header><nav><section v-for="group in nav" :key="group.label"><label>{{ group.label }}</label><a v-for="([path,label,Icon]) in group.items" :key="path" :href="`#${path}`" :class="{active:route===path}"><component :is="Icon" :size="18"/>{{ label }}</a></section></nav></aside>
+    <button v-if="mobileOpen" class="mobile-backdrop" title="关闭导航" @click="mobileOpen=false"/><aside v-if="mobileOpen" class="mobile-drawer"><header class="brand"><span class="brand-mark"><Layers3 :size="19"/></span><strong>渠道管家</strong><button class="icon-btn" title="关闭" @click="mobileOpen=false"><X :size="18"/></button></header><nav><section v-for="group in nav" :key="group.label"><label>{{ group.label }}</label><a v-for="([path,label,Icon]) in group.items" :key="path" :href="`#${path}`" :class="{active:route===path}"><component :is="Icon" :size="18"/>{{ label }}</a></section></nav></aside>
   </div>
 
-  <ModalShell v-if="modal==='source'" title="接入数据源" @close="close"><form class="modal-form" @submit.prevent="createSource"><label><span>平台名称</span><input v-model="form.name" required/></label><label><span>平台类型</span><select v-model="form.platform"><option value="SUB2API">Sub2API</option><option value="NEW_API">New API</option></select></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" type="url" placeholder="https://" required/></label><label><span>{{ form.platform==='SUB2API'?'管理员邮箱':'用户名' }}</span><input v-model="form.username" :type="form.platform==='SUB2API'?'email':'text'" required/></label><label><span>密码</span><input v-model="form.password" type="password" required/></label><label><span>资产模式</span><select v-model="form.assetMode"><option value="OBSERVE">观察资产</option><option value="PRODUCTION">生产资产</option></select></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存</button></footer></form></ModalShell>
+  <ModalShell v-if="modal==='source'" title="接入数据源" @close="close"><form class="modal-form" @submit.prevent="createSource"><label><span>平台名称</span><input v-model="form.name" required/></label><label><span>平台类型</span><select v-model="form.platform"><option value="SUB2API">Sub2API</option><option value="NEW_API">New API</option></select></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" type="url" placeholder="https://" required/></label><label><span>{{ form.platform==='SUB2API'?'管理员邮箱':'用户名' }}</span><input v-model="form.username" :type="form.platform==='SUB2API'?'email':'text'" required/></label><label><span>密码</span><input v-model="form.password" type="password" required/></label><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存</button></footer></form></ModalShell>
+  <ModalShell v-if="modal==='source-edit'" title="编辑数据源" @close="close"><form class="modal-form" @submit.prevent="updateSource"><label class="full"><span>平台名称</span><input v-model="form.name" required/></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" disabled/></label><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存并重算</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='source-detail'&&sourceDetail" :title="sourceDetail.source.name" wide @close="close"><div class="detail-summary"><span><b>{{ sourceDetail.groups.length }}</b>远端分组</span><span><b>{{ sourceDetail.keys.length }}</b>授权 Key</span><button class="btn primary small" @click="modal='key';Object.keys(form).forEach(k=>delete form[k])"><Plus :size="14"/>添加 Key</button></div><div class="table-wrap inner"><table><thead><tr><th>分组</th><th>远端 ID</th><th>倍率</th><th>采集时间</th></tr></thead><tbody><tr v-for="group in sourceDetail.groups" :key="group.id"><td>{{ group.name }}</td><td>{{ group.remoteId }}</td><td>{{ ratio(group.multiplier) }}</td><td>{{ date(group.capturedAt) }}</td></tr></tbody></table></div></ModalShell>
   <ModalShell v-if="modal==='key'" title="授权上游 Key" @close="close"><form class="modal-form" @submit.prevent="addKey"><label><span>Key 名称</span><input v-model="form.name" required/></label><label><span>并发额度</span><input v-model="form.concurrency" type="number" min="1" value="1"/></label><label class="full"><span>API Key</span><input v-model="form.apiKey" type="password" required/></label><label class="check-row full"><input v-model="form.productionAuthorized" type="checkbox"/><span><strong>授权进入生产候选池</strong><small>保存后将按分组生成待探测渠道</small></span></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">保存</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='target'" title="接入目标节点" @close="close"><form class="modal-form" @submit.prevent="createTarget"><label><span>节点名称</span><input v-model="form.name" required/></label><label class="full"><span>节点地址</span><input v-model="form.baseURL" type="url" placeholder="https://" required/></label><label><span>管理员邮箱</span><input v-model="form.username" type="email" required/></label><label><span>管理员密码</span><input v-model="form.password" type="password" required/></label><label class="check-row full"><input v-model="form.writeEnabled" type="checkbox"/><span><strong>允许创建和维护托管账号</strong><small>既有账号始终只读</small></span></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">保存</button></footer></form></ModalShell>

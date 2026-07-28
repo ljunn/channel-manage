@@ -103,3 +103,18 @@ func TestPercentile(t *testing.T) {
 		t.Fatalf("empty percentile=%v", got)
 	}
 }
+
+func TestSourceValueDivisor(t *testing.T) {
+	tests := []struct {
+		numerator, denominator, want float64
+	}{{0, 0, 1}, {1, 10, 10}, {2, 10, 5}, {10, 1, .1}}
+	for _, test := range tests {
+		got, err := sourceValueDivisor(test.numerator, test.denominator)
+		if err != nil || got != test.want {
+			t.Fatalf("sourceValueDivisor(%v,%v)=(%v,%v), want %v", test.numerator, test.denominator, got, err, test.want)
+		}
+	}
+	if _, err := sourceValueDivisor(1, 0); err == nil {
+		t.Fatal("zero denominator was accepted")
+	}
+}

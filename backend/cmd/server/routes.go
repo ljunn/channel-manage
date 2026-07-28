@@ -165,6 +165,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 2 && method == http.MethodGet {
 			return a.sourceDetail(w, r, id)
 		}
+		if len(parts) == 2 && method == http.MethodPatch {
+			return a.updateSource(w, r, id)
+		}
 		if len(parts) == 2 && method == http.MethodDelete {
 			return a.deleteSource(w, r, id)
 		}
