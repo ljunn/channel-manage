@@ -10,6 +10,7 @@ import StateBlock from './components/StateBlock.vue'
 
 const tokenKey = 'channel_manage_token'
 const token = ref(sessionStorage.getItem(tokenKey) || '')
+const operator = ref(null)
 const route = ref(location.hash.slice(1) || '/overview')
 const mobileOpen = ref(false)
 const loading = ref(false)
@@ -34,7 +35,7 @@ const filtered = items => !search.value ? items : items.filter(item => JSON.stri
 
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/overview'; mobileOpen.value = false })
 watch(route, () => { search.value=''; clearMessages(); if(token.value) void loadPage() })
-onMounted(() => { if (token.value) void loadPage(); else route.value='/login' })
+onMounted(async () => { if (token.value) { try { operator.value=await api('/auth/me'); await loadPage() } catch {} } else route.value='/login' })
 
 async function api(path, init={}) {
   const headers = new Headers(init.headers || {})
@@ -52,11 +53,11 @@ function body(value){ return JSON.stringify(value) }
 function clearMessages(){ notice.value=''; error.value='' }
 function showError(reason){ error.value=reason instanceof Error ? reason.message : '操作失败' }
 function go(path){ location.hash=path }
-function logout(call=true){ if(call&&token.value) void api('/auth/logout',{method:'POST'}).catch(()=>{});token.value='';sessionStorage.removeItem(tokenKey);go('/login') }
+function logout(call=true){ if(call&&token.value) void api('/auth/logout',{method:'POST'}).catch(()=>{});token.value='';operator.value=null;sessionStorage.removeItem(tokenKey);go('/login') }
 
 async function login(event){
   const values=Object.fromEntries(new FormData(event.currentTarget));loading.value=true;clearMessages()
-  try{const result=await api('/auth/login',{method:'POST',body:body(values)});token.value=result.access_token;sessionStorage.setItem(tokenKey,token.value);go('/overview');await loadPage()}
+  try{const result=await api('/auth/login',{method:'POST',body:body(values)});token.value=result.access_token;operator.value=result.operator;sessionStorage.setItem(tokenKey,token.value);go('/overview');await loadPage()}
   catch(reason){showError(reason)}finally{loading.value=false}
 }
 
@@ -98,6 +99,15 @@ async function eventAct(row,value){await action(()=>api(`/events/${row.id}/${val
 async function saveSettings(){const payload={};for(const key of ['shadow_mode','emergency_freeze','auto_approve'])payload[key]=!!data.settings[key];for(const key of ['probe_interval_seconds','scan_interval_seconds','max_daily_probe_cost_usd','min_healthy_channels','confirmation_failures','metric_window_minutes','min_error_samples','error_rate_threshold'])payload[key]=Number(data.settings[key]);await action(()=>api('/settings',{method:'PATCH',body:body(payload)}),'系统设置已保存')}
 async function createNotification(){await submit(()=>api('/notification-channels',{method:'POST',body:body({name:form.name,apiKey:form.apiKey,fromEmail:form.fromEmail,toEmail:form.toEmail})}),'通知渠道已保存')}
 async function testNotification(row){await action(()=>api(`/notification-channels/${row.id}/test`,{method:'POST'}),'测试邮件已发送')}
+async function updateAccount(){
+  clearMessages()
+  if(form.newPassword && form.newPassword!==form.confirmPassword){showError(new Error('两次输入的新密码不一致'));return}
+  loading.value=true
+  try{
+    operator.value=await api('/auth/account',{method:'PATCH',body:body({email:form.email,currentPassword:form.currentPassword,newPassword:form.newPassword||''})})
+    close();notice.value='登录账号已更新，其他会话已退出'
+  }catch(reason){showError(reason)}finally{loading.value=false}
+}
 async function runAutomation(){await action(()=>api('/automation/run',{method:'POST'}),'自动任务已提交')}
 async function rescanSource(row){await action(()=>api(`/sources/${row.id}/scan`,{method:'POST'}),'扫描任务已提交')}
 async function syncTarget(row){await action(()=>api(`/targets/${row.id}/test-connection`,{method:'POST'}),'同步任务已提交')}
@@ -134,7 +144,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
       <div class="sidebar-foot"><span class="online-dot" />控制面在线<button class="icon-btn" title="退出登录" @click="logout()"><LogOut :size="17" /></button></div>
     </aside>
     <section class="workspace">
-      <header class="topbar"><button class="icon-btn mobile-menu" title="打开导航" @click="mobileOpen=true"><Menu :size="19" /></button><div><small>SUB2API / CHANNEL MANAGE</small><strong>{{ pageTitle }}</strong></div><div class="top-actions"><label class="search"><Search :size="16"/><input v-model="search" placeholder="筛选当前列表" /></label><button class="icon-btn" title="刷新" @click="loadPage"><RefreshCw :size="18" /></button></div></header>
+      <header class="topbar"><button class="icon-btn mobile-menu" title="打开导航" @click="mobileOpen=true"><Menu :size="19" /></button><div><small>SUB2API / CHANNEL MANAGE</small><strong>{{ pageTitle }}</strong></div><div class="top-actions"><label class="search"><Search :size="16"/><input v-model="search" placeholder="筛选当前列表" /></label><button class="icon-btn" title="刷新" @click="loadPage"><RefreshCw :size="18" /></button><button class="account-button" title="修改账号与密码" @click="open('account',{email:operator?.email||''})"><UserCog :size="17"/><span>{{ operator?.email||'账号设置' }}</span></button></div></header>
       <main>
         <div v-if="notice" class="message success"><Check :size="16"/>{{ notice }}</div><div v-if="error" class="message error"><AlertTriangle :size="16"/>{{ error }}</div>
         <template v-if="route==='/overview'">
@@ -209,4 +219,5 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
   <ModalShell v-if="modal==='managed'" title="创建托管账号" @close="close"><form class="modal-form" @submit.prevent="createManaged"><label><span>目标节点</span><select v-model="form.targetID" required @change="loadTargetGroups"><option v-for="item in data.targets" :key="item.id" :value="item.id">{{ item.name }}</option></select></label><label><span>来源渠道</span><select v-model="form.channelID" required><option value="" disabled>请选择</option><option v-for="item in data.channels.filter(x=>x.lifecycleState==='HEALTHY')" :key="item.id" :value="item.id">{{ item.sourceName }} / {{ item.keyName }} / {{ item.groupName }}</option></select></label><label class="full"><span>账号名称</span><input v-model="form.name" required/></label><fieldset class="full"><legend>目标分组</legend><label v-for="group in targetGroups" :key="group.id" class="check-row"><input v-model="form.targetGroupIDs" type="checkbox" :value="group.id"/><span>{{ group.name }}</span></label></fieldset><label><span>优先级</span><input v-model="form.priority" type="number" min="101" value="101"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1" value="1"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">创建</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='policy'" title="新建策略" @close="close"><form class="modal-form" @submit.prevent="createPolicy"><label class="full"><span>策略名称</span><input v-model="form.name" required/></label><label><span>倍率上限</span><input v-model="form.maxMultiplier" type="number" min="0.0001" step="0.0001" value="1"/></label><label><span>最低成功率（%）</span><input v-model="form.minSuccessRate" type="number" min="0" max="100" value="95"/></label><label><span>最少样本</span><input v-model="form.minSamples" type="number" min="1" value="5"/></label><label><span>确认失败次数</span><input v-model="form.confirmationFailures" type="number" min="1" value="3"/></label><label><span>冷却时间（分钟）</span><input v-model="form.cooldownMinutes" type="number" min="1" value="15"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">创建</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='notification'" title="添加邮件通知" @close="close"><form class="modal-form" @submit.prevent="createNotification"><label><span>渠道名称</span><input v-model="form.name" required/></label><label><span>Resend API Key</span><input v-model="form.apiKey" type="password" required/></label><label><span>发件邮箱</span><input v-model="form.fromEmail" type="email" required/></label><label><span>收件邮箱</span><input v-model="form.toEmail" type="email" required/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">保存</button></footer></form></ModalShell>
+  <ModalShell v-if="modal==='account'" title="账号与密码" @close="close"><form class="modal-form" @submit.prevent="updateAccount"><label class="full"><span>登录邮箱</span><input v-model.trim="form.email" type="email" autocomplete="username" required/></label><label class="full"><span>当前密码</span><input v-model="form.currentPassword" type="password" autocomplete="current-password" required/></label><label><span>新密码（不修改可留空）</span><input v-model="form.newPassword" type="password" autocomplete="new-password" minlength="10" maxlength="72"/></label><label><span>确认新密码</span><input v-model="form.confirmPassword" type="password" autocomplete="new-password" :required="!!form.newPassword"/></label><div v-if="error" class="message error full"><AlertTriangle :size="16"/>{{ error }}</div><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading"><span v-if="loading" class="spinner"/>保存账号</button></footer></form></ModalShell>
 </template>

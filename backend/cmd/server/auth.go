@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"strings"
 	"time"
 
+	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -83,11 +85,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) authenticate(r *http.Request) (Operator, error) {
-	header := strings.TrimSpace(r.Header.Get("Authorization"))
-	if !strings.HasPrefix(header, "Bearer ") {
-		return Operator{}, fmt.Errorf("missing token")
-	}
-	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	token := bearerToken(r)
 	if token == "" {
 		return Operator{}, fmt.Errorf("missing token")
 	}
@@ -99,14 +97,93 @@ func (a *App) authenticate(r *http.Request) (Operator, error) {
 }
 
 func (a *App) logout(w http.ResponseWriter, r *http.Request) error {
-	header := strings.TrimSpace(r.Header.Get("Authorization"))
-	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	token := bearerToken(r)
 	_, err := a.db.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=now() WHERE token_hash=$1`, tokenHash(token))
 	if err != nil {
 		return err
 	}
 	writeData(w, map[string]bool{"revoked": true})
 	return nil
+}
+
+func (a *App) updateAccount(w http.ResponseWriter, r *http.Request) error {
+	operator, ok := r.Context().Value(userContextKey).(Operator)
+	if !ok {
+		return &apiError{Status: 401, Code: "UNAUTHORIZED", Message: "请先登录"}
+	}
+	var input struct {
+		Email           string `json:"email"`
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	if input.CurrentPassword == "" {
+		return &apiError{Status: 400, Code: "CURRENT_PASSWORD_REQUIRED", Message: "请输入当前密码"}
+	}
+
+	email := strings.ToLower(strings.TrimSpace(input.Email))
+	if email == "" {
+		email = operator.Email
+	}
+	address, err := mail.ParseAddress(email)
+	if err != nil || !strings.EqualFold(address.Address, email) {
+		return &apiError{Status: 400, Code: "INVALID_EMAIL", Message: "请输入有效的登录邮箱"}
+	}
+	if input.NewPassword != "" && (len(input.NewPassword) < 10 || len([]byte(input.NewPassword)) > 72) {
+		return &apiError{Status: 400, Code: "INVALID_PASSWORD", Message: "新密码需要 10 至 72 个字符"}
+	}
+
+	var passwordHash string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT password_hash FROM operators WHERE id=$1`, operator.ID).Scan(&passwordHash); err != nil {
+		return err
+	}
+	if bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.CurrentPassword)) != nil {
+		return &apiError{Status: 403, Code: "INVALID_CURRENT_PASSWORD", Message: "当前密码不正确"}
+	}
+	if email == operator.Email && input.NewPassword == "" {
+		return &apiError{Status: 400, Code: "NO_CHANGES", Message: "账号或密码没有变化"}
+	}
+	if input.NewPassword != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return err
+		}
+		passwordHash = string(hash)
+	}
+
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(r.Context(), `UPDATE operators SET email=$2,password_hash=$3 WHERE id=$1`, operator.ID, email, passwordHash); err != nil {
+		if databaseError, ok := err.(*pq.Error); ok && databaseError.Code == "23505" {
+			return &apiError{Status: 409, Code: "EMAIL_EXISTS", Message: "该邮箱已被其他账号使用"}
+		}
+		return err
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE sessions SET revoked_at=now() WHERE operator_id=$1 AND token_hash<>$2 AND revoked_at IS NULL`, operator.ID, tokenHash(bearerToken(r))); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	updated := operator
+	updated.Email = email
+	a.audit(r.Context(), "UPDATE_ACCOUNT", "operator", operator.ID, map[string]any{"email_changed": email != operator.Email, "password_changed": input.NewPassword != "", "email": email})
+	writeData(w, updated)
+	return nil
+}
+
+func bearerToken(r *http.Request) string {
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(header, "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 }
 
 func randomToken(bytes int) string {

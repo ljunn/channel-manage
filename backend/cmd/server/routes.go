@@ -12,6 +12,13 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 	if method == http.MethodPost && path == "/auth/logout" {
 		return a.logout(w, r)
 	}
+	if method == http.MethodGet && path == "/auth/me" {
+		writeData(w, r.Context().Value(userContextKey))
+		return nil
+	}
+	if method == http.MethodPatch && path == "/auth/account" {
+		return a.updateAccount(w, r)
+	}
 	if method == http.MethodGet && path == "/dashboard/summary" {
 		value, err := a.dashboard(r.Context())
 		if err != nil {

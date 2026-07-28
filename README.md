@@ -51,6 +51,8 @@ docker compose up -d --build
 docker compose logs app | grep 初始管理员
 ```
 
+登录后可点击页面右上角的账号邮箱，修改登录邮箱或密码。修改时需要验证当前密码；保存成功后，除当前浏览器外的其他登录会话会自动退出。
+
 本地开发：
 
 ```bash
