@@ -42,13 +42,13 @@ func (a *App) syncDueTargetMetrics(ctx context.Context) {
 }
 
 func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
-	target, credential, err := a.targetCredentials(ctx, targetID)
+	target, _, err := a.targetCredentials(ctx, targetID)
 	if err != nil {
 		return err
 	}
 	requestCtx, cancel := timeoutContext(ctx)
 	defer cancel()
-	session, err := a.loginRemote(requestCtx, target.BaseURL, "SUB2API", credential.Username, credential.Password)
+	session, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
 		return err
 	}

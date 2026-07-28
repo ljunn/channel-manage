@@ -1,5 +1,12 @@
 # 更新日志
 
+## 0.1.6 - 2026-07-28
+
+- 远端认证改为持久化会话：首次登录后加密保存 Access Token、Refresh Token、Cookie 和会话标识，后台任务不再周期性重复调用登录接口。
+- Sub2API 同时兼容“Access Token + Refresh Token”和“仅 Access Token”；有 RT 时自动轮换，无 RT 时仅在 Access Token 失效后重新登录。
+- New API 同时兼容新版 Access Token + HttpOnly 刷新 Cookie 会话和旧版登录 Cookie，会话失效后按远端能力刷新或重新登录。
+- 登录接口遇到 429 时按 `Retry-After` 退避重试，限流不会误触发旧版路由回退，也不会因单次失败将目标节点判定为离线。
+
 ## 0.1.5 - 2026-07-28
 
 - 新增渠道管家品牌 Logo，并同步更新登录页、桌面端、移动端和浏览器图标。

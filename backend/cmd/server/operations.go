@@ -186,8 +186,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	remoteName := "[托管] " + input.Name
 	var sourceBase, encryptedKey, platform, keyModels, targetBase string
 	var targetWrite bool
-	var targetSecret []byte
-	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,s.platform,k.models,t.base_url,t.api_key_cipher,t.write_enabled FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &platform, &keyModels, &targetBase, &targetSecret, &targetWrite)
+	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,s.platform,k.models,t.base_url,t.write_enabled FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &platform, &keyModels, &targetBase, &targetWrite)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在或尚未授权生产使用"}
 	}
@@ -209,14 +208,6 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
-	plainTarget, err := a.decryptSecret(targetSecret)
-	if err != nil {
-		return err
-	}
-	var credential sourceCredentials
-	if json.Unmarshal(plainTarget, &credential) != nil {
-		return fmt.Errorf("invalid target credential")
-	}
 	models := []string{}
 	_ = json.Unmarshal([]byte(keyModels), &models)
 	if len(models) == 0 {
@@ -236,7 +227,11 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	}
 	requestCtx, cancel := timeoutContext(r.Context())
 	defer cancel()
-	session, err := a.loginRemote(requestCtx, targetBase, "SUB2API", credential.Username, credential.Password)
+	target, _, err := a.targetCredentials(requestCtx, input.TargetID)
+	if err != nil {
+		return err
+	}
+	session, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
 		return err
 	}

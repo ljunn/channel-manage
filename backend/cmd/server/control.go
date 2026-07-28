@@ -144,27 +144,18 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if frozen || shadow {
 		return a.failAction(ctx, id, "安全冻结或影子模式禁止执行写动作")
 	}
-	var managedID, action, after, targetBase, remoteID, marker string
-	var targetSecret []byte
+	var managedID, action, after, targetID, targetBase, remoteID, marker string
 	var writeEnabled bool
-	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.after_state,t.base_url,t.api_key_cipher,t.write_enabled,m.remote_id,m.ownership_marker FROM action_intents i JOIN managed_accounts m ON m.id=i.managed_account_id JOIN targets t ON t.id=m.target_id WHERE i.id=$1 AND i.status='APPROVED'`, id).Scan(&managedID, &action, &after, &targetBase, &targetSecret, &writeEnabled, &remoteID, &marker)
+	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.after_state,t.id,t.base_url,t.write_enabled,m.remote_id,m.ownership_marker FROM action_intents i JOIN managed_accounts m ON m.id=i.managed_account_id JOIN targets t ON t.id=m.target_id WHERE i.id=$1 AND i.status='APPROVED'`, id).Scan(&managedID, &action, &after, &targetID, &targetBase, &writeEnabled, &remoteID, &marker)
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
 	}
 	if !writeEnabled || !strings.HasPrefix(marker, "channel-manage:") {
 		return a.failAction(ctx, id, "目标写入未授权或托管所有权无效")
 	}
-	plain, err := a.decryptSecret(targetSecret)
-	if err != nil {
-		return a.failAction(ctx, id, err.Error())
-	}
-	var credential sourceCredentials
-	if json.Unmarshal(plain, &credential) != nil {
-		return a.failAction(ctx, id, "目标凭据不可读")
-	}
 	requestCtx, cancel := timeoutContext(ctx)
 	defer cancel()
-	session, err := a.loginRemote(requestCtx, targetBase, "SUB2API", credential.Username, credential.Password)
+	session, err := a.authenticateTarget(requestCtx, Target{ID: targetID, BaseURL: targetBase}, true)
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
 	}

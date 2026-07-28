@@ -68,7 +68,7 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if err != nil {
 		return err
 	}
-	target, targetCredential, err := a.targetCredentials(r.Context(), input.TargetID)
+	target, _, err := a.targetCredentials(r.Context(), input.TargetID)
 	if err != nil {
 		return err
 	}
@@ -91,12 +91,10 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if err != nil {
 		return err
 	}
-	defer a.logoutRemote(context.Background(), source.BaseURL, sourceSession)
-	targetSession, err := a.loginRemote(requestCtx, target.BaseURL, "SUB2API", targetCredential.Username, targetCredential.Password)
+	targetSession, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
 		return err
 	}
-	defer a.logoutRemote(context.Background(), target.BaseURL, targetSession)
 
 	created := make([]createdDeployment, 0, len(sourceGroups))
 	committed := false

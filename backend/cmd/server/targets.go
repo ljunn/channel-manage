@@ -104,13 +104,13 @@ func (a *App) targetCredentials(ctx context.Context, id string) (Target, sourceC
 }
 
 func (a *App) syncTarget(ctx context.Context, id string) error {
-	target, credential, err := a.targetCredentials(ctx, id)
+	target, _, err := a.targetCredentials(ctx, id)
 	if err != nil {
 		return err
 	}
 	requestCtx, cancel := timeoutContext(ctx)
 	defer cancel()
-	session, err := a.loginRemote(requestCtx, target.BaseURL, "SUB2API", credential.Username, credential.Password)
+	session, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
 		a.targetSyncFailed(ctx, target, err)
 		return err
@@ -173,7 +173,65 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
+func (a *App) authenticateTarget(ctx context.Context, target Target, validate bool) (remoteSession, error) {
+	a.targetAuthMu.Lock()
+	defer a.targetAuthMu.Unlock()
+
+	currentTarget, credential, err := a.targetCredentials(ctx, target.ID)
+	if err != nil {
+		return remoteSession{}, err
+	}
+	target = currentTarget
+	if credentialHasSession(credential) {
+		session := sessionFromCredential(credential)
+		if !validate {
+			return session, nil
+		}
+		_, _, validationErr := a.remoteJSON(ctx, target.BaseURL, http.MethodGet, "/api/v1/admin/groups?page=1&page_size=1", session, nil)
+		if validationErr == nil {
+			return session, nil
+		}
+		if !remoteUnauthorized(validationErr) {
+			return remoteSession{}, validationErr
+		}
+	}
+
+	if credential.RefreshToken != "" {
+		pair, refreshErr := a.refreshSub2APIToken(ctx, target.BaseURL, credential.RefreshToken)
+		if refreshErr == nil {
+			session := remoteSession{Authorization: "Bearer " + pair.AccessToken, RefreshToken: pair.RefreshToken}
+			return session, a.persistTargetSession(ctx, target.ID, credential, session)
+		}
+		if !remoteAuthenticationExpired(refreshErr) && !remoteRouteUnavailable(refreshErr) {
+			return remoteSession{}, refreshErr
+		}
+	}
+	if credential.Username == "" || credential.Password == "" {
+		return remoteSession{}, &apiError{Status: 401, Code: "TARGET_REAUTH_REQUIRED", Message: "目标节点会话已失效且没有可用的账号密码"}
+	}
+	session, err := a.loginRemote(ctx, target.BaseURL, "SUB2API", credential.Username, credential.Password)
+	if err != nil {
+		return remoteSession{}, err
+	}
+	return session, a.persistTargetSession(ctx, target.ID, credential, session)
+}
+
+func (a *App) persistTargetSession(ctx context.Context, targetID string, credential sourceCredentials, session remoteSession) error {
+	applySessionToCredential(&credential, session)
+	encrypted, err := a.encryptSecret([]byte(jsonValue(credential)))
+	if err != nil {
+		return err
+	}
+	_, err = a.db.ExecContext(ctx, `UPDATE targets SET api_key_cipher=$2,updated_at=now() WHERE id=$1`, targetID, encrypted)
+	return err
+}
+
 func (a *App) targetSyncFailed(ctx context.Context, target Target, cause error) {
+	if remoteRateLimited(cause) {
+		_, _ = a.db.ExecContext(ctx, `UPDATE targets SET last_error=$2,updated_at=now() WHERE id=$1`, target.ID, truncate(cause.Error(), 500))
+		a.openEvent(ctx, "P2", "TARGET_SYNC", "目标节点请求受限", target.Name+": "+cause.Error(), "target-rate-limit:"+target.ID)
+		return
+	}
 	_, _ = a.db.ExecContext(ctx, `UPDATE targets SET status='OFFLINE',last_error=$2,updated_at=now() WHERE id=$1`, target.ID, truncate(cause.Error(), 500))
 	a.openEvent(ctx, "P1", "TARGET_SYNC", "目标节点同步失败", target.Name+": "+cause.Error(), "target-sync:"+target.ID)
 }

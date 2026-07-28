@@ -39,6 +39,9 @@ type sourceCredentials struct {
 	Password     string `json:"password,omitempty"`
 	AccessToken  string `json:"accessToken,omitempty"`
 	RefreshToken string `json:"refreshToken,omitempty"`
+	Cookie       string `json:"cookie,omitempty"`
+	UserID       string `json:"userId,omitempty"`
+	SessionID    string `json:"sessionId,omitempty"`
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
@@ -265,10 +268,9 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		var session remoteSession
 		session, err = a.authenticateSource(requestCtx, source, credential, false)
 		if err == nil {
-			defer a.logoutRemote(ctx, source.BaseURL, session)
 			err = a.collectSource(requestCtx, source, session)
-			if remoteUnauthorized(err) && credential.AuthMode == "TOKEN" && credential.RefreshToken != "" {
-				session, err = a.refreshSourceSession(requestCtx, source, credential)
+			if remoteUnauthorized(err) {
+				session, err = a.renewSourceSession(requestCtx, source, credential)
 				if err == nil {
 					err = a.collectSource(requestCtx, source, session)
 				}
@@ -285,24 +287,31 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 }
 
 func (a *App) authenticateSource(ctx context.Context, source Source, credential sourceCredentials, validate bool) (remoteSession, error) {
-	if source.Platform != "SUB2API" || credential.AuthMode != "TOKEN" {
+	if source.Platform != "SUB2API" && source.Platform != "NEW_API" {
 		return a.loginRemote(ctx, source.BaseURL, source.Platform, credential.Username, credential.Password)
 	}
-	session := remoteSession{Authorization: "Bearer " + credential.AccessToken}
+	if !credentialHasSession(credential) {
+		return a.renewSourceSession(ctx, source, credential)
+	}
+	session := sessionFromCredential(credential)
 	if !validate {
 		return session, nil
 	}
-	_, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/groups/available", session, nil)
+	path := "/api/v1/groups/available"
+	if source.Platform == "NEW_API" {
+		path = "/api/user/self/groups"
+	}
+	_, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, path, session, nil)
 	if err == nil {
 		return session, nil
 	}
-	if !remoteUnauthorized(err) || credential.RefreshToken == "" {
+	if !remoteUnauthorized(err) {
 		return remoteSession{}, err
 	}
-	return a.refreshSourceSession(ctx, source, credential)
+	return a.renewSourceSession(ctx, source, credential)
 }
 
-func (a *App) refreshSourceSession(ctx context.Context, source Source, expected sourceCredentials) (remoteSession, error) {
+func (a *App) renewSourceSession(ctx context.Context, source Source, expected sourceCredentials) (remoteSession, error) {
 	a.sourceAuthMu.Lock()
 	defer a.sourceAuthMu.Unlock()
 
@@ -310,26 +319,50 @@ func (a *App) refreshSourceSession(ctx context.Context, source Source, expected 
 	if err != nil {
 		return remoteSession{}, err
 	}
-	if current.AuthMode != "TOKEN" || current.RefreshToken == "" {
-		return remoteSession{}, &apiError{Status: 409, Code: "SOURCE_AUTH_CHANGED", Message: "数据源认证方式已变更，请重试"}
+	if credentialHasSession(current) && (current.AccessToken != expected.AccessToken || current.Cookie != expected.Cookie || current.RefreshToken != expected.RefreshToken) {
+		return sessionFromCredential(current), nil
 	}
-	if current.RefreshToken != expected.RefreshToken && current.AccessToken != "" {
-		return remoteSession{Authorization: "Bearer " + current.AccessToken}, nil
+
+	var session remoteSession
+	if source.Platform == "SUB2API" && current.RefreshToken != "" {
+		pair, refreshErr := a.refreshSub2APIToken(ctx, source.BaseURL, current.RefreshToken)
+		if refreshErr == nil {
+			session = remoteSession{Authorization: "Bearer " + pair.AccessToken, RefreshToken: pair.RefreshToken}
+			return session, a.persistSourceSession(ctx, source.ID, current, session)
+		}
+		if !remoteAuthenticationExpired(refreshErr) && !remoteRouteUnavailable(refreshErr) {
+			return remoteSession{}, refreshErr
+		}
 	}
-	pair, err := a.refreshSub2APIToken(ctx, source.BaseURL, current.RefreshToken)
+	if source.Platform == "NEW_API" && current.Cookie != "" && current.SessionID != "" {
+		refreshed, refreshErr := a.refreshNewAPISession(ctx, source.BaseURL, sessionFromCredential(current))
+		if refreshErr == nil {
+			return refreshed, a.persistSourceSession(ctx, source.ID, current, refreshed)
+		}
+		if !remoteAuthenticationExpired(refreshErr) && !remoteRouteUnavailable(refreshErr) {
+			return remoteSession{}, refreshErr
+		}
+	}
+	if current.Username == "" || current.Password == "" {
+		return remoteSession{}, &apiError{Status: 401, Code: "SOURCE_REAUTH_REQUIRED", Message: "远端会话已失效且没有可用的账号密码"}
+	}
+	session, err = a.loginRemote(ctx, source.BaseURL, source.Platform, current.Username, current.Password)
 	if err != nil {
 		return remoteSession{}, err
 	}
-	current.AccessToken = pair.AccessToken
-	current.RefreshToken = pair.RefreshToken
-	encrypted, err := a.encryptSecret([]byte(jsonValue(current)))
+	return session, a.persistSourceSession(ctx, source.ID, current, session)
+}
+
+func (a *App) persistSourceSession(ctx context.Context, sourceID string, credential sourceCredentials, session remoteSession) error {
+	applySessionToCredential(&credential, session)
+	encrypted, err := a.encryptSecret([]byte(jsonValue(credential)))
 	if err != nil {
-		return remoteSession{}, err
+		return err
 	}
-	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,updated_at=now() WHERE id=$1`, source.ID, encrypted); err != nil {
-		return remoteSession{}, err
+	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,updated_at=now() WHERE id=$1`, sourceID, encrypted); err != nil {
+		return err
 	}
-	return remoteSession{Authorization: "Bearer " + pair.AccessToken}, nil
+	return nil
 }
 
 func (a *App) collectSource(ctx context.Context, source Source, session remoteSession) error {

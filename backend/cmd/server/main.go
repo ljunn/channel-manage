@@ -39,6 +39,7 @@ type App struct {
 	httpClient   *http.Client
 	workerMu     sync.Mutex
 	sourceAuthMu sync.Mutex
+	targetAuthMu sync.Mutex
 }
 
 type apiError struct {

@@ -197,6 +197,45 @@ func TestLoginRemoteSupportsFlatSub2APILogin(t *testing.T) {
 	}
 }
 
+func TestLoginRemoteRetriesRateLimitAndReturnsTokenPair(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"Too many requests, please try again later"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"access-token","refresh_token":"refresh-token"}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+
+	session, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Authorization != "Bearer access-token" || session.RefreshToken != "refresh-token" {
+		t.Fatalf("unexpected session: %#v", session)
+	}
+	if requests != 2 {
+		t.Fatalf("login requests=%d, want 2", requests)
+	}
+}
+
+func TestRemoteRateLimitedClassification(t *testing.T) {
+	err := &apiError{Status: 502, Code: "REMOTE_RATE_LIMITED", Message: "Too many requests"}
+	if !remoteRateLimited(err) {
+		t.Fatal("rate limit error was not classified")
+	}
+	if remoteRateLimited(&apiError{Status: 502, Code: "REMOTE_REJECTED"}) {
+		t.Fatal("ordinary remote rejection was classified as a rate limit")
+	}
+}
+
 func TestLoginRemoteDoesNotHideSub2APIAuthenticationError(t *testing.T) {
 	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
 	fallbackCalled := false
@@ -259,6 +298,71 @@ func TestRefreshSub2APITokenSupportsFlatRoute(t *testing.T) {
 	}
 	if pair.AccessToken != "flat-access" || pair.RefreshToken != "flat-refresh" {
 		t.Fatalf("unexpected pair: %#v", pair)
+	}
+}
+
+func TestRefreshSub2APITokenDoesNotFallbackAfterRateLimit(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	flatCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/auth/refresh" {
+			flatCalled = true
+			t.Fatal("flat refresh fallback must not run after rate limiting")
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"Too many requests"}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, err := app.refreshSub2APIToken(context.Background(), server.URL, "refresh-token")
+	if !remoteRateLimited(err) || flatCalled {
+		t.Fatalf("expected original rate limit, got %v", err)
+	}
+}
+
+func TestRefreshNewAPISessionRotatesAccessAndCookie(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/user/auth/refresh" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if r.Header.Get("X-Auth-Session") != "session-id" {
+			t.Fatalf("missing session header: %q", r.Header.Get("X-Auth-Session"))
+		}
+		if cookie, err := r.Cookie("new_api_refresh"); err != nil || cookie.Value != "old-refresh" {
+			t.Fatalf("missing refresh cookie: %v %#v", err, cookie)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "new_api_refresh", Value: "new-refresh", Path: "/api/user/auth"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"access_token":"new-access","session":{"sid":"session-id"}}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	session, err := app.refreshNewAPISession(context.Background(), server.URL, remoteSession{
+		Authorization: "Bearer old-access",
+		Cookie:        "new_api_refresh=old-refresh",
+		SessionID:     "session-id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Authorization != "Bearer new-access" || !strings.Contains(session.Cookie, "new_api_refresh=new-refresh") {
+		t.Fatalf("unexpected refreshed session: %#v", session)
+	}
+}
+
+func TestSessionCredentialRoundTripSupportsTokenAndCookieVariants(t *testing.T) {
+	for _, session := range []remoteSession{
+		{Authorization: "Bearer access", RefreshToken: "refresh"},
+		{Authorization: "Bearer access", Cookie: "new_api_refresh=cookie", UserID: "42", SessionID: "sid"},
+		{Cookie: "session=legacy", UserID: "7"},
+	} {
+		credential := sourceCredentials{Username: "user", Password: "password"}
+		applySessionToCredential(&credential, session)
+		if got := sessionFromCredential(credential); !reflect.DeepEqual(got, session) {
+			t.Fatalf("session round trip mismatch: got %#v want %#v", got, session)
+		}
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 
 type remoteSession struct {
 	Authorization string
+	RefreshToken  string
 	Cookie        string
 	UserID        string
 	SessionID     string
@@ -152,7 +153,9 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 			}
 		}
 		code := "REMOTE_REJECTED"
-		if response.StatusCode == http.StatusUnauthorized {
+		if response.StatusCode == http.StatusTooManyRequests {
+			code = "REMOTE_RATE_LIMITED"
+		} else if response.StatusCode == http.StatusUnauthorized {
 			code = "REMOTE_UNAUTHORIZED"
 		}
 		return value, response.Header, &apiError{Status: 502, Code: code, Message: message}
@@ -168,6 +171,9 @@ type sub2APITokenPair struct {
 func (a *App) refreshSub2APIToken(ctx context.Context, baseURL, refreshToken string) (sub2APITokenPair, error) {
 	value, _, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/refresh", remoteSession{}, map[string]string{"refresh_token": refreshToken})
 	if err != nil {
+		if !remoteRouteUnavailable(err) {
+			return sub2APITokenPair{}, err
+		}
 		value, _, err = a.remoteJSON(ctx, baseURL, http.MethodPost, "/auth/refresh", remoteSession{}, map[string]string{"refresh_token": refreshToken})
 		if err != nil {
 			return sub2APITokenPair{}, err
@@ -189,6 +195,33 @@ func (a *App) refreshSub2APIToken(ctx context.Context, baseURL, refreshToken str
 		return sub2APITokenPair{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端刷新令牌响应缺少令牌"}
 	}
 	return pair, nil
+}
+
+func (a *App) refreshNewAPISession(ctx context.Context, baseURL string, session remoteSession) (remoteSession, error) {
+	value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/user/auth/refresh", session, nil)
+	if err != nil {
+		return remoteSession{}, err
+	}
+	data, err := unwrapEnvelope(value, "NEW_API")
+	if err != nil {
+		return remoteSession{}, err
+	}
+	record, ok := data.(map[string]any)
+	if !ok {
+		return remoteSession{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端刷新会话响应不兼容"}
+	}
+	accessToken := text(record["access_token"], "")
+	if accessToken == "" {
+		return remoteSession{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端刷新会话响应缺少令牌"}
+	}
+	if cookie := responseCookie(headers); cookie != "" {
+		session.Cookie = cookie
+	}
+	if nested, ok := record["session"].(map[string]any); ok {
+		session.SessionID = text(nested["sid"], session.SessionID)
+	}
+	session.Authorization = "Bearer " + accessToken
+	return session, nil
 }
 
 func sub2APIResponseData(value any) (any, error) {
@@ -219,6 +252,26 @@ func remoteUnauthorized(err error) bool {
 	return errors.As(err, &typed) && typed.Code == "REMOTE_UNAUTHORIZED"
 }
 
+func remoteRateLimited(err error) bool {
+	var typed *apiError
+	return errors.As(err, &typed) && typed.Code == "REMOTE_RATE_LIMITED"
+}
+
+func remoteAuthenticationExpired(err error) bool {
+	var typed *apiError
+	if !errors.As(err, &typed) {
+		return false
+	}
+	if typed.Code == "REMOTE_UNAUTHORIZED" {
+		return true
+	}
+	message := strings.ToLower(typed.Message)
+	return typed.Code == "REMOTE_REJECTED" && (strings.Contains(message, "token expired") ||
+		strings.Contains(message, "invalid token") || strings.Contains(message, "invalid refresh") ||
+		strings.Contains(message, "refresh token") || strings.Contains(message, "令牌失效") ||
+		strings.Contains(message, "令牌过期"))
+}
+
 func remoteRouteUnavailable(err error) bool {
 	var typed *apiError
 	if !errors.As(err, &typed) {
@@ -245,7 +298,18 @@ func unwrapEnvelope(value any, platform string) (any, error) {
 
 func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, password string) (remoteSession, error) {
 	if platform == "SUB2API" {
-		value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/login", remoteSession{}, map[string]any{"email": username, "password": password, "not_in_cn_confirmed": true})
+		var value any
+		var headers http.Header
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			value, headers, err = a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/login", remoteSession{}, map[string]any{"email": username, "password": password, "not_in_cn_confirmed": true})
+			if !remoteRateLimited(err) || attempt == 2 {
+				break
+			}
+			if err := waitRemoteLoginRetry(ctx, headers, attempt); err != nil {
+				return remoteSession{}, err
+			}
+		}
 		if err != nil {
 			if !remoteRouteUnavailable(err) {
 				return remoteSession{}, err
@@ -264,7 +328,11 @@ func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, pass
 		if !ok || accessToken == "" {
 			return remoteSession{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端登录响应不兼容"}
 		}
-		return remoteSession{Authorization: "Bearer " + accessToken, Cookie: responseCookie(headers)}, nil
+		return remoteSession{
+			Authorization: "Bearer " + accessToken,
+			RefreshToken:  text(record["refresh_token"], ""),
+			Cookie:        responseCookie(headers),
+		}, nil
 	}
 	value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/user/login", remoteSession{}, map[string]string{"username": username, "password": password})
 	if err != nil {
@@ -300,6 +368,47 @@ func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, pass
 		return remoteSession{}, &apiError{Status: 502, Code: "AUTHENTICATION", Message: "远端登录失败"}
 	}
 	return remoteSession{Cookie: cookie, UserID: strconv.Itoa(int(id))}, nil
+}
+
+func waitRemoteLoginRetry(ctx context.Context, headers http.Header, attempt int) error {
+	delay := time.Duration(attempt+1) * time.Second
+	if seconds, err := strconv.Atoi(headers.Get("Retry-After")); err == nil && seconds >= 0 {
+		delay = time.Duration(seconds) * time.Second
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func sessionFromCredential(credential sourceCredentials) remoteSession {
+	authorization := ""
+	if credential.AccessToken != "" {
+		authorization = "Bearer " + credential.AccessToken
+	}
+	return remoteSession{
+		Authorization: authorization,
+		RefreshToken:  credential.RefreshToken,
+		Cookie:        credential.Cookie,
+		UserID:        credential.UserID,
+		SessionID:     credential.SessionID,
+	}
+}
+
+func credentialHasSession(credential sourceCredentials) bool {
+	return credential.AccessToken != "" || credential.Cookie != ""
+}
+
+func applySessionToCredential(credential *sourceCredentials, session remoteSession) {
+	credential.AccessToken = strings.TrimPrefix(session.Authorization, "Bearer ")
+	credential.RefreshToken = session.RefreshToken
+	credential.Cookie = session.Cookie
+	credential.UserID = session.UserID
+	credential.SessionID = session.SessionID
 }
 
 func responseCookie(headers http.Header) string {
