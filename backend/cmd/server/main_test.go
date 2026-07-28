@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -116,5 +120,119 @@ func TestSourceValueDivisor(t *testing.T) {
 	}
 	if _, err := sourceValueDivisor(1, 0); err == nil {
 		t.Fatal("zero denominator was accepted")
+	}
+}
+
+func TestLoginRemoteSupportsModernNewAPI(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/user/login" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "new_api_refresh", Value: "refresh-value", Path: "/api/user/auth"})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"data":{"access_token":"dashboard-token","user":{"id":42},"session":{"sid":"session-id"}}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	session, err := app.loginRemote(context.Background(), server.URL, "NEW_API", "user", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Authorization != "Bearer dashboard-token" || session.UserID != "42" || session.SessionID != "session-id" || !strings.Contains(session.Cookie, "new_api_refresh=") {
+		t.Fatalf("unexpected session: %#v", session)
+	}
+}
+
+func TestLoginRemoteReportsNewAPISessionLimit(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"success":false,"code":"AUTH_SESSION_LIMIT","message":"Conflict"}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, err := app.loginRemote(context.Background(), server.URL, "NEW_API", "user", "password")
+	apiErr, ok := err.(*apiError)
+	if !ok || !strings.Contains(apiErr.Message, "AUTH_SESSION_LIMIT") {
+		t.Fatalf("expected session limit error, got %v", err)
+	}
+}
+
+func TestLoginRemoteSupportsFlatSub2APILogin(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case "/auth/login":
+			_, _ = w.Write([]byte(`{"access_token":"flat-token"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	session, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Authorization != "Bearer flat-token" {
+		t.Fatalf("unexpected session: %#v", session)
+	}
+}
+
+func TestRefreshSub2APITokenRotatesPair(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/refresh" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"access_token":"new-access","refresh_token":"new-refresh"}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	pair, err := app.refreshSub2APIToken(context.Background(), server.URL, "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pair.AccessToken != "new-access" || pair.RefreshToken != "new-refresh" {
+		t.Fatalf("unexpected pair: %#v", pair)
+	}
+}
+
+func TestRefreshSub2APITokenSupportsFlatRoute(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"not found"}`))
+		case "/auth/refresh":
+			_, _ = w.Write([]byte(`{"access_token":"flat-access","refresh_token":"flat-refresh"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	pair, err := app.refreshSub2APIToken(context.Background(), server.URL, "old-refresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pair.AccessToken != "flat-access" || pair.RefreshToken != "flat-refresh" {
+		t.Fatalf("unexpected pair: %#v", pair)
+	}
+}
+
+func TestPageRecordsSupportsPagedAndFlatResponses(t *testing.T) {
+	flat := []any{map[string]any{"id": float64(1)}}
+	if len(pageRecords(flat)) != 1 || len(pageRecords(map[string]any{"items": flat})) != 1 {
+		t.Fatal("token page records were not normalized")
 	}
 }

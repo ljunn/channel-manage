@@ -44,6 +44,10 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			models JSONB NOT NULL DEFAULT '[]'::jsonb, raw_hash TEXT NOT NULL DEFAULT '', captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(source_id, remote_id)
 		)`,
+		`ALTER TABLE source_groups ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE source_keys ADD COLUMN IF NOT EXISTS remote_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE source_keys ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT false`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_keys_remote_id ON source_keys(source_id,remote_id) WHERE remote_id<>''`,
 		`CREATE TABLE IF NOT EXISTS group_samples (
 			id BIGSERIAL PRIMARY KEY, source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 			group_id UUID NOT NULL REFERENCES source_groups(id) ON DELETE CASCADE, multiplier NUMERIC(14,6),

@@ -174,6 +174,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 3 && parts[2] == "keys" && method == http.MethodPost {
 			return a.addSourceKey(w, r, id)
 		}
+		if len(parts) == 3 && parts[2] == "deploy" && method == http.MethodPost {
+			return a.deploySourceGroups(w, r, id)
+		}
 		if len(parts) == 3 && (parts[2] == "scan" || parts[2] == "test-connection") && method == http.MethodPost {
 			go a.scanSource(context.Background(), id)
 			writeData(w, map[string]string{"id": id, "status": "ACCEPTED"})

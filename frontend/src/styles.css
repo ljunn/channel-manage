@@ -114,6 +114,7 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .message { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; padding: 10px 13px; border: 1px solid; border-radius: 7px; font-size: 12px; }
 .message.error { border-color: #f3caca; background: var(--red-soft); color: var(--red); }
 .message.success { border-color: #c6e9d5; background: var(--green-soft); color: var(--green); }
+.message.warning { border-color: #ecd39f; background: var(--amber-soft); color: var(--amber); }
 .badge { min-height: 22px; display: inline-flex; align-items: center; padding: 0 9px; border-radius: 6px; background: var(--line-soft); color: var(--muted); font-size: 11px; font-weight: 500; white-space: nowrap; }
 .badge.success { background: var(--green-soft); color: #176a44; }
 .badge.warning { background: var(--amber-soft); color: #7f4b00; }
@@ -255,13 +256,19 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .check-row small { font-size: 11px; }
 .modal-form fieldset { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; }
 .modal-form legend { padding: 0 5px; }
+.modal-form .auth-mode { display: flex; gap: 4px; padding: 4px; background: var(--soft); }
+.auth-mode legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.auth-mode label { flex: 1; height: 34px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 6px; color: var(--ink-500); cursor: pointer; }
+.auth-mode label.active { border-color: var(--line); background: var(--paper); color: var(--ink); box-shadow: 0 1px 2px rgba(15,23,42,.06); }
+.auth-mode input { position: absolute; opacity: 0; pointer-events: none; }
+.auth-mode span { font-size: 12px; font-weight: 600; }
 .ratio-input { display: grid!important; grid-template-columns: minmax(0,1fr) 14px minmax(0,1fr); align-items: center; gap: 6px; }
 .ratio-input b { color: var(--muted); font-size: 13px; text-align: center; }
 .ratio-input input { min-width: 0; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; overflow-y: auto; padding: 20px 14px; background: rgba(28,43,51,.42); }
 .modal { width: min(560px,100%); max-height: calc(100dvh - 48px); display: flex; flex-direction: column; overflow: hidden; border-radius: 10px; outline: none; background: var(--paper); box-shadow: var(--shadow-pop); animation: modal-in .18s ease; }
-.modal.wide { width: min(860px,100%); }
+.modal.wide { width: min(1080px,100%); }
 @keyframes modal-in { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
 .modal > header { min-height: 54px; display: flex; align-items: center; justify-content: space-between; padding: 14px 22px 0; }
 .modal > header h2 { font-size: 16px; font-weight: 600; }
@@ -270,6 +277,33 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .detail-summary span { display: flex; align-items: baseline; gap: 5px; color: var(--muted); font-size: 11px; }
 .detail-summary b { color: var(--ink); font-size: 18px; }
 .detail-summary .btn { margin-left: auto; }
+.mapping-layout { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 18px; align-items: start; }
+.group-picker { min-width: 0; }
+.group-picker > header, .mapping-config > header { min-height: 48px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.group-picker > header > div, .mapping-config > header { display: grid; gap: 3px; }
+.group-picker h3, .mapping-config h3 { margin: 0; color: var(--ink); font-size: 14px; }
+.group-picker header small, .mapping-config header small { font-size: 11px; }
+.mapping-table { max-height: 460px; }
+.mapping-table table { min-width: 690px; }
+.mapping-table th:first-child, .mapping-table td:first-child { width: 46px; padding-right: 4px; }
+.mapping-table input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--teal-600); }
+.mapping-table tr.mapped { background: var(--soft); }
+.mapping-table tr.mapped td { color: var(--ink-400); }
+.mapping-table .group-description { max-width: 280px; color: var(--muted); white-space: normal; }
+.muted { color: var(--ink-400); font-size: 12px; }
+.mapping-config { display: grid; gap: 14px; padding-left: 18px; border-left: 1px solid var(--line); }
+.mapping-config > header { display: grid; min-height: 0; margin: 0; }
+.mapping-config > label, .mapping-options label { display: grid; gap: 6px; }
+.mapping-config label > span:first-child, .mapping-config legend { color: var(--ink-700); font-size: 12px; font-weight: 500; }
+.mapping-config input[type="number"], .mapping-config select { width: 100%; height: 38px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; outline: 0; background: var(--paper); color: var(--ink); font-size: 13px; }
+.mapping-config input:focus, .mapping-config select:focus { border-color: var(--teal-500); box-shadow: 0 0 0 3px rgba(53,181,170,.13); }
+.mapping-config fieldset { max-height: 250px; display: grid; gap: 10px; overflow-y: auto; margin: 0; padding: 11px; border: 1px solid var(--line); border-radius: 7px; }
+.mapping-config legend { padding: 0 5px; }
+.mapping-config .check-row { align-items: center; }
+.mapping-config .check-row strong { font-size: 12px; }
+.mapping-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.empty-inline { padding: 13px 4px; color: var(--ink-400); font-size: 12px; text-align: center; }
+.mapping-config .message { margin: 0; }
 
 .login-page { min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: flex-end; padding: 48px max(5vw,48px); background: #edf4f4 url('/brand/login-data-pool.webp') center/cover no-repeat; }
 .login-panel { width: 100%; max-width: 410px; display: flex; flex-direction: column; gap: 26px; padding: 38px 36px 34px; border: 1px solid rgba(207,219,222,.9); border-radius: 8px; background: var(--paper); box-shadow: 0 24px 64px rgba(35,62,67,.16),0 2px 8px rgba(35,62,67,.06); }
@@ -334,6 +368,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .modal-form fieldset { grid-template-columns: 1fr; }
   .modal-backdrop { align-items: end; padding: 0; }
   .modal, .modal.wide { width: 100%; max-height: 92dvh; padding-bottom: env(safe-area-inset-bottom); border-radius: 12px 12px 0 0; }
+  .mapping-layout { grid-template-columns: 1fr; }
+  .mapping-config { padding: 17px 0 0; border-top: 1px solid var(--line); border-left: 0; }
+  .mapping-config input[type="number"], .mapping-config select { height: 44px; }
   .mobile-backdrop { position: fixed; inset: 0; z-index: 80; display: block; border: 0; background: rgba(28,43,51,.42); }
   .mobile-drawer { position: fixed; inset: 0 auto 0 0; z-index: 90; width: 280px; min-height: 100dvh; display: flex; flex-direction: column; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); border-right: 1px solid var(--line); background: var(--paper); color: var(--ink); box-shadow: var(--shadow-pop); }
   .mobile-drawer .brand { padding: 0 4px 10px; }

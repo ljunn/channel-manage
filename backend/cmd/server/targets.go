@@ -64,7 +64,7 @@ func (a *App) createTarget(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	encrypted, err := a.encryptSecret([]byte(jsonValue(sourceCredentials{input.Username, input.Password})))
+	encrypted, err := a.encryptSecret([]byte(jsonValue(sourceCredentials{AuthMode: "PASSWORD", Username: input.Username, Password: input.Password})))
 	if err != nil {
 		return err
 	}
@@ -277,7 +277,7 @@ func (a *App) updateTarget(w http.ResponseWriter, r *http.Request, id string) er
 		_, _ = a.db.ExecContext(r.Context(), `UPDATE targets SET name=$2,updated_at=now() WHERE id=$1`, id, input.Name)
 	}
 	if input.Username != "" && input.Password != "" {
-		encrypted, err := a.encryptSecret([]byte(jsonValue(sourceCredentials{input.Username, input.Password})))
+		encrypted, err := a.encryptSecret([]byte(jsonValue(sourceCredentials{AuthMode: "PASSWORD", Username: input.Username, Password: input.Password})))
 		if err != nil {
 			return err
 		}

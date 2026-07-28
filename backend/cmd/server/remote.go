@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ type remoteSession struct {
 	Authorization string
 	Cookie        string
 	UserID        string
+	SessionID     string
 }
 
 func newRemoteHTTPClient() *http.Client {
@@ -117,6 +119,9 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 	if session.UserID != "" {
 		request.Header.Set("New-Api-User", session.UserID)
 	}
+	if session.SessionID != "" {
+		request.Header.Set("X-Auth-Session", session.SessionID)
+	}
 	response, err := a.httpClient.Do(request)
 	if err != nil {
 		return nil, nil, &apiError{Status: 502, Code: "REMOTE_UNAVAILABLE", Message: "无法连接远端平台"}
@@ -131,9 +136,80 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 		return nil, response.Header, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端返回了无法识别的数据"}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return value, response.Header, &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: fmt.Sprintf("远端请求失败 (%d)", response.StatusCode)}
+		message := fmt.Sprintf("远端请求失败 (%d)", response.StatusCode)
+		if record, ok := value.(map[string]any); ok {
+			if remoteMessage := text(record["message"], ""); remoteMessage != "" {
+				message = remoteMessage
+			}
+			if remoteCode := text(record["code"], ""); remoteCode != "" {
+				message = remoteCode + ": " + message
+			}
+			if remoteError, ok := record["error"].(map[string]any); ok {
+				message = text(remoteError["message"], message)
+			}
+		}
+		code := "REMOTE_REJECTED"
+		if response.StatusCode == http.StatusUnauthorized {
+			code = "REMOTE_UNAUTHORIZED"
+		}
+		return value, response.Header, &apiError{Status: 502, Code: code, Message: message}
 	}
 	return value, response.Header, nil
+}
+
+type sub2APITokenPair struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+func (a *App) refreshSub2APIToken(ctx context.Context, baseURL, refreshToken string) (sub2APITokenPair, error) {
+	value, _, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/refresh", remoteSession{}, map[string]string{"refresh_token": refreshToken})
+	if err != nil {
+		value, _, err = a.remoteJSON(ctx, baseURL, http.MethodPost, "/auth/refresh", remoteSession{}, map[string]string{"refresh_token": refreshToken})
+		if err != nil {
+			return sub2APITokenPair{}, err
+		}
+	}
+	data, err := sub2APIResponseData(value)
+	if err != nil {
+		return sub2APITokenPair{}, err
+	}
+	record, ok := data.(map[string]any)
+	if !ok {
+		return sub2APITokenPair{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端刷新令牌响应不兼容"}
+	}
+	pair := sub2APITokenPair{
+		AccessToken:  text(record["access_token"], ""),
+		RefreshToken: text(record["refresh_token"], refreshToken),
+	}
+	if pair.AccessToken == "" || pair.RefreshToken == "" {
+		return sub2APITokenPair{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端刷新令牌响应缺少令牌"}
+	}
+	return pair, nil
+}
+
+func sub2APIResponseData(value any) (any, error) {
+	envelope, ok := value.(map[string]any)
+	if !ok {
+		return value, nil
+	}
+	if _, hasCode := envelope["code"]; hasCode {
+		return unwrapEnvelope(value, "SUB2API")
+	}
+	if success, hasSuccess := envelope["success"].(bool); hasSuccess {
+		if !success {
+			return nil, &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: text(envelope["message"], "远端拒绝请求")}
+		}
+		if data, hasData := envelope["data"]; hasData {
+			return data, nil
+		}
+	}
+	return value, nil
+}
+
+func remoteUnauthorized(err error) bool {
+	var typed *apiError
+	return errors.As(err, &typed) && typed.Code == "REMOTE_UNAUTHORIZED"
 }
 
 func unwrapEnvelope(value any, platform string) (any, error) {
@@ -157,19 +233,23 @@ func unwrapEnvelope(value any, platform string) (any, error) {
 
 func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, password string) (remoteSession, error) {
 	if platform == "SUB2API" {
-		value, _, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/login", remoteSession{}, map[string]any{"email": username, "password": password, "not_in_cn_confirmed": true})
+		value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/login", remoteSession{}, map[string]any{"email": username, "password": password, "not_in_cn_confirmed": true})
 		if err != nil {
-			return remoteSession{}, err
+			value, headers, err = a.remoteJSON(ctx, baseURL, http.MethodPost, "/auth/login", remoteSession{}, map[string]string{"email": username, "password": password})
+			if err != nil {
+				return remoteSession{}, err
+			}
 		}
-		data, err := unwrapEnvelope(value, platform)
+		data, err := sub2APIResponseData(value)
 		if err != nil {
 			return remoteSession{}, err
 		}
 		record, ok := data.(map[string]any)
-		if !ok || text(record["access_token"], "") == "" {
+		accessToken := text(record["access_token"], text(record["token"], ""))
+		if !ok || accessToken == "" {
 			return remoteSession{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端登录响应不兼容"}
 		}
-		return remoteSession{Authorization: "Bearer " + text(record["access_token"], "")}, nil
+		return remoteSession{Authorization: "Bearer " + accessToken, Cookie: responseCookie(headers)}, nil
 	}
 	value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/user/login", remoteSession{}, map[string]string{"username": username, "password": password})
 	if err != nil {
@@ -183,12 +263,47 @@ func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, pass
 	if !ok {
 		return remoteSession{}, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端登录响应不兼容"}
 	}
+	if required, _ := record["require_2fa"].(bool); required {
+		return remoteSession{}, &apiError{Status: 409, Code: "REMOTE_2FA_REQUIRED", Message: "远端账号已开启两步验证，暂不支持自动登录"}
+	}
+	if accessToken := text(record["access_token"], ""); accessToken != "" {
+		userID := ""
+		if user, ok := record["user"].(map[string]any); ok {
+			if id, ok := number(user["id"]); ok {
+				userID = strconv.Itoa(int(id))
+			}
+		}
+		sessionID := ""
+		if session, ok := record["session"].(map[string]any); ok {
+			sessionID = text(session["sid"], "")
+		}
+		return remoteSession{Authorization: "Bearer " + accessToken, Cookie: responseCookie(headers), UserID: userID, SessionID: sessionID}, nil
+	}
 	cookie := strings.Split(headers.Get("Set-Cookie"), ";")[0]
 	id, _ := number(record["id"])
 	if cookie == "" || id <= 0 {
 		return remoteSession{}, &apiError{Status: 502, Code: "AUTHENTICATION", Message: "远端登录失败"}
 	}
 	return remoteSession{Cookie: cookie, UserID: strconv.Itoa(int(id))}, nil
+}
+
+func responseCookie(headers http.Header) string {
+	cookies := []string{}
+	for _, value := range headers.Values("Set-Cookie") {
+		if pair := strings.TrimSpace(strings.Split(value, ";")[0]); pair != "" {
+			cookies = append(cookies, pair)
+		}
+	}
+	return strings.Join(cookies, "; ")
+}
+
+func (a *App) logoutRemote(ctx context.Context, baseURL string, session remoteSession) {
+	if session.SessionID == "" || session.Cookie == "" || session.Authorization == "" {
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, _, _ = a.remoteJSON(requestCtx, baseURL, http.MethodPost, "/api/user/auth/logout", session, nil)
 }
 
 func number(value any) (float64, bool) {

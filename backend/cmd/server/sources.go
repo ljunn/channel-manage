@@ -34,8 +34,11 @@ type Source struct {
 }
 
 type sourceCredentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	AuthMode     string `json:"authMode,omitempty"`
+	Username     string `json:"username,omitempty"`
+	Password     string `json:"password,omitempty"`
+	AccessToken  string `json:"accessToken,omitempty"`
+	RefreshToken string `json:"refreshToken,omitempty"`
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
@@ -66,9 +69,9 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 
 func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	var input struct {
-		Name, Platform, Type, BaseURL, Username, Password string
-		ValueNumerator, ValueDenominator                  float64
-		ScanIntervalSeconds                               int
+		Name, Platform, Type, BaseURL, AuthMode, Username, Password, AccessToken, RefreshToken string
+		ValueNumerator, ValueDenominator                                                       float64
+		ScanIntervalSeconds                                                                    int
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		return err
@@ -80,14 +83,44 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	if platform != "SUB2API" && platform != "NEW_API" {
 		return &apiError{400, "INVALID_TYPE", "数据源类型必须是 Sub2API 或 New API"}
 	}
-	if strings.TrimSpace(input.Name) == "" || input.Username == "" || input.Password == "" {
-		return &apiError{400, "INVALID_INPUT", "请填写名称、账号和密码"}
+	if strings.TrimSpace(input.Name) == "" {
+		return &apiError{400, "INVALID_INPUT", "请填写数据源名称"}
+	}
+	authMode := strings.ToUpper(strings.TrimSpace(input.AuthMode))
+	if authMode == "" {
+		authMode = "PASSWORD"
+	}
+	if authMode != "PASSWORD" && authMode != "TOKEN" {
+		return &apiError{400, "INVALID_AUTH_MODE", "认证方式必须是账号密码或令牌"}
+	}
+	if platform != "SUB2API" && authMode != "PASSWORD" {
+		return &apiError{400, "INVALID_AUTH_MODE", "New API 仅支持账号密码认证"}
+	}
+	credential := sourceCredentials{AuthMode: authMode}
+	credentialHint := ""
+	if authMode == "TOKEN" {
+		accessToken := normalizeAccessToken(input.AccessToken)
+		refreshToken := strings.TrimSpace(input.RefreshToken)
+		if platform != "SUB2API" || accessToken == "" || refreshToken == "" {
+			return &apiError{400, "INVALID_INPUT", "令牌认证需要填写 Access Token 和 Refresh Token"}
+		}
+		credential.AccessToken = accessToken
+		credential.RefreshToken = refreshToken
+		credentialHint = "令牌认证"
+	} else {
+		if strings.TrimSpace(input.Username) == "" || input.Password == "" {
+			return &apiError{400, "INVALID_INPUT", "请填写账号和密码"}
+		}
+		credential.AuthMode = "PASSWORD"
+		credential.Username = strings.TrimSpace(input.Username)
+		credential.Password = input.Password
+		credentialHint = mask(input.Username)
 	}
 	baseURL, err := validateRemoteURL(input.BaseURL)
 	if err != nil {
 		return err
 	}
-	credential, err := a.encryptSecret([]byte(jsonValue(sourceCredentials{input.Username, input.Password})))
+	encryptedCredential, err := a.encryptSecret([]byte(jsonValue(credential)))
 	if err != nil {
 		return err
 	}
@@ -100,17 +133,25 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 		interval = 900
 	}
 	id := uuid.NewString()
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,value_divisor,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, strings.TrimSpace(input.Name), platform, baseURL, divisor, credential, mask(input.Username), interval)
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,value_divisor,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, strings.TrimSpace(input.Name), platform, baseURL, divisor, encryptedCredential, credentialHint, interval)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") {
 			return &apiError{409, "SOURCE_ALREADY_EXISTS", "该平台地址已添加"}
 		}
 		return err
 	}
-	a.audit(r.Context(), "CREATE", "source", id, map[string]any{"name": input.Name, "platform": platform, "base_url": baseURL, "value_divisor": divisor})
+	a.audit(r.Context(), "CREATE", "source", id, map[string]any{"name": input.Name, "platform": platform, "base_url": baseURL, "value_divisor": divisor, "auth_mode": credential.AuthMode})
 	go a.scanSource(context.Background(), id)
 	writeData(w, map[string]any{"id": id, "status": "ACCEPTED"})
 	return nil
+}
+
+func normalizeAccessToken(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 7 && strings.EqualFold(value[:7], "Bearer ") {
+		return strings.TrimSpace(value[7:])
+	}
+	return value
 }
 
 func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) error {
@@ -222,9 +263,16 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		requestCtx, cancel := timeoutContext(ctx)
 		defer cancel()
 		var session remoteSession
-		session, err = a.loginRemote(requestCtx, source.BaseURL, source.Platform, credential.Username, credential.Password)
+		session, err = a.authenticateSource(requestCtx, source, credential, false)
 		if err == nil {
+			defer a.logoutRemote(ctx, source.BaseURL, session)
 			err = a.collectSource(requestCtx, source, session)
+			if remoteUnauthorized(err) && credential.AuthMode == "TOKEN" && credential.RefreshToken != "" {
+				session, err = a.refreshSourceSession(requestCtx, source, credential)
+				if err == nil {
+					err = a.collectSource(requestCtx, source, session)
+				}
+			}
 		}
 	}
 	if err != nil {
@@ -236,11 +284,59 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 	return err
 }
 
+func (a *App) authenticateSource(ctx context.Context, source Source, credential sourceCredentials, validate bool) (remoteSession, error) {
+	if source.Platform != "SUB2API" || credential.AuthMode != "TOKEN" {
+		return a.loginRemote(ctx, source.BaseURL, source.Platform, credential.Username, credential.Password)
+	}
+	session := remoteSession{Authorization: "Bearer " + credential.AccessToken}
+	if !validate {
+		return session, nil
+	}
+	_, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/groups/available", session, nil)
+	if err == nil {
+		return session, nil
+	}
+	if !remoteUnauthorized(err) || credential.RefreshToken == "" {
+		return remoteSession{}, err
+	}
+	return a.refreshSourceSession(ctx, source, credential)
+}
+
+func (a *App) refreshSourceSession(ctx context.Context, source Source, expected sourceCredentials) (remoteSession, error) {
+	a.sourceAuthMu.Lock()
+	defer a.sourceAuthMu.Unlock()
+
+	_, current, err := a.sourceCredentials(ctx, source.ID)
+	if err != nil {
+		return remoteSession{}, err
+	}
+	if current.AuthMode != "TOKEN" || current.RefreshToken == "" {
+		return remoteSession{}, &apiError{Status: 409, Code: "SOURCE_AUTH_CHANGED", Message: "数据源认证方式已变更，请重试"}
+	}
+	if current.RefreshToken != expected.RefreshToken && current.AccessToken != "" {
+		return remoteSession{Authorization: "Bearer " + current.AccessToken}, nil
+	}
+	pair, err := a.refreshSub2APIToken(ctx, source.BaseURL, current.RefreshToken)
+	if err != nil {
+		return remoteSession{}, err
+	}
+	current.AccessToken = pair.AccessToken
+	current.RefreshToken = pair.RefreshToken
+	encrypted, err := a.encryptSecret([]byte(jsonValue(current)))
+	if err != nil {
+		return remoteSession{}, err
+	}
+	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,updated_at=now() WHERE id=$1`, source.ID, encrypted); err != nil {
+		return remoteSession{}, err
+	}
+	return remoteSession{Authorization: "Bearer " + pair.AccessToken}, nil
+}
+
 func (a *App) collectSource(ctx context.Context, source Source, session remoteSession) error {
 	type group struct {
-		RemoteID, Name string
-		Multiplier     *float64
-		Models         []string
+		RemoteID, Name, Description, GroupType string
+		Multiplier                             *float64
+		Models                                 []string
 	}
 	groups := []group{}
 	var balance *float64
@@ -277,7 +373,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			if v, ok := number(rates[remoteID]); ok {
 				multiplier = &v
 			}
-			groups = append(groups, group{remoteID, text(record["name"], remoteID), multiplier, []string{}})
+			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["description"], ""), text(record["platform"], "default"), multiplier, []string{}})
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/user/profile", session, nil)
 		if err == nil {
@@ -306,7 +402,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			if v, ok := number(record["ratio"]); ok {
 				multiplier = &v
 			}
-			groups = append(groups, group{remoteID, text(record["desc"], remoteID), multiplier, []string{}})
+			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["desc"], ""), "default", multiplier, []string{}})
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/user/self", session, nil)
 		if err == nil {
@@ -341,7 +437,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 	}
 	for _, item := range groups {
 		var groupID string
-		err = tx.QueryRowContext(ctx, `INSERT INTO source_groups(source_id,remote_id,name,multiplier,models,captured_at) VALUES($1,$2,$3,$4,$5,now()) ON CONFLICT(source_id,remote_id) DO UPDATE SET name=excluded.name,multiplier=excluded.multiplier,models=excluded.models,captured_at=now() RETURNING id`, source.ID, item.RemoteID, item.Name, item.Multiplier, jsonValue(item.Models)).Scan(&groupID)
+		err = tx.QueryRowContext(ctx, `INSERT INTO source_groups(source_id,remote_id,name,description,multiplier,group_type,models,captured_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT(source_id,remote_id) DO UPDATE SET name=excluded.name,description=excluded.description,multiplier=excluded.multiplier,group_type=excluded.group_type,models=excluded.models,captured_at=now() RETURNING id`, source.ID, item.RemoteID, item.Name, item.Description, item.Multiplier, item.GroupType, jsonValue(item.Models)).Scan(&groupID)
 		if err != nil {
 			return err
 		}
@@ -417,39 +513,28 @@ func (a *App) sourceDetail(w http.ResponseWriter, r *http.Request, id string) er
 	if source == nil {
 		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,name,key_hint,production_authorized,status,models,concurrency,created_at FROM source_keys WHERE source_id=$1 ORDER BY created_at`, id)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	keys := []map[string]any{}
-	for rows.Next() {
-		var keyID, name, hint, authorized, status, models string
-		var production bool
-		var concurrency int
-		var created time.Time
-		if err := rows.Scan(&keyID, &name, &hint, &production, &status, &models, &concurrency, &created); err != nil {
-			return err
-		}
-		_ = authorized
-		keys = append(keys, map[string]any{"id": keyID, "name": name, "keyHint": hint, "productionAuthorized": production, "status": status, "models": json.RawMessage(models), "concurrency": concurrency, "createdAt": created})
-	}
-	groupRows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,multiplier,group_type,models,captured_at FROM source_groups WHERE source_id=$1 ORDER BY name`, id)
+	groupRows, err := a.db.QueryContext(r.Context(), `SELECT g.id,g.remote_id,g.name,g.description,g.multiplier,g.group_type,g.models,g.captured_at,
+		COALESCE(jsonb_agg(DISTINCT jsonb_build_object('targetId',t.id,'targetName',t.name)) FILTER (WHERE t.id IS NOT NULL),'[]'::jsonb)
+		FROM source_groups g
+		LEFT JOIN channels c ON c.source_group_id=g.id
+		LEFT JOIN managed_accounts m ON m.channel_id=c.id
+		LEFT JOIN targets t ON t.id=m.target_id
+		WHERE g.source_id=$1 GROUP BY g.id ORDER BY g.name`, id)
 	if err != nil {
 		return err
 	}
 	defer groupRows.Close()
 	groups := []map[string]any{}
 	for groupRows.Next() {
-		var groupID, remoteID, name, groupType, models string
+		var groupID, remoteID, name, description, groupType, models, deployments string
 		var multiplier sql.NullFloat64
 		var captured time.Time
-		if err := groupRows.Scan(&groupID, &remoteID, &name, &multiplier, &groupType, &models, &captured); err != nil {
+		if err := groupRows.Scan(&groupID, &remoteID, &name, &description, &multiplier, &groupType, &models, &captured, &deployments); err != nil {
 			return err
 		}
-		groups = append(groups, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "multiplier": nullableFloat(multiplier), "groupType": groupType, "models": json.RawMessage(models), "capturedAt": captured})
+		groups = append(groups, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "description": description, "multiplier": nullableFloat(multiplier), "groupType": groupType, "models": json.RawMessage(models), "deployments": json.RawMessage(deployments), "capturedAt": captured})
 	}
-	writeData(w, map[string]any{"source": source, "keys": keys, "groups": groups})
+	writeData(w, map[string]any{"source": source, "groups": groups})
 	return nil
 }
 
