@@ -76,6 +76,18 @@ func TestUnwrapEnvelope(t *testing.T) {
 	if _, err := unwrapEnvelope(map[string]any{"success": false}, "NEW_API"); err == nil {
 		t.Fatal("failed response was accepted")
 	}
+	direct := []any{map[string]any{"id": float64(1)}}
+	value, err = unwrapEnvelope(direct, "SUB2API")
+	if err != nil || len(value.([]any)) != 1 {
+		t.Fatalf("direct Sub2API response was not accepted: %#v, %v", value, err)
+	}
+}
+
+func TestAPIErrorIncludesActionableMessage(t *testing.T) {
+	err := (&apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "AUTH_SESSION_LIMIT: Conflict"}).Error()
+	if err != "REMOTE_REJECTED: AUTH_SESSION_LIMIT: Conflict" {
+		t.Fatalf("unexpected error text: %q", err)
+	}
 }
 
 func TestStableKey(t *testing.T) {
@@ -182,6 +194,26 @@ func TestLoginRemoteSupportsFlatSub2APILogin(t *testing.T) {
 	}
 	if session.Authorization != "Bearer flat-token" {
 		t.Fatalf("unexpected session: %#v", session)
+	}
+}
+
+func TestLoginRemoteDoesNotHideSub2APIAuthenticationError(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	fallbackCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/auth/login" {
+			fallbackCalled = true
+			t.Fatal("flat login fallback must not run after an authentication failure")
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":401,"reason":"INVALID_CREDENTIALS","message":"invalid email or password"}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
+	if err == nil || !strings.Contains(err.Error(), "INVALID_CREDENTIALS: invalid email or password") || fallbackCalled {
+		t.Fatalf("expected original authentication error, got %v", err)
 	}
 }
 

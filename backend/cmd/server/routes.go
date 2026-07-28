@@ -195,8 +195,10 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 			return a.deleteTarget(w, r, id)
 		}
 		if len(parts) == 3 && parts[2] == "test-connection" && method == http.MethodPost {
-			go a.syncTarget(context.Background(), id)
-			writeData(w, map[string]string{"id": id, "status": "ACCEPTED"})
+			if err := a.syncTarget(r.Context(), id); err != nil {
+				return err
+			}
+			writeData(w, map[string]string{"id": id, "status": "ONLINE"})
 			return nil
 		}
 		if len(parts) == 3 && method == http.MethodGet && (parts[2] == "groups" || parts[2] == "protected-accounts" || parts[2] == "managed-accounts") {

@@ -47,7 +47,15 @@ type apiError struct {
 	Message string
 }
 
-func (e *apiError) Error() string { return e.Code }
+func (e *apiError) Error() string {
+	if e.Message == "" {
+		return e.Code
+	}
+	if e.Code == "" {
+		return e.Message
+	}
+	return e.Code + ": " + e.Message
+}
 
 func main() {
 	ctx := context.Background()

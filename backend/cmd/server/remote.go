@@ -141,6 +141,9 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 			if remoteMessage := text(record["message"], ""); remoteMessage != "" {
 				message = remoteMessage
 			}
+			if remoteReason := text(record["reason"], ""); remoteReason != "" {
+				message = remoteReason + ": " + message
+			}
 			if remoteCode := text(record["code"], ""); remoteCode != "" {
 				message = remoteCode + ": " + message
 			}
@@ -194,7 +197,11 @@ func sub2APIResponseData(value any) (any, error) {
 		return value, nil
 	}
 	if _, hasCode := envelope["code"]; hasCode {
-		return unwrapEnvelope(value, "SUB2API")
+		code, codeOK := number(envelope["code"])
+		if !codeOK || code != 0 {
+			return nil, &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: text(envelope["message"], "远端拒绝请求")}
+		}
+		return envelope["data"], nil
 	}
 	if success, hasSuccess := envelope["success"].(bool); hasSuccess {
 		if !success {
@@ -212,17 +219,22 @@ func remoteUnauthorized(err error) bool {
 	return errors.As(err, &typed) && typed.Code == "REMOTE_UNAUTHORIZED"
 }
 
+func remoteRouteUnavailable(err error) bool {
+	var typed *apiError
+	if !errors.As(err, &typed) {
+		return false
+	}
+	message := strings.ToLower(typed.Message)
+	return typed.Code == "SCHEMA_CHANGED" || strings.Contains(message, "(404)") || strings.Contains(message, "not found")
+}
+
 func unwrapEnvelope(value any, platform string) (any, error) {
+	if platform == "SUB2API" {
+		return sub2APIResponseData(value)
+	}
 	record, ok := value.(map[string]any)
 	if !ok {
 		return nil, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端返回格式不兼容"}
-	}
-	if platform == "SUB2API" {
-		code, ok := number(record["code"])
-		if !ok || code != 0 {
-			return nil, &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: text(record["message"], "远端拒绝请求")}
-		}
-		return record["data"], nil
 	}
 	success, ok := record["success"].(bool)
 	if !ok || !success {
@@ -235,6 +247,9 @@ func (a *App) loginRemote(ctx context.Context, baseURL, platform, username, pass
 	if platform == "SUB2API" {
 		value, headers, err := a.remoteJSON(ctx, baseURL, http.MethodPost, "/api/v1/auth/login", remoteSession{}, map[string]any{"email": username, "password": password, "not_in_cn_confirmed": true})
 		if err != nil {
+			if !remoteRouteUnavailable(err) {
+				return remoteSession{}, err
+			}
 			value, headers, err = a.remoteJSON(ctx, baseURL, http.MethodPost, "/auth/login", remoteSession{}, map[string]string{"email": username, "password": password})
 			if err != nil {
 				return remoteSession{}, err
