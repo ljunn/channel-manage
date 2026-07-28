@@ -1,0 +1,10 @@
+.env
+channel-manage
+release/
+frontend/node_modules/
+frontend/dist/
+.playwright-cli/
+.playwright/
+output/
+test-results/
+*.log
