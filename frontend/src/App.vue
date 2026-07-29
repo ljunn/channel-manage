@@ -29,11 +29,15 @@ const selectedSource = ref('')
 const targetGroups = ref([])
 const sourceOpening = ref(false)
 const targetGroupsLoading = ref(false)
+const deploymentBusy = ref(false)
 const policyTargetGroups = ref([])
 const form = reactive({})
 const marketMetric = ref('average')
 const marketGroup = ref('all')
 const marketTab = ref('low')
+const sourceBindingFilter = ref('all')
+const sourceStatusFilter = ref('all')
+const sourceSort = ref('created')
 const systemVersion = reactive({currentVersion:'',buildType:'',repository:'',updateSupported:false,restartSupported:false,rollbackAvailable:false,restartPending:false,pendingVersion:''})
 const updateInfo = reactive({latestVersion:'',hasUpdate:false,name:'',body:'',htmlUrl:'',publishedAt:''})
 const updateBusy = ref(false)
@@ -60,6 +64,23 @@ const filtered = items => !search.value ? items : items.filter(item => JSON.stri
 const paged = items => filtered(items).slice((page.value-1)*pageSize.value,page.value*pageSize.value)
 const filteredCount = items => filtered(items).length
 const ranking = index => (page.value-1)*pageSize.value+index+1
+const sourceRows = computed(() => {
+  let items=filtered(data.sources)
+  if(sourceBindingFilter.value==='unbound')items=items.filter(item=>Number(item.managedAccountCount||0)===0)
+  else if(sourceBindingFilter.value==='partial')items=items.filter(item=>Number(item.boundGroupCount||0)>0&&Number(item.boundGroupCount||0)<Number(item.groupCount||0))
+  else if(sourceBindingFilter.value==='complete')items=items.filter(item=>Number(item.groupCount||0)>0&&Number(item.boundGroupCount||0)>=Number(item.groupCount||0))
+  if(sourceStatusFilter.value!=='all')items=items.filter(item=>item.scanStatus===sourceStatusFilter.value)
+  const result=[...items]
+  const nullLast=(left,right,direction=1)=>left==null&&right==null?0:left==null?1:right==null?-1:direction*(Number(left)-Number(right))
+  if(sourceSort.value==='accountsAsc')result.sort((a,b)=>Number(a.managedAccountCount||0)-Number(b.managedAccountCount||0))
+  else if(sourceSort.value==='accountsDesc')result.sort((a,b)=>Number(b.managedAccountCount||0)-Number(a.managedAccountCount||0))
+  else if(sourceSort.value==='balanceDesc')result.sort((a,b)=>nullLast(a.balance,b.balance,-1))
+  else if(sourceSort.value==='balanceAsc')result.sort((a,b)=>nullLast(a.balance,b.balance,1))
+  else if(sourceSort.value==='groupsDesc')result.sort((a,b)=>Number(b.groupCount||0)-Number(a.groupCount||0))
+  else result.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt))
+  return result
+})
+const sourcePagedRows = computed(() => sourceRows.value.slice((page.value-1)*pageSize.value,page.value*pageSize.value))
 const marketGroupChannels = computed(() => data.market.channels.filter(item=>marketGroup.value==='all'||item.targetGroupId===marketGroup.value))
 const marketRankedChannels = computed(() => marketGroupChannels.value.filter(item=>marketTab.value!=='stable'||(item.lifecycleState==='HEALTHY'&&Number(item.probeSamples7d||0)+Number(item.businessSamples7d||0)>0)).sort((a,b)=>marketTab.value==='stable'?(Number(b.qualityScore)-Number(a.qualityScore)||Number(b.probeSamples7d+b.businessSamples7d)-Number(a.probeSamples7d+a.businessSamples7d)):(Number(a.qualityScore)-Number(b.qualityScore))))
 const marketPagedChannels = computed(() => marketRankedChannels.value.slice((page.value-1)*pageSize.value,page.value*pageSize.value))
@@ -77,6 +98,7 @@ watch(route, () => { search.value=''; page.value=1; clearMessages(); if(token.va
 watch(search, () => { page.value=1 })
 watch(pageSize, () => { page.value=1 })
 watch([marketGroup,marketTab], () => { page.value=1 })
+watch([sourceBindingFilter,sourceStatusFilter,sourceSort], () => { page.value=1 })
 onMounted(async () => { void loadVersion(); if (token.value) { try { operator.value=await api('/auth/me'); await loadPage() } catch {} } else route.value='/login' })
 
 async function loadVersion(){
@@ -111,7 +133,7 @@ async function login(event){
 }
 
 async function loadPage(){
-  loading.value=true;page.value=1;clearMessages()
+  loading.value=true;clearMessages()
   try{
     const path=route.value
     if(path==='/overview') data.summary=await api('/dashboard/summary')
@@ -167,11 +189,20 @@ function mappedTargets(group){return (group.deployments||[]).map(item=>item.targ
 function toggleSourceGroups(){const available=(sourceDetail.value?.groups||[]).filter(group=>!isGroupMapped(group)).map(group=>group.id);form.sourceGroupIDs=form.sourceGroupIDs?.length===available.length?[]:available}
 function toggleTargetGroups(){const available=targetGroups.value.map(group=>group.id);form.targetGroupIDs=form.targetGroupIDs?.length===available.length?[]:available}
 async function deploySourceGroups(){
+	if(deploymentBusy.value)return
   if(!form.sourceGroupIDs?.length){showError(new Error('请至少选择一个源分组'));return}
   if(!form.targetID||!form.targetGroupIDs?.length){showError(new Error('请选择目标节点和目标分组'));return}
+	const sourceID=selectedSource.value
+	const sourceGroupCount=form.sourceGroupIDs.length
   const accountCount=form.sourceGroupIDs.length*form.targetGroupIDs.length
   const timeout=(form.sourceGroupIDs.length+accountCount+1)*30000
-  await submit(()=>api(`/sources/${selectedSource.value}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)}),timeout}),`已自动创建 ${form.sourceGroupIDs.length} 个专用 Key 和 ${accountCount} 个独立托管账号，默认停止调度`)
+	deploymentBusy.value=true;clearMessages()
+	try{
+		await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)}),timeout})
+		const [detail,sources]=await Promise.all([api(`/sources/${sourceID}`),api('/sources')])
+		sourceDetail.value=detail;data.sources=sources;form.sourceGroupIDs=[]
+		notice.value=`已自动创建 ${sourceGroupCount} 个专用 Key 和 ${accountCount} 个独立托管账号，可继续选择其他源分组`
+	}catch(reason){showError(reason)}finally{deploymentBusy.value=false}
 }
 async function openPolicy(){open('policy',{targetID:writableTargets.value[0]?.id||'',targetGroupID:'',mode:'PRICE',minSuccessRate:95,minSamples:5});await loadPolicyTargetGroups()}
 async function loadPolicyTargetGroups(){policyTargetGroups.value=form.targetID?await api(`/targets/${form.targetID}/groups`):[];form.targetGroupID=''}
@@ -217,6 +248,8 @@ function money(value){return value==null?'--':`$${Number(value).toFixed(2)}`}
 function ratio(value){return value==null?'--':`${Number(value).toFixed(4)}x`}
 function multiplierLabel(value){return value==null?'倍率未提供':`倍率 ×${Number(value).toFixed(4)}`}
 function valueRatio(value){return `1 : ${Number(value||1).toLocaleString('zh-CN',{maximumFractionDigits:8,useGrouping:false})}`}
+function coveragePercent(bound,total){return total?`${Math.round(Number(bound||0)*100/Number(total))}%`:'--'}
+function sourceBindingText(row){if(!Number(row.managedAccountCount||0))return'未绑定';if(Number(row.boundGroupCount||0)>=Number(row.groupCount||0))return'已全部绑定';return'部分绑定'}
 function minimumRatio(items){const values=items.map(item=>Number(item.multiplier)).filter(value=>Number.isFinite(value));return values.length?Math.min(...values):null}
 </script>
 
@@ -250,16 +283,17 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <template v-if="route==='/overview'">
           <div class="page-head"><div><span class="eyebrow">TODAY</span><h1>运营总览</h1></div><button class="btn" @click="runAutomation"><Play :size="16"/>立即运行</button></div>
           <div v-if="loading" class="skeleton-grid"><i v-for="n in 6" :key="n" /></div>
-          <template v-else><section class="metric-strip"><article><span>数据源</span><strong>{{ data.summary.sources||0 }}</strong><small>已启用平台</small></article><article><span>托管渠道</span><strong>{{ data.summary.channels||0 }}</strong><small>{{ data.summary.healthyChannels||0 }} 个健康</small></article><article><span>托管账号</span><strong>{{ data.summary.managedAccounts||0 }}</strong><small>目标节点账号</small></article><article><span>最低倍率</span><strong>{{ ratio(data.summary.minimumMultiplier) }}</strong><small>24 小时样本</small></article></section>
+		  <template v-else><section class="metric-strip"><article><span>数据源</span><strong>{{ data.summary.sources||0 }}</strong><small>{{ data.summary.unboundSources||0 }} 个尚未绑定</small></article><article><span>源分组覆盖率</span><strong>{{ coveragePercent(data.summary.boundSourceGroups,data.summary.totalSourceGroups) }}</strong><small>{{ data.summary.boundSourceGroups||0 }} / {{ data.summary.totalSourceGroups||0 }} 个已创建账号</small></article><article><span>托管账号</span><strong>{{ data.summary.managedAccounts||0 }}</strong><small>{{ data.summary.healthyChannels||0 }} 个渠道健康</small></article><article><span>待关注数据源</span><strong>{{ data.summary.attentionSources?.length||0 }}</strong><small>{{ data.summary.openEvents||0 }} 个活动事件</small></article></section>
+		  <div class="overview-ops-grid"><section class="panel overview-list"><header><div><span class="eyebrow">ACTION QUEUE</span><h2>需要处理的数据源</h2></div><button class="link" @click="go('/sources')">查看全部 <ArrowRight :size="14"/></button></header><StateBlock v-if="!data.summary.attentionSources?.length" title="当前没有待关注数据源"/><div v-else class="overview-source-list"><button v-for="row in data.summary.attentionSources" :key="row.id" class="overview-source-row" @click="go('/sources')"><span><strong>{{ row.name }}</strong><small>{{ sourceBindingText(row) }} · {{ row.boundGroupCount||0 }}/{{ row.groupCount||0 }} 个分组 · {{ row.managedAccountCount||0 }} 个账号</small></span><span class="overview-source-side"><b>{{ money(row.balance) }}</b><small :class="{'danger-text':row.scanStatus==='FAILED'}">{{ row.scanStatus==='FAILED'?'扫描失败':statusText(row.scanStatus) }}</small></span></button></div></section><section class="panel overview-list"><header><div><span class="eyebrow">BALANCE WATCH</span><h2>余额分布</h2></div><CircleDollarSign :size="21"/></header><div class="balance-columns"><div><h3>余额较低</h3><span v-for="row in (data.summary.lowestBalanceSources||[])" :key="`low-${row.id}`"><strong>{{ row.name }}</strong><b>{{ money(row.balance) }}</b></span><small v-if="!data.summary.lowestBalanceSources?.length">暂无余额数据</small></div><div><h3>余额较高</h3><span v-for="row in (data.summary.highestBalanceSources||[])" :key="`high-${row.id}`"><strong>{{ row.name }}</strong><b>{{ money(row.balance) }}</b></span><small v-if="!data.summary.highestBalanceSources?.length">暂无余额数据</small></div></div></section></div>
           <div class="overview-grid"><section class="panel safety-panel"><header><div><span class="eyebrow">SAFETY GATE</span><h2>生产安全</h2></div><ShieldCheck :size="22"/></header><div class="safety-state"><span :class="['safety-icon',data.summary.emergencyFreeze?'danger':'success']"><Pause v-if="data.summary.emergencyFreeze"/><Check v-else/></span><div><strong>{{ data.summary.emergencyFreeze?'紧急冻结':'写入闸门正常' }}</strong><small>{{ data.summary.shadowMode?'当前为影子模式':'允许执行已批准动作' }}</small></div></div><div class="mini-stats"><span><b>{{ data.summary.pendingActions||0 }}</b>待审批动作</span><span><b>{{ data.summary.openEvents||0 }}</b>活动事件</span></div></section>
-          <section class="panel quick-panel"><header><div><span class="eyebrow">WORKFLOW</span><h2>工作流程</h2></div><Activity :size="22"/></header><ol><li><span>1</span><div><strong>市场采集</strong><small>数据源按周期同步</small></div></li><li><span>2</span><div><strong>渠道探测</strong><small>质量与模型能力验证</small></div></li><li><span>3</span><div><strong>策略判定</strong><small>生成可解释动作</small></div></li><li><span>4</span><div><strong>自动执行</strong><small>只写入托管账号</small></div></li></ol></section></div></template>
+		  <section class="panel quick-panel"><header><div><span class="eyebrow">QUALITY SIGNAL</span><h2>渠道健康</h2></div><Activity :size="22"/></header><div class="safety-state"><span class="safety-icon success"><Check/></span><div><strong>{{ data.summary.healthyChannels||0 }} / {{ data.summary.channels||0 }} 个渠道健康</strong><small>仅统计本系统已托管的目标渠道</small></div></div><div class="mini-stats"><span><b>{{ ratio(data.summary.minimumMultiplier) }}</b>当前最低倍率</span><span><b>{{ data.summary.unboundSourceGroups||0 }}</b>未绑定源分组</span></div></section></div></template>
         </template>
 
         <template v-else-if="route==='/sources'">
           <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></div>
           <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></StateBlock>
-          <div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额</th><th>分组</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in paged(data.sources)" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td>{{ row.groupCount }}</td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div>
-          <PaginationBar v-if="!loading" v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.sources)"/>
+          <template v-else><div class="source-controls"><label><span>绑定状态</span><select v-model="sourceBindingFilter"><option value="all">全部</option><option value="unbound">未绑定账号</option><option value="partial">部分绑定</option><option value="complete">已全部绑定</option></select></label><label><span>扫描状态</span><select v-model="sourceStatusFilter"><option value="all">全部状态</option><option value="SUCCESS">扫描成功</option><option value="FAILED">扫描失败</option><option value="RUNNING">扫描中</option></select></label><label><span>排序</span><select v-model="sourceSort"><option value="created">最近接入</option><option value="accountsAsc">托管账号少 → 多</option><option value="accountsDesc">托管账号多 → 少</option><option value="balanceDesc">余额高 → 低</option><option value="balanceAsc">余额低 → 高</option><option value="groupsDesc">源分组多 → 少</option></select></label><span class="source-result-count">{{ sourceRows.length }} 个符合条件</span></div><StateBlock v-if="!sourceRows.length" title="没有符合条件的数据源"/><div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额</th><th>绑定覆盖</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in sourcePagedRows" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td class="binding-progress"><strong>{{ row.boundGroupCount||0 }} / {{ row.groupCount||0 }} 个源分组</strong><small>{{ row.managedAccountCount||0 }} 个托管账号 · {{ sourceBindingText(row) }}</small></td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div></template>
+          <PaginationBar v-if="!loading&&sourceRows.length" v-model:page="page" v-model:page-size="pageSize" :total="sourceRows.length"/>
         </template>
 
         <template v-else-if="route==='/market'">
@@ -297,7 +331,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
 
         <template v-else-if="route==='/policies'">
           <div class="page-head"><div><h1>策略配置</h1><span>每 30 秒评估托管账号并同步调度状态与优先级</span></div><button class="btn primary" @click="openPolicy"><Plus :size="16"/>新建分组策略</button></div>
-          <div class="policy-list"><article v-for="row in paged(data.policies)" :key="row.id" class="panel policy"><header><div><strong>{{ row.name }}</strong><small>{{ row.targetName }} / {{ row.targetGroupName }} · v{{ row.activeVersion||1 }}</small></div><span :class="['badge',statusTone(row.status)]">{{ row.status==='ACTIVE'?'自动调度中':'未启用调度' }}</span></header><div :class="['policy-scheduling',row.status==='ACTIVE'?'active':'inactive']"><Workflow :size="17"/><div><strong>{{ row.status==='ACTIVE'?`${row.schedulableCount} / ${row.managedCount} 个账号参与调度`:'自动调度未运行' }}</strong><small>{{ row.status==='ACTIVE'?`每 ${row.evaluationIntervalSeconds} 秒重新评估，并直接同步到目标节点`:'启用后才会自动调整账号状态和优先级' }}</small></div></div><dl><div><dt>排序方式</dt><dd>{{ row.config.mode==='SPEED'?'首 Token P95 从快到慢':'源倍率从低到高' }}</dd></div><div><dt>写入优先级</dt><dd>1000 起连续排列</dd></div><div><dt>参与条件</dt><dd>健康 · 倍率不超目标</dd></div><div><dt>样本门槛</dt><dd>≥ {{ row.config.minSamples||5 }} 次 · 成功率 ≥ {{ row.config.minSuccessRate||95 }}%</dd></div></dl><p class="policy-effect">不满足条件的账号自动退出调度；恢复满足条件后自动重新加入。</p><footer><button v-if="row.status!=='ACTIVE'" class="btn primary small" @click="activatePolicy(row)"><Play :size="14"/>启用自动调度</button><button v-else class="btn small" @click="deactivatePolicy(row)"><Pause :size="14"/>停用调度</button><button class="btn small" @click="action(()=>api(`/policies/${row.id}/simulate`,{method:'POST'}),'模拟完成，结果已生成')"><BarChart3 :size="14"/>模拟</button><button class="icon-btn" title="编辑策略" @click="editPolicy(row)"><Pencil :size="15"/></button><button class="icon-btn danger" title="删除策略" @click="removePolicy(row)"><Trash2 :size="15"/></button></footer></article></div>
+          <div class="policy-list"><article v-for="row in paged(data.policies)" :key="row.id" class="panel policy"><header><div><strong>{{ row.name }}</strong><small>{{ row.targetName }} / {{ row.targetGroupName }} · v{{ row.activeVersion||1 }}</small></div><span :class="['badge',statusTone(row.status)]">{{ row.status==='ACTIVE'?'自动调度中':'未启用调度' }}</span></header><div :class="['policy-scheduling',row.status==='ACTIVE'?'active':'inactive']"><Workflow :size="17"/><div><strong>{{ row.status==='ACTIVE'?`${row.schedulableCount} / ${row.managedCount} 个账号参与调度`:'自动调度未运行' }}</strong><small>{{ row.status==='ACTIVE'?`每 ${row.evaluationIntervalSeconds} 秒重新评估，并直接同步到目标节点`:'启用后才会自动调整账号状态和优先级' }}</small></div></div><dl><div><dt>排序方式</dt><dd>{{ row.config.mode==='SPEED'?'首 Token P95 从快到慢':'源倍率从低到高' }}</dd></div><div><dt>写入优先级</dt><dd>1000 起连续排列</dd></div><div><dt>参与条件</dt><dd>健康 · 倍率不超目标</dd></div><div><dt>{{ row.metricWindowDays||7 }} 天样本门槛</dt><dd>≥ {{ row.config.minSamples||5 }} 次 · 成功率 ≥ {{ row.config.minSuccessRate||95 }}%</dd></div></dl><p class="policy-effect">不满足条件的账号自动退出调度；恢复满足条件后自动重新加入。</p><footer><button v-if="row.status!=='ACTIVE'" class="btn primary small" @click="activatePolicy(row)"><Play :size="14"/>启用自动调度</button><button v-else class="btn small" @click="deactivatePolicy(row)"><Pause :size="14"/>停用调度</button><button class="btn small" @click="action(()=>api(`/policies/${row.id}/simulate`,{method:'POST'}),'模拟完成，结果已生成')"><BarChart3 :size="14"/>模拟</button><button class="icon-btn" title="编辑策略" @click="editPolicy(row)"><Pencil :size="15"/></button><button class="icon-btn danger" title="删除策略" @click="removePolicy(row)"><Trash2 :size="15"/></button></footer></article></div>
           <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.policies)"/>
         </template>
 
@@ -370,7 +404,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
       </section>
       <footer class="mapping-submit">
         <div class="mapping-options"><label><span>初始优先级</span><input v-model="form.priority" type="number" min="1"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
-        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），每个账号只绑定 1 个目标分组</small><button class="btn primary" :disabled="loading||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>确认创建</button></div>
+        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），每个账号只绑定 1 个目标分组</small><button class="btn primary" :disabled="deploymentBusy||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>{{ deploymentBusy?'正在创建':'确认创建' }}</button></div>
       </footer>
     </form>
   </ModalShell>
