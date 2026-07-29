@@ -19,7 +19,7 @@ func (a *App) listChannels(ctx context.Context) ([]map[string]any, error) {
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY m.first_token_p95_ms) FROM metric_buckets m WHERE m.channel_id=c.id AND m.first_token_p95_ms IS NOT NULL AND m.window_start>now()-interval '1 hour'),
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour'),
 		(SELECT COALESCE(sum(m.requests),0) FROM metric_buckets m WHERE m.channel_id=c.id AND m.window_start>now()-interval '1 hour'),
 		(SELECT CASE WHEN COALESCE(sum(m.requests),0)=0 THEN NULL ELSE 100.0*(sum(m.requests)-sum(m.errors))/sum(m.requests) END FROM metric_buckets m WHERE m.channel_id=c.id AND m.window_start>now()-interval '1 hour')
 		FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id ORDER BY s.name,k.name,g.name`)
@@ -51,7 +51,8 @@ func nullableTime(value sql.NullTime) any {
 
 func (a *App) probeChannel(ctx context.Context, id string) error {
 	var sourceID, sourceName, sourceBase, keyName, groupName, encryptedKey, state, stateReason, modelsJSON string
-	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON)
+	var managed bool
+	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models,EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id) FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON, &managed)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
 	}
@@ -68,16 +69,18 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if isSlowFirstTokenQuarantine(state, stateReason) {
 		return a.probeSlowFirstTokenRecovery(ctx, id, sourceID, sourceName, sourceBase, keyName, groupName, string(keyBytes), modelsJSON)
 	}
+	models := []string{}
+	_ = json.Unmarshal([]byte(modelsJSON), &models)
 	started := time.Now()
 	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	value, _, requestErr := a.remoteJSON(requestCtx, sourceBase, http.MethodGet, "/v1/models", remoteSession{Authorization: "Bearer " + string(keyBytes)}, nil)
 	latency := int(time.Since(started).Milliseconds())
-	success := requestErr == nil
+	modelsLoaded := requestErr == nil
 	errorType := ""
 	summary := ""
-	models := []string{}
-	if success {
+	if modelsLoaded {
+		models = models[:0]
 		record, _ := value.(map[string]any)
 		if raw, ok := record["data"].([]any); ok {
 			for _, entry := range raw {
@@ -93,25 +96,54 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	} else {
 		errorType, summary = classifyProbeFailure(requestErr)
 	}
+	probeKind := "LIGHT"
+	var firstTokenValue any
+	slowFirstToken := false
+	if managed {
+		probeKind = "ACTIVE"
+		model := selectFirstTokenProbeModel(models)
+		if model == "" {
+			requestErr = fmt.Errorf("没有可用于首响抽样的文本模型")
+			errorType = "PROBE_MODEL_UNAVAILABLE"
+			summary = requestErr.Error()
+			latency = 0
+		} else {
+			firstTokenMs, sampleErr := a.measureFirstToken(ctx, sourceBase, string(keyBytes), model)
+			latency = firstTokenMs
+			firstTokenValue = firstTokenMs
+			requestErr = sampleErr
+			slowFirstToken = firstTokenMs > maxFirstTokenMs
+			if slowFirstToken {
+				errorType = "FIRST_TOKEN_TOO_SLOW"
+				summary = fmt.Sprintf("流式抽样首 Token %.2f 秒超过 60 秒", float64(firstTokenMs)/1000)
+			} else if sampleErr != nil {
+				errorType, summary = classifyProbeFailure(sampleErr)
+				if errorType != "BALANCE_EXHAUSTED" {
+					summary = truncate(sampleErr.Error(), 200)
+				}
+			} else {
+				errorType = ""
+				summary = fmt.Sprintf("流式抽样首 Token %.2f 秒", float64(firstTokenMs)/1000)
+			}
+		}
+	}
+	success := requestErr == nil && !slowFirstToken
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO probe_runs(channel_id,kind,success,latency_ms,first_token_ms,error_type,response_summary,finished_at) VALUES($1,'LIGHT',$2,$3,NULL,$4,$5,now())`, id, success, latency, truncate(errorType, 100), summary)
+	_, err = tx.ExecContext(ctx, `INSERT INTO probe_runs(channel_id,kind,success,latency_ms,first_token_ms,error_type,response_summary,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())`, id, probeKind, success, latency, firstTokenValue, truncate(errorType, 100), summary)
 	if err != nil {
 		return err
 	}
-	if success {
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET
-			lifecycle_state=CASE WHEN lifecycle_state='QUARANTINED' AND state_reason LIKE '真实业务首 Token%' THEN lifecycle_state ELSE 'HEALTHY' END,
-			state_reason=CASE WHEN lifecycle_state='QUARANTINED' AND state_reason LIKE '真实业务首 Token%' THEN state_reason ELSE '最近探测成功' END,
-			score=CASE WHEN lifecycle_state='QUARANTINED' AND state_reason LIKE '真实业务首 Token%' THEN score ELSE 100 END,
-			consecutive_failures=CASE WHEN lifecycle_state='QUARANTINED' AND state_reason LIKE '真实业务首 Token%' THEN consecutive_failures ELSE 0 END,
-			last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' OR (lifecycle_state='QUARANTINED' AND state_reason LIKE '真实业务首 Token%') THEN state_changed_at ELSE now() END WHERE id=$1`, id)
-		if len(models) > 0 {
-			_, _ = tx.ExecContext(ctx, `UPDATE source_keys SET models=$2::jsonb,updated_at=now() WHERE id=(SELECT source_key_id FROM channels WHERE id=$1)`, id, jsonValue(models))
-		}
+	if modelsLoaded && len(models) > 0 {
+		_, _ = tx.ExecContext(ctx, `UPDATE source_keys SET models=$2::jsonb,updated_at=now() WHERE id=(SELECT source_key_id FROM channels WHERE id=$1)`, id, jsonValue(models))
+	}
+	if slowFirstToken {
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,score=0,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, slowFirstTokenReason(latency))
+	} else if success {
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason='最近流式抽样成功',score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END WHERE id=$1`, id)
 	} else {
 		windowMinutes := a.settingInt(ctx, "metric_window_minutes", 5)
 		minSamples := a.settingInt(ctx, "min_error_samples", 5)
@@ -127,6 +159,11 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	if slowFirstToken {
+		if disableErr := a.disableSlowChannelAccounts(ctx, id, slowFirstTokenReason(latency)); disableErr != nil {
+			logDatabaseError("禁用慢首响渠道", disableErr)
+		}
 	}
 	if errorType == "BALANCE_EXHAUSTED" {
 		detail := fmt.Sprintf("数据源：%s\n渠道：%s / %s\n源站明确返回账户可用余额不足。", sourceName, groupName, keyName)
@@ -693,7 +730,7 @@ func (a *App) marketManagedChannels(ctx context.Context) ([]map[string]any, erro
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
 		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
 		(SELECT CASE WHEN COALESCE(sum(b.requests),0)=0 THEN NULL ELSE 100.0*(sum(b.requests)-sum(b.errors))/sum(b.requests) END FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY b.first_token_p95_ms) FROM metric_buckets b WHERE b.channel_id=c.id AND b.first_token_p95_ms IS NOT NULL AND b.window_start>now()-interval '1 hour')
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour')
 		FROM managed_account_groups mag
 		JOIN managed_accounts m ON m.id=mag.managed_account_id
 		JOIN channels c ON c.id=m.channel_id
