@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -265,7 +266,7 @@ func (a *App) fetchPaged(ctx context.Context, baseURL, path string, session remo
 
 func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind string) error {
 	if kind == "groups" {
-		if err := a.ensureTargetMultiplierCache(r.Context(), id); err != nil {
+		if err := a.ensureTargetMultiplierCacheForRead(r.Context(), id); err != nil {
 			return err
 		}
 		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,multiplier,multiplier_captured_at,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
@@ -294,6 +295,46 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 }
 
 const targetMultiplierCacheTTL = 3 * time.Minute
+
+func (a *App) ensureTargetMultiplierCacheForRead(ctx context.Context, targetID string) error {
+	var total, missing, stale int
+	if err := a.db.QueryRowContext(ctx, `SELECT count(*),count(*) FILTER (WHERE multiplier IS NULL OR multiplier_captured_at IS NULL),count(*) FILTER (WHERE multiplier_captured_at<=now()-interval '3 minutes') FROM target_groups WHERE target_id=$1`, targetID).Scan(&total, &missing, &stale); err != nil {
+		return err
+	}
+	if total == 0 || missing > 0 {
+		return a.ensureTargetMultiplierCache(ctx, targetID)
+	}
+	if stale > 0 {
+		a.refreshTargetMultiplierCacheAsync(targetID)
+	}
+	return nil
+}
+
+func (a *App) refreshTargetMultiplierCacheAsync(targetID string) {
+	a.targetMultiplierMu.Lock()
+	if a.targetMultiplierRefreshes == nil {
+		a.targetMultiplierRefreshes = make(map[string]struct{})
+	}
+	if _, refreshing := a.targetMultiplierRefreshes[targetID]; refreshing {
+		a.targetMultiplierMu.Unlock()
+		return
+	}
+	a.targetMultiplierRefreshes[targetID] = struct{}{}
+	a.targetMultiplierMu.Unlock()
+
+	go func() {
+		defer func() {
+			a.targetMultiplierMu.Lock()
+			delete(a.targetMultiplierRefreshes, targetID)
+			a.targetMultiplierMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := a.syncTarget(ctx, targetID); err != nil {
+			log.Printf("后台刷新目标分组倍率失败 [%s]: %v", targetID, err)
+		}
+	}()
+}
 
 func (a *App) ensureTargetMultiplierCache(ctx context.Context, targetID string) error {
 	var total, stale int

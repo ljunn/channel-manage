@@ -206,11 +206,9 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	MinSuccessRate       float64 `json:"minSuccessRate"`
-	MinSamples           int     `json:"minSamples"`
-	ConfirmationFailures int     `json:"confirmationFailures"`
-	CooldownMinutes      int     `json:"cooldownMinutes"`
+	Mode           string  `json:"mode"`
+	MinSuccessRate float64 `json:"minSuccessRate"`
+	MinSamples     int     `json:"minSamples"`
 }
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
@@ -223,17 +221,14 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.MinSamples < 1 {
 		config.MinSamples = 5
 	}
-	if config.ConfirmationFailures < 1 {
-		config.ConfirmationFailures = 3
-	}
-	if config.CooldownMinutes < 1 {
-		config.CooldownMinutes = 15
-	}
 	return config
 }
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id,
+		(SELECT count(*) FROM managed_account_groups mg WHERE mg.target_group_id=p.scope_id),
+		(SELECT count(*) FROM managed_account_groups mg JOIN managed_accounts m ON m.id=mg.managed_account_id WHERE mg.target_group_id=p.scope_id AND m.schedulable=true)
+		FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -243,13 +238,14 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 		var id, name, scope, status, config, targetGroupName, targetName string
 		var scopeID, targetID sql.NullString
 		var active sql.NullInt64
+		var managedCount, schedulableCount int
 		var created time.Time
-		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID); err != nil {
+		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID, &managedCount, &schedulableCount); err != nil {
 			return nil, err
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": 30, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -306,6 +302,20 @@ func (a *App) deletePolicy(w http.ResponseWriter, r *http.Request, id string) er
 	}
 	a.audit(r.Context(), "DELETE", "policy", id, nil)
 	writeData(w, map[string]bool{"deleted": true})
+	return nil
+}
+
+func (a *App) deactivatePolicy(w http.ResponseWriter, r *http.Request, id string) error {
+	result, err := a.db.ExecContext(r.Context(), `UPDATE policies SET status='DRAFT',updated_at=now() WHERE id=$1 AND status='ACTIVE'`, id)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return &apiError{409, "POLICY_NOT_ACTIVE", "策略未处于启用状态"}
+	}
+	a.audit(r.Context(), "DEACTIVATE", "policy", id, nil)
+	writeData(w, map[string]any{"id": id, "status": "DRAFT"})
 	return nil
 }
 

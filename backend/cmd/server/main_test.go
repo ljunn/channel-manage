@@ -190,7 +190,25 @@ func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testin
 func TestDeploymentErrorExplainsInsufficientBalance(t *testing.T) {
 	err := deploymentError("UPSTREAM_MODEL_READ_FAILED", "Pro分组", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "INSUFFICIENT_BALANCE: Insufficient account balance"})
 	apiErr, ok := err.(*apiError)
-	if !ok || !strings.Contains(apiErr.Message, "源站账户余额不足") || !strings.Contains(apiErr.Message, "Pro分组") {
+	if !ok || apiErr.Status != http.StatusConflict || !strings.Contains(apiErr.Message, "源站账户余额不足") || !strings.Contains(apiErr.Message, "Pro分组") {
+		t.Fatalf("unexpected deployment error: %#v", err)
+	}
+}
+
+func TestManagedObjectNameFitsNewAPITokenLimit(t *testing.T) {
+	name := managedObjectName("CCMAX自营3可外接", "svip-bug-team-250刀", "12345678")
+	if len(name) > 50 {
+		t.Fatalf("managed key name is %d bytes, want at most 50: %q", len(name), name)
+	}
+	if !strings.HasSuffix(name, "-12345678") {
+		t.Fatalf("managed key name must retain its unique suffix: %q", name)
+	}
+}
+
+func TestDeploymentErrorExplainsTokenNameLimit(t *testing.T) {
+	err := deploymentError("UPSTREAM_KEY_CREATE_FAILED", "CCMAX自营3可外接", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "Token name is too long"})
+	apiErr, ok := err.(*apiError)
+	if !ok || apiErr.Status != http.StatusUnprocessableEntity || !strings.Contains(apiErr.Message, "50 字节") {
 		t.Fatalf("unexpected deployment error: %#v", err)
 	}
 }

@@ -280,6 +280,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 	if len(parts) == 3 && parts[0] == "policies" && parts[2] == "simulate" && method == http.MethodPost {
 		return a.simulatePolicy(w, r, parts[1])
 	}
+	if len(parts) == 3 && parts[0] == "policies" && parts[2] == "deactivate" && method == http.MethodPost {
+		return a.deactivatePolicy(w, r, parts[1])
+	}
 	if len(parts) == 3 && parts[0] == "policies" && parts[2] == "activate-version" && method == http.MethodPost {
 		return a.activatePolicy(w, r, parts[1])
 	}

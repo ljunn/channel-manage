@@ -32,14 +32,16 @@ var (
 var embeddedWeb embed.FS
 
 type App struct {
-	db           *sql.DB
-	jwtSecret    []byte
-	cryptoKey    []byte
-	web          http.Handler
-	httpClient   *http.Client
-	workerMu     sync.Mutex
-	sourceAuthMu sync.Mutex
-	targetAuthMu sync.Mutex
+	db                        *sql.DB
+	jwtSecret                 []byte
+	cryptoKey                 []byte
+	web                       http.Handler
+	httpClient                *http.Client
+	workerMu                  sync.Mutex
+	sourceAuthMu              sync.Mutex
+	targetAuthMu              sync.Mutex
+	targetMultiplierMu        sync.Mutex
+	targetMultiplierRefreshes map[string]struct{}
 }
 
 type apiError struct {

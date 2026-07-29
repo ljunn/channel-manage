@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -440,12 +441,30 @@ func (a *App) deleteRemoteManagedAccount(ctx context.Context, baseURL string, se
 }
 
 func managedObjectName(sourceName, groupName, suffix string) string {
-	value := "渠道管家-" + strings.TrimSpace(sourceName) + "-" + strings.TrimSpace(groupName) + "-" + suffix
-	runes := []rune(value)
-	if len(runes) > 50 {
-		value = string(runes[:50])
+	prefix := "渠道管家-" + strings.TrimSpace(sourceName) + "-" + strings.TrimSpace(groupName)
+	tail := "-" + strings.TrimSpace(suffix)
+	if len(prefix)+len(tail) <= 50 {
+		return prefix + tail
 	}
-	return value
+	return truncateUTF8Bytes(prefix, 50-len(tail)) + tail
+}
+
+func truncateUTF8Bytes(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := 0
+	for index, char := range value {
+		size := utf8.RuneLen(char)
+		if index+size > maxBytes {
+			break
+		}
+		end = index + size
+	}
+	return value[:end]
 }
 
 func managedAccountName(sourceName, sourceGroupName, targetGroupName string, targetGroupRemoteID int) string {
@@ -467,10 +486,16 @@ func deploymentError(code, groupName string, err error) error {
 	log.Printf("自动绑定失败 [%s] %s: %v", code, groupName, err)
 	if apiErr, ok := err.(*apiError); ok {
 		message := apiErr.Message
-		if strings.Contains(strings.ToUpper(message), "INSUFFICIENT_BALANCE") {
+		status := apiErr.Status
+		upperMessage := strings.ToUpper(message)
+		if strings.Contains(upperMessage, "TOKEN NAME IS TOO LONG") {
+			status = http.StatusUnprocessableEntity
+			message = "源站拒绝创建专用 Key：名称超过 50 字节限制"
+		} else if strings.Contains(upperMessage, "INSUFFICIENT_BALANCE") {
+			status = http.StatusConflict
 			message = "源站账户余额不足，无法验证新建专用 Key 的可用模型"
 		}
-		return &apiError{Status: apiErr.Status, Code: code, Message: groupName + "：" + message}
+		return &apiError{Status: status, Code: code, Message: groupName + "：" + message}
 	}
 	return &apiError{Status: 502, Code: code, Message: groupName + "：" + err.Error()}
 }
