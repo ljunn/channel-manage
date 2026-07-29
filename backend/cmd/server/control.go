@@ -205,14 +205,27 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
-	MaxMultiplier        float64 `json:"maxMultiplier"`
 	MinSuccessRate       float64 `json:"minSuccessRate"`
 	MinSamples           int     `json:"minSamples"`
 	ConfirmationFailures int     `json:"confirmationFailures"`
 	CooldownMinutes      int     `json:"cooldownMinutes"`
 }
 
-func defaultPolicyConfig() policyConfig { return policyConfig{1, 95, 5, 3, 15} }
+func normalizePolicyConfig(config policyConfig) policyConfig {
+	if config.MinSuccessRate <= 0 {
+		config.MinSuccessRate = 95
+	}
+	if config.MinSamples < 1 {
+		config.MinSamples = 5
+	}
+	if config.ConfirmationFailures < 1 {
+		config.ConfirmationFailures = 3
+	}
+	if config.CooldownMinutes < 1 {
+		config.CooldownMinutes = 15
+	}
+	return config
+}
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb) FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version ORDER BY p.created_at DESC`)
@@ -229,7 +242,9 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "status": status, "activeVersion": nullableInt(active), "config": json.RawMessage(config), "createdAt": created})
+		var policy policyConfig
+		_ = json.Unmarshal([]byte(config), &policy)
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -248,9 +263,7 @@ func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
 	if input.ScopeType == "" {
 		input.ScopeType = "GLOBAL"
 	}
-	if input.Config.MaxMultiplier <= 0 {
-		input.Config = defaultPolicyConfig()
-	}
+	input.Config = normalizePolicyConfig(input.Config)
 	id := uuid.NewString()
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -278,9 +291,7 @@ func (a *App) createPolicyVersion(w http.ResponseWriter, r *http.Request, id str
 	if err := decodeJSON(r, &input); err != nil {
 		return err
 	}
-	if input.Config.MaxMultiplier <= 0 {
-		return &apiError{400, "INVALID_POLICY", "倍率上限必须大于 0"}
-	}
+	input.Config = normalizePolicyConfig(input.Config)
 	var version int
 	err := a.db.QueryRowContext(r.Context(), `INSERT INTO policy_versions(policy_id,version,config) SELECT $1,COALESCE(max(version),0)+1,$2 FROM policy_versions WHERE policy_id=$1 RETURNING version`, id, jsonValue(input.Config)).Scan(&version)
 	if err != nil {
@@ -317,26 +328,18 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	var config policyConfig
 	_ = json.Unmarshal([]byte(configData), &config)
-	channels, err := a.listChannels(r.Context())
+	config = normalizePolicyConfig(config)
+	if err := a.ensureManagedTargetMultiplierCaches(r.Context()); err != nil {
+		return err
+	}
+	candidates, err := a.managedPolicyCandidates(r.Context())
 	if err != nil {
 		return err
 	}
 	preview := []map[string]any{}
-	for _, channel := range channels {
-		reasons := []string{}
-		multiplier, _ := channel["multiplier"].(float64)
-		rate, _ := channel["successRate"].(float64)
-		samples, _ := channel["probeSamples1h"].(int)
-		if multiplier == 0 || multiplier > config.MaxMultiplier {
-			reasons = append(reasons, "倍率超过上限或缺失")
-		}
-		if samples < config.MinSamples {
-			reasons = append(reasons, "有效样本不足")
-		}
-		if rate < config.MinSuccessRate {
-			reasons = append(reasons, "成功率低于阈值")
-		}
-		preview = append(preview, map[string]any{"channel": channel, "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
+	for _, candidate := range candidates {
+		reasons := policyRejectionReasons(candidate, config)
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

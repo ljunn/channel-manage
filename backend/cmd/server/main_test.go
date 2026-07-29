@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -121,6 +122,31 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if !strings.Contains(request["name"].(string), targetGroups[index].Name) {
 			t.Fatalf("account %d name does not identify target group: %q", index, request["name"])
 		}
+	}
+}
+
+func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5})
+	eligible := managedPolicyCandidate{
+		State: "HEALTHY", SourceMultiplier: sql.NullFloat64{Float64: .5, Valid: true}, TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
+		SuccessRate: sql.NullFloat64{Float64: 100, Valid: true}, Samples: 5,
+	}
+	if reasons := policyRejectionReasons(eligible, config); len(reasons) != 0 {
+		t.Fatalf("equal source and target multipliers should be eligible: %#v", reasons)
+	}
+	eligible.SourceMultiplier.Float64 = .51
+	reasons := policyRejectionReasons(eligible, config)
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "超过目标分组上限") {
+		t.Fatalf("source multiplier above target limit was not rejected: %#v", reasons)
+	}
+}
+
+func TestPolicyRejectsManualMultiplierLimit(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/policies", strings.NewReader(`{"name":"test","config":{"maxMultiplier":1}}`))
+	err := (&App{}).createPolicy(httptest.NewRecorder(), request)
+	apiErr, ok := err.(*apiError)
+	if !ok || apiErr.Code != "INVALID_JSON" {
+		t.Fatalf("manual multiplier limit was accepted: %v", err)
 	}
 }
 

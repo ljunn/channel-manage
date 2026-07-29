@@ -176,6 +176,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if input.TargetID == "" || input.ChannelID == "" || len(input.TargetGroupIDs) == 0 {
 		return &apiError{400, "INVALID_INPUT", "请选择目标节点、渠道和目标分组"}
 	}
+	if len(input.TargetGroupIDs) != 1 {
+		return &apiError{400, "ONE_TARGET_GROUP_PER_ACCOUNT", "每个托管账号必须且只能绑定一个目标分组"}
+	}
 	if input.Priority < 101 {
 		input.Priority = 101
 	}

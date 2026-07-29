@@ -131,7 +131,8 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 			continue
 		}
 		remoteID := strconv.Itoa(int(idNumber))
-		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,updated_at) VALUES($1,$2,$3,now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,updated_at=now()`, id, remoteID, text(record["name"], remoteID))
+		multiplier := sub2APIGroupMultiplier(record, nil, remoteID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,multiplier,multiplier_captured_at,updated_at) VALUES($1,$2,$3,$4,now(),now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,multiplier=excluded.multiplier,multiplier_captured_at=now(),updated_at=now()`, id, remoteID, text(record["name"], remoteID), multiplier)
 		if err != nil {
 			return err
 		}
@@ -264,7 +265,10 @@ func (a *App) fetchPaged(ctx context.Context, baseURL, path string, session remo
 
 func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind string) error {
 	if kind == "groups" {
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
+		if err := a.ensureTargetMultiplierCache(r.Context(), id); err != nil {
+			return err
+		}
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,multiplier,multiplier_captured_at,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
 		if err != nil {
 			return err
 		}
@@ -272,11 +276,13 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 		items := []map[string]any{}
 		for rows.Next() {
 			var groupID, remoteID, name string
+			var multiplier sql.NullFloat64
+			var multiplierCaptured sql.NullTime
 			var updated time.Time
-			if err := rows.Scan(&groupID, &remoteID, &name, &updated); err != nil {
+			if err := rows.Scan(&groupID, &remoteID, &name, &multiplier, &multiplierCaptured, &updated); err != nil {
 				return err
 			}
-			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "updatedAt": updated})
+			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "multiplier": nullableFloat(multiplier), "multiplierCapturedAt": nullableTime(multiplierCaptured), "updatedAt": updated})
 		}
 		writeData(w, items)
 		return nil
@@ -285,6 +291,59 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 		return a.listManagedAccountsForTarget(w, r, id)
 	}
 	return &apiError{Status: http.StatusNotFound, Code: "NOT_FOUND", Message: "接口不存在"}
+}
+
+const targetMultiplierCacheTTL = 3 * time.Minute
+
+func (a *App) ensureTargetMultiplierCache(ctx context.Context, targetID string) error {
+	var total, stale int
+	if err := a.db.QueryRowContext(ctx, `SELECT count(*),count(*) FILTER (WHERE multiplier IS NULL OR multiplier_captured_at IS NULL OR multiplier_captured_at<=now()-interval '3 minutes') FROM target_groups WHERE target_id=$1`, targetID).Scan(&total, &stale); err != nil {
+		return err
+	}
+	if total == 0 || stale > 0 {
+		if err := a.syncTarget(ctx, targetID); err != nil {
+			return err
+		}
+	}
+	if err := a.db.QueryRowContext(ctx, `SELECT count(*) FROM target_groups WHERE target_id=$1`, targetID).Scan(&total); err != nil {
+		return err
+	}
+	if total == 0 {
+		return &apiError{502, "TARGET_GROUPS_UNAVAILABLE", "目标节点未返回分组数据"}
+	}
+	return nil
+}
+
+func (a *App) ensureManagedTargetMultiplierCaches(ctx context.Context) error {
+	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT target_id FROM managed_accounts`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := a.ensureTargetMultiplierCache(ctx, id); err != nil {
+			return err
+		}
+	}
+	var missing int
+	if err := a.db.QueryRowContext(ctx, `SELECT count(*) FROM managed_account_groups mg JOIN target_groups tg ON tg.id=mg.target_group_id WHERE tg.multiplier IS NULL`).Scan(&missing); err != nil {
+		return err
+	}
+	if missing > 0 {
+		return &apiError{502, "TARGET_MULTIPLIER_UNAVAILABLE", "托管账号所在目标分组未返回倍率，无法执行策略"}
+	}
+	return nil
 }
 
 func nullableInt(value sql.NullInt64) any {

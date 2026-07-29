@@ -64,9 +64,11 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE targets ADD COLUMN IF NOT EXISTS last_metrics_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS target_groups (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
-			remote_id TEXT NOT NULL, name TEXT NOT NULL,
+			remote_id TEXT NOT NULL, name TEXT NOT NULL, multiplier NUMERIC(14,6), multiplier_captured_at TIMESTAMPTZ,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, remote_id)
 		)`,
+		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier NUMERIC(14,6)`,
+		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier_captured_at TIMESTAMPTZ`,
 		`ALTER TABLE target_groups DROP COLUMN IF EXISTS protected_best_priority`,
 		`DROP TABLE IF EXISTS protected_accounts`,
 		`CREATE TABLE IF NOT EXISTS channels (
@@ -98,6 +100,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			ownership_marker TEXT NOT NULL, sync_status TEXT NOT NULL DEFAULT 'PENDING', last_error TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, channel_id)
 		)`,
+		`ALTER TABLE managed_accounts DROP CONSTRAINT IF EXISTS managed_accounts_target_id_channel_id_key`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_accounts_target_remote ON managed_accounts(target_id,remote_id) WHERE remote_id<>''`,
 		`CREATE TABLE IF NOT EXISTS managed_account_groups (
 			managed_account_id UUID NOT NULL REFERENCES managed_accounts(id) ON DELETE CASCADE,
 			target_group_id UUID NOT NULL REFERENCES target_groups(id) ON DELETE RESTRICT,

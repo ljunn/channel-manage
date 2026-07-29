@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -100,54 +103,94 @@ func (a *App) probeDueChannels(ctx context.Context) {
 }
 
 func (a *App) evaluateManagedAccounts(ctx context.Context) error {
-	var activePolicies int
-	if err := a.db.QueryRowContext(ctx, `SELECT count(*) FROM policies WHERE status='ACTIVE' AND active_version IS NOT NULL`).Scan(&activePolicies); err != nil {
+	var configData string
+	if err := a.db.QueryRowContext(ctx, `SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' ORDER BY p.updated_at DESC LIMIT 1`).Scan(&configData); err == sql.ErrNoRows {
+		return nil
+	} else if err != nil {
 		return err
 	}
-	if activePolicies == 0 {
-		return nil
+	var config policyConfig
+	_ = json.Unmarshal([]byte(configData), &config)
+	config = normalizePolicyConfig(config)
+	if err := a.ensureManagedTargetMultiplierCaches(ctx); err != nil {
+		return err
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.schedulable,c.lifecycle_state,c.state_reason FROM managed_accounts m JOIN channels c ON c.id=m.channel_id`)
+	items, err := a.managedPolicyCandidates(ctx)
 	if err != nil {
 		return err
-	}
-	defer rows.Close()
-	type candidate struct {
-		id, state, reason string
-		schedulable       bool
-	}
-	items := []candidate{}
-	for rows.Next() {
-		var item candidate
-		if err := rows.Scan(&item.id, &item.schedulable, &item.state, &item.reason); err != nil {
-			return err
-		}
-		items = append(items, item)
 	}
 	autoApprove, _ := a.settingBool(ctx, "auto_approve")
 	shadow, _ := a.settingBool(ctx, "shadow_mode")
 	for _, item := range items {
-		desired := item.state == "HEALTHY"
-		if desired == item.schedulable {
+		reasons := policyRejectionReasons(item, config)
+		desired := len(reasons) == 0
+		if desired == item.Schedulable {
 			continue
 		}
 		action := "SET_SCHEDULABLE"
-		reason := "渠道恢复健康，建议恢复调度"
+		reason := "渠道与目标分组倍率均符合策略，建议恢复调度"
 		if !desired {
-			reason = "渠道状态为 " + item.state + "，建议停止调度：" + item.reason
+			reason = strings.Join(reasons, "；")
 		}
-		key := stableKey(item.id, action, fmt.Sprint(desired), time.Now().UTC().Format("2006-01-02"))
+		key := stableKey(item.ID, action, fmt.Sprint(desired), time.Now().UTC().Format("2006-01-02"))
 		status := "PENDING"
 		if autoApprove && !shadow {
 			status = "APPROVED"
 		}
 		var id string
-		err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $6='APPROVED' THEN now() END) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, item.id, action, jsonValue(map[string]bool{"schedulable": item.schedulable}), jsonValue(map[string]bool{"schedulable": desired}), reason, status, key).Scan(&id)
+		err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $6='APPROVED' THEN now() END) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, item.ID, action, jsonValue(map[string]bool{"schedulable": item.Schedulable}), jsonValue(map[string]bool{"schedulable": desired}), reason, status, key).Scan(&id)
 		if err == nil && status == "APPROVED" {
 			go a.executeAction(context.Background(), id)
 		}
 	}
 	return nil
+}
+
+type managedPolicyCandidate struct {
+	ID, State, StateReason, SourceGroup, TargetGroup string
+	Schedulable                                      bool
+	SourceMultiplier, TargetMultiplier, SuccessRate  sql.NullFloat64
+	Samples                                          int
+}
+
+func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.schedulable,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
+		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
+		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour')
+		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
+		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []managedPolicyCandidate{}
+	for rows.Next() {
+		var item managedPolicyCandidate
+		if err := rows.Scan(&item.ID, &item.Schedulable, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []string {
+	reasons := []string{}
+	if item.State != "HEALTHY" {
+		reasons = append(reasons, "渠道状态为 "+item.State+"："+item.StateReason)
+	}
+	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
+		reasons = append(reasons, "源分组或目标分组倍率缺失")
+	} else if item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64 {
+		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 超过目标分组上限 %.4fx", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
+	}
+	if item.Samples < config.MinSamples {
+		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
+	}
+	if !item.SuccessRate.Valid || item.SuccessRate.Float64 < config.MinSuccessRate {
+		reasons = append(reasons, fmt.Sprintf("成功率低于 %.1f%%", config.MinSuccessRate))
+	}
+	return reasons
 }
 
 func stableKey(values ...string) string {
