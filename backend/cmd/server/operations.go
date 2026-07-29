@@ -162,7 +162,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	} else {
 		if managed {
 			// Active samples are advisory for managed channels; ordinary upstream errors must not remove them from service.
-			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=0,lifecycle_state='HEALTHY',state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END,score=CASE WHEN lifecycle_state='QUARANTINED' THEN 100 ELSE score END WHERE id=$1`, id, truncate(errorType, 200))
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state='HEALTHY',state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END,score=CASE WHEN lifecycle_state='QUARANTINED' THEN 100 ELSE score END WHERE id=$1`, id, truncate(errorType, 200))
 		} else {
 			windowMinutes := a.settingInt(ctx, "metric_window_minutes", 5)
 			minSamples := a.settingInt(ctx, "min_error_samples", 5)
