@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 )
@@ -35,6 +36,14 @@ func (a *App) runAutomation(ctx context.Context) {
 	a.syncDueTargets(ctx)
 	a.syncDueTargetMetrics(ctx)
 	a.probeDueChannels(ctx)
+	if err := a.evaluateManagedAccounts(ctx); err != nil {
+		log.Printf("策略评估失败: %v", err)
+	}
+}
+
+func (a *App) runPolicyEvaluation(ctx context.Context) {
+	a.workerMu.Lock()
+	defer a.workerMu.Unlock()
 	if err := a.evaluateManagedAccounts(ctx); err != nil {
 		log.Printf("策略评估失败: %v", err)
 	}
@@ -103,15 +112,32 @@ func (a *App) probeDueChannels(ctx context.Context) {
 }
 
 func (a *App) evaluateManagedAccounts(ctx context.Context) error {
-	var configData string
-	if err := a.db.QueryRowContext(ctx, `SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' ORDER BY p.updated_at DESC LIMIT 1`).Scan(&configData); err == sql.ErrNoRows {
-		return nil
-	} else if err != nil {
+	policyRows, err := a.db.QueryContext(ctx, `SELECT p.id,p.scope_id,v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' AND p.scope_type='TARGET_GROUP' ORDER BY p.updated_at`)
+	if err != nil {
 		return err
 	}
-	var config policyConfig
-	_ = json.Unmarshal([]byte(configData), &config)
-	config = normalizePolicyConfig(config)
+	type activePolicy struct {
+		ID, ScopeID string
+		Config      policyConfig
+	}
+	policies := []activePolicy{}
+	for policyRows.Next() {
+		var policy activePolicy
+		var configData string
+		if err := policyRows.Scan(&policy.ID, &policy.ScopeID, &configData); err != nil {
+			policyRows.Close()
+			return err
+		}
+		_ = json.Unmarshal([]byte(configData), &policy.Config)
+		policy.Config = normalizePolicyConfig(policy.Config)
+		policies = append(policies, policy)
+	}
+	if err := policyRows.Close(); err != nil {
+		return err
+	}
+	if len(policies) == 0 {
+		return nil
+	}
 	if err := a.ensureManagedTargetMultiplierCaches(ctx); err != nil {
 		return err
 	}
@@ -119,44 +145,56 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	autoApprove, _ := a.settingBool(ctx, "auto_approve")
 	shadow, _ := a.settingBool(ctx, "shadow_mode")
-	for _, item := range items {
-		reasons := policyRejectionReasons(item, config)
-		desired := len(reasons) == 0
-		if desired == item.Schedulable {
-			continue
-		}
-		action := "SET_SCHEDULABLE"
-		reason := "渠道与目标分组倍率均符合策略，建议恢复调度"
-		if !desired {
-			reason = strings.Join(reasons, "；")
-		}
-		key := stableKey(item.ID, action, fmt.Sprint(desired), time.Now().UTC().Format("2006-01-02"))
-		status := "PENDING"
-		if autoApprove && !shadow {
-			status = "APPROVED"
-		}
-		var id string
-		err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $6='APPROVED' THEN now() END) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, item.ID, action, jsonValue(map[string]bool{"schedulable": item.Schedulable}), jsonValue(map[string]bool{"schedulable": desired}), reason, status, key).Scan(&id)
-		if err == nil && status == "APPROVED" {
-			go a.executeAction(context.Background(), id)
+	frozen, _ := a.settingBool(ctx, "emergency_freeze")
+	if shadow || frozen {
+		return nil
+	}
+	for _, policy := range policies {
+		groupItems := candidatesForTargetGroup(items, policy.ScopeID)
+		desiredPriority := rankManagedAccounts(groupItems, policy.Config)
+		for _, item := range groupItems {
+			reasons := policyRejectionReasons(item, policy.Config)
+			desired := len(reasons) == 0
+			if desired != item.Schedulable {
+				reason := "渠道与目标分组倍率均符合策略，建议恢复调度"
+				if !desired {
+					reason = strings.Join(reasons, "；")
+				}
+				a.enqueueManagedAction(ctx, item.ID, "SET_SCHEDULABLE", map[string]bool{"schedulable": item.Schedulable}, map[string]bool{"schedulable": desired}, reason)
+			}
+			priority, ranked := desiredPriority[item.ID]
+			if ranked && priority != item.Priority {
+				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
+				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
+			}
 		}
 	}
 	return nil
 }
 
+func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string, before, after any, reason string) {
+	key := stableKey(managedID, action, jsonValue(before), jsonValue(after))
+	var id string
+	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,'APPROVED',$6,now()) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, managedID, action, jsonValue(before), jsonValue(after), reason, key).Scan(&id)
+	if err == nil {
+		go a.executeAction(context.Background(), id)
+	}
+}
+
 type managedPolicyCandidate struct {
-	ID, State, StateReason, SourceGroup, TargetGroup string
-	Schedulable                                      bool
-	SourceMultiplier, TargetMultiplier, SuccessRate  sql.NullFloat64
-	Samples                                          int
+	ID, TargetGroupID, State, StateReason, SourceGroup, TargetGroup string
+	Schedulable                                                     bool
+	Priority                                                        int
+	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95  sql.NullFloat64
+	Samples                                                         int
 }
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.schedulable,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,COALESCE(min(tg.id::text),''),m.schedulable,m.priority,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
-		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour')
+		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-interval '7 days')
 		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
 		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`)
 	if err != nil {
@@ -166,12 +204,57 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	items := []managedPolicyCandidate{}
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.Schedulable, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate); err != nil {
+		if err := rows.Scan(&item.ID, &item.TargetGroupID, &item.Schedulable, &item.Priority, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func candidatesForTargetGroup(items []managedPolicyCandidate, targetGroupID string) []managedPolicyCandidate {
+	result := []managedPolicyCandidate{}
+	for _, item := range items {
+		if item.TargetGroupID == targetGroupID {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) map[string]int {
+	eligible := []managedPolicyCandidate{}
+	config = normalizePolicyConfig(config)
+	for _, item := range items {
+		if len(policyRejectionReasons(item, config)) == 0 {
+			eligible = append(eligible, item)
+		}
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if config.Mode == "SPEED" {
+			if eligible[i].FirstTokenP95.Valid != eligible[j].FirstTokenP95.Valid {
+				return eligible[i].FirstTokenP95.Valid
+			}
+			if eligible[i].FirstTokenP95.Valid && eligible[i].FirstTokenP95.Float64 != eligible[j].FirstTokenP95.Float64 {
+				return eligible[i].FirstTokenP95.Float64 < eligible[j].FirstTokenP95.Float64
+			}
+		} else if eligible[i].SourceMultiplier.Valid && eligible[j].SourceMultiplier.Valid && eligible[i].SourceMultiplier.Float64 != eligible[j].SourceMultiplier.Float64 {
+			return eligible[i].SourceMultiplier.Float64 < eligible[j].SourceMultiplier.Float64
+		}
+		return eligible[i].ID < eligible[j].ID
+	})
+	result := map[string]int{}
+	for index, item := range eligible {
+		result[item.ID] = 1000 + index
+	}
+	return result
+}
+
+func policyModeText(mode string) string {
+	if mode == "SPEED" {
+		return "速度优先"
+	}
+	return "价格优先"
 }
 
 func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []string {

@@ -483,7 +483,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO channels(source_id,source_key_id,source_group_id,state_reason) SELECT k.source_id,k.id,g.id,'等待首次探测' FROM source_keys k JOIN source_groups g ON g.source_id=k.source_id WHERE k.source_id=$1 AND k.production_authorized=true ON CONFLICT DO NOTHING`, source.ID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO channels(source_id,source_key_id,source_group_id,state_reason) SELECT k.source_id,k.id,g.id,'等待首次探测' FROM source_keys k JOIN source_groups g ON g.source_id=k.source_id WHERE k.source_id=$1 AND k.production_authorized=true AND k.auto_generated=false ON CONFLICT DO NOTHING`, source.ID)
 	if err != nil {
 		return err
 	}

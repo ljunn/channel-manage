@@ -107,7 +107,7 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		{ID: "local-1", Name: "低倍率", RemoteID: 11},
 		{ID: "local-2", Name: "高质量", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 101, 1)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +122,32 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if !strings.Contains(request["name"].(string), targetGroups[index].Name) {
 			t.Fatalf("account %d name does not identify target group: %q", index, request["name"])
 		}
+		if int(request["priority"].(float64)) != 1000 {
+			t.Fatalf("account %d priority=%v, want 1000", index, request["priority"])
+		}
+	}
+}
+
+func TestSyncTargetAccountPriority(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/admin/accounts/42" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]int
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["priority"] != 1007 {
+			t.Fatalf("priority=%d, want 1007", payload["priority"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	if err := app.syncTargetAccountPriority(context.Background(), server.URL, "42", remoteSession{}, 1007); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -138,6 +164,53 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	reasons := policyRejectionReasons(eligible, config)
 	if len(reasons) != 1 || !strings.Contains(reasons[0], "超过目标分组上限") {
 		t.Fatalf("source multiplier above target limit was not rejected: %#v", reasons)
+	}
+}
+
+func TestRankManagedAccountsByPriceFromPriority1000(t *testing.T) {
+	items := []managedPolicyCandidate{
+		eligiblePolicyCandidate("expensive", .8, 240),
+		eligiblePolicyCandidate("cheap", .2, 900),
+		eligiblePolicyCandidate("middle", .5, 120),
+	}
+	priorities := rankManagedAccounts(items, policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5})
+	if priorities["cheap"] != 1000 || priorities["middle"] != 1001 || priorities["expensive"] != 1002 {
+		t.Fatalf("unexpected price ranking: %#v", priorities)
+	}
+}
+
+func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
+	items := []managedPolicyCandidate{
+		eligiblePolicyCandidate("slow", .1, 900),
+		eligiblePolicyCandidate("fast", .8, 120),
+		eligiblePolicyCandidate("middle", .5, 240),
+	}
+	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
+	if priorities["fast"] != 1000 || priorities["middle"] != 1001 || priorities["slow"] != 1002 {
+		t.Fatalf("unexpected speed ranking: %#v", priorities)
+	}
+}
+
+func TestRankManagedAccountsExcludesIneligibleChannels(t *testing.T) {
+	healthy := eligiblePolicyCandidate("healthy", .2, 120)
+	unhealthy := eligiblePolicyCandidate("unhealthy", .1, 100)
+	unhealthy.State = "OFFLINE"
+	priorities := rankManagedAccounts([]managedPolicyCandidate{unhealthy, healthy}, policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5})
+	if priorities["healthy"] != 1000 {
+		t.Fatalf("eligible account did not start at 1000: %#v", priorities)
+	}
+	if _, exists := priorities["unhealthy"]; exists {
+		t.Fatalf("ineligible account was ranked: %#v", priorities)
+	}
+}
+
+func eligiblePolicyCandidate(id string, sourceMultiplier, firstTokenP95 float64) managedPolicyCandidate {
+	return managedPolicyCandidate{
+		ID: id, State: "HEALTHY", Samples: 5,
+		SourceMultiplier: sql.NullFloat64{Float64: sourceMultiplier, Valid: true},
+		TargetMultiplier: sql.NullFloat64{Float64: 1, Valid: true},
+		SuccessRate:      sql.NullFloat64{Float64: 100, Valid: true},
+		FirstTokenP95:    sql.NullFloat64{Float64: firstTokenP95, Valid: true},
 	}
 }
 

@@ -164,6 +164,63 @@ func (a *App) listManagedAccountsForTarget(w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+func (a *App) updateManagedAccountPriority(w http.ResponseWriter, r *http.Request, id string) error {
+	var input struct {
+		Priority int `json:"priority"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	if input.Priority < 1 || input.Priority > 1000000 {
+		return &apiError{400, "INVALID_PRIORITY", "优先级必须在 1 到 1000000 之间"}
+	}
+	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
+	shadow, _ := a.settingBool(r.Context(), "shadow_mode")
+	if frozen || shadow {
+		return &apiError{409, "REMOTE_WRITE_BLOCKED", "安全冻结或影子模式禁止同步优先级"}
+	}
+	var targetID, targetBase, remoteID, marker string
+	var writeEnabled bool
+	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.base_url,t.write_enabled,m.remote_id,m.ownership_marker FROM managed_accounts m JOIN targets t ON t.id=m.target_id WHERE m.id=$1`, id).Scan(&targetID, &targetBase, &writeEnabled, &remoteID, &marker)
+	if err == sql.ErrNoRows {
+		return &apiError{404, "MANAGED_ACCOUNT_NOT_FOUND", "托管账号不存在"}
+	}
+	if err != nil {
+		return err
+	}
+	if !writeEnabled || !strings.HasPrefix(marker, "channel-manage:") {
+		return &apiError{409, "TARGET_WRITE_DISABLED", "目标写入未授权或托管所有权无效"}
+	}
+	requestCtx, cancel := timeoutContext(r.Context())
+	defer cancel()
+	target, _, err := a.targetCredentials(requestCtx, targetID)
+	if err != nil {
+		return err
+	}
+	session, err := a.authenticateTarget(requestCtx, target, true)
+	if err != nil {
+		return err
+	}
+	if err = a.syncTargetAccountPriority(requestCtx, targetBase, remoteID, session, input.Priority); err != nil {
+		return err
+	}
+	if _, err = a.db.ExecContext(r.Context(), `UPDATE managed_accounts SET priority=$2,updated_at=now() WHERE id=$1`, id, input.Priority); err != nil {
+		return err
+	}
+	a.audit(r.Context(), "SET_PRIORITY", "managed_account", id, map[string]any{"priority": input.Priority, "remote_id": remoteID})
+	writeData(w, map[string]any{"id": id, "priority": input.Priority, "syncStatus": "SYNCED"})
+	return nil
+}
+
+func (a *App) syncTargetAccountPriority(ctx context.Context, targetBase, remoteID string, session remoteSession, priority int) error {
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPut, "/api/v1/admin/accounts/"+remoteID, session, map[string]int{"priority": priority})
+	if err != nil {
+		return err
+	}
+	_, err = unwrapEnvelope(value, "SUB2API")
+	return err
+}
+
 func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error {
 	var input struct {
 		TargetID, ChannelID, Name string
@@ -179,8 +236,8 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if len(input.TargetGroupIDs) != 1 {
 		return &apiError{400, "ONE_TARGET_GROUP_PER_ACCOUNT", "每个托管账号必须且只能绑定一个目标分组"}
 	}
-	if input.Priority < 101 {
-		input.Priority = 101
+	if input.Priority < 1 {
+		input.Priority = 1000
 	}
 	if input.Concurrency < 1 {
 		input.Concurrency = 1

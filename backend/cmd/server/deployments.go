@@ -62,8 +62,8 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if len(input.SourceGroupIDs)*len(input.TargetGroupIDs) > 100 {
 		return &apiError{400, "TOO_MANY_MAPPINGS", "每次最多创建 100 个独立托管账号"}
 	}
-	if input.Priority < 101 {
-		input.Priority = 101
+	if input.Priority < 1 {
+		input.Priority = 1000
 	}
 	if input.Concurrency < 1 {
 		input.Concurrency = 1

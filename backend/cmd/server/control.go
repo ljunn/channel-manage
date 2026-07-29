@@ -205,6 +205,7 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
+	Mode                 string  `json:"mode"`
 	MinSuccessRate       float64 `json:"minSuccessRate"`
 	MinSamples           int     `json:"minSamples"`
 	ConfirmationFailures int     `json:"confirmationFailures"`
@@ -212,6 +213,9 @@ type policyConfig struct {
 }
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
+	if config.Mode != "SPEED" {
+		config.Mode = "PRICE"
+	}
 	if config.MinSuccessRate <= 0 {
 		config.MinSuccessRate = 95
 	}
@@ -228,23 +232,23 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 }
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb) FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version ORDER BY p.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,'') FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, name, scope, status, config string
+		var id, name, scope, status, config, targetGroupName, targetName string
 		var scopeID sql.NullString
 		var active sql.NullInt64
 		var created time.Time
-		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config); err != nil {
+		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName); err != nil {
 			return nil, err
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -260,8 +264,15 @@ func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
 	if input.Name == "" {
 		return &apiError{400, "INVALID_INPUT", "请填写策略名称"}
 	}
-	if input.ScopeType == "" {
-		input.ScopeType = "GLOBAL"
+	if input.ScopeType != "TARGET_GROUP" || input.ScopeID == "" {
+		return &apiError{400, "INVALID_POLICY_SCOPE", "请选择策略对应的目标分组"}
+	}
+	var groupExists int
+	if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM target_groups WHERE id=$1`, input.ScopeID).Scan(&groupExists); err != nil {
+		return err
+	}
+	if groupExists == 0 {
+		return &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
 	}
 	input.Config = normalizePolicyConfig(input.Config)
 	id := uuid.NewString()
@@ -307,7 +318,15 @@ func (a *App) activatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	if err := decodeJSON(r, &input); err != nil {
 		return err
 	}
-	result, err := a.db.ExecContext(r.Context(), `UPDATE policies SET active_version=$2,status='ACTIVE',updated_at=now() WHERE id=$1 AND EXISTS(SELECT 1 FROM policy_versions WHERE policy_id=$1 AND version=$2)`, id, input.Version)
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(r.Context(), `UPDATE policies SET status='DRAFT',updated_at=now() WHERE id<>$1 AND scope_type=(SELECT scope_type FROM policies WHERE id=$1) AND scope_id=(SELECT scope_id FROM policies WHERE id=$1) AND status='ACTIVE'`, id); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(r.Context(), `UPDATE policies SET active_version=$2,status='ACTIVE',updated_at=now() WHERE id=$1 AND EXISTS(SELECT 1 FROM policy_versions WHERE policy_id=$1 AND version=$2)`, id, input.Version)
 	if err != nil {
 		return err
 	}
@@ -315,14 +334,18 @@ func (a *App) activatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	if affected == 0 {
 		return &apiError{404, "POLICY_VERSION_NOT_FOUND", "策略版本不存在"}
 	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
 	a.audit(r.Context(), "ACTIVATE", "policy", id, map[string]int{"version": input.Version})
+	go a.runPolicyEvaluation(context.Background())
 	writeData(w, map[string]any{"id": id, "version": input.Version, "status": "ACTIVE"})
 	return nil
 }
 
 func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) error {
-	var configData string
-	err := a.db.QueryRowContext(r.Context(), `SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.id=$1`, id).Scan(&configData)
+	var configData, scopeID string
+	err := a.db.QueryRowContext(r.Context(), `SELECT v.config,p.scope_id FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.id=$1`, id).Scan(&configData, &scopeID)
 	if err != nil {
 		return &apiError{404, "POLICY_VERSION_NOT_FOUND", "策略尚未激活"}
 	}
@@ -337,9 +360,9 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		return err
 	}
 	preview := []map[string]any{}
-	for _, candidate := range candidates {
+	for _, candidate := range candidatesForTargetGroup(candidates, scopeID) {
 		reasons := policyRejectionReasons(candidate, config)
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

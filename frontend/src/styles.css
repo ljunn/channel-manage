@@ -167,6 +167,7 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .table-wrap td small { max-width: 300px; margin-top: 2px; overflow: hidden; font-size: 12px; text-overflow: ellipsis; }
 .link { border: 0; background: transparent; padding: 0; color: var(--ink); text-align: left; }
 .link strong { color: var(--teal-700); font-weight: 600; }
+.inline-edit { display: inline-flex; align-items: center; gap: 5px; color: var(--teal-700); cursor: pointer; }
 .rank { color: var(--ink-400); font-family: var(--mono); }
 .ratio { color: var(--teal-700); font-family: var(--mono); font-weight: 600; }
 .tag { min-height: 22px; display: inline-flex; align-items: center; margin: 2px; padding: 0 8px; border-radius: 6px; background: var(--teal-50); color: var(--teal-700); font-size: 11px; }
