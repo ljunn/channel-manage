@@ -33,7 +33,11 @@ func (a *App) resolveEvent(ctx context.Context, dedupeKey string) {
 }
 
 func (a *App) listEvents(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id,severity,category,title,detail,status,acknowledged_at,resolved_at,created_at FROM events WHERE status<>'RESOLVED' OR resolved_at>now()-interval '24 hours' ORDER BY CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END,CASE severity WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,created_at DESC LIMIT 200`)
+	rows, err := a.db.QueryContext(ctx, `SELECT id,severity,category,title,detail,status,acknowledged_at,resolved_at,created_at FROM events
+		WHERE status<>'RESOLVED' OR id IN (
+			SELECT id FROM events WHERE status='RESOLVED' AND resolved_at>now()-interval '24 hours' ORDER BY resolved_at DESC LIMIT 10
+		)
+		ORDER BY CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END,CASE severity WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,COALESCE(resolved_at,created_at) DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}

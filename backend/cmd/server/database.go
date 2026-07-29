@@ -131,6 +131,13 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_status_time ON events(status, created_at DESC)`,
+		`UPDATE events SET status='RESOLVED',resolved_at=COALESCE(resolved_at,now()) WHERE status='ACKNOWLEDGED'`,
+		`UPDATE events e SET status='RESOLVED',resolved_at=COALESCE(e.resolved_at,now())
+		WHERE e.status<>'RESOLVED' AND (e.dedupe_key LIKE 'target-sync:%' OR e.dedupe_key LIKE 'target-rate-limit:%')
+		AND NOT EXISTS (
+			SELECT 1 FROM targets t
+			WHERE t.id::text=split_part(e.dedupe_key,':',2) AND t.status<>'ONLINE'
+		)`,
 		`WITH ranked AS (
 			SELECT id,row_number() OVER (PARTITION BY dedupe_key ORDER BY created_at DESC) AS position
 			FROM events WHERE status<>'RESOLVED'
