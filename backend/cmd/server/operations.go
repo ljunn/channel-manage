@@ -435,9 +435,74 @@ func (a *App) dashboard(ctx context.Context) (map[string]any, error) {
 		}
 	}
 	_ = a.db.QueryRowContext(ctx, `SELECT min(multiplier) FROM source_groups WHERE captured_at>now()-interval '1 day'`).Scan(&minMultiplier)
+	sourceItems, err := a.listSources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	totalSourceGroups, boundSourceGroups, unboundSources := 0, 0, 0
+	attentionSources := make([]Source, 0, len(sourceItems))
+	for _, item := range sourceItems {
+		totalSourceGroups += item.GroupCount
+		boundSourceGroups += item.BoundGroupCount
+		if item.ManagedAccountCount == 0 {
+			unboundSources++
+		}
+		if item.ManagedAccountCount == 0 || item.BoundGroupCount < item.GroupCount || item.ScanStatus == "FAILED" {
+			attentionSources = append(attentionSources, item)
+		}
+	}
+	sort.SliceStable(attentionSources, func(i, j int) bool {
+		left, right := sourceAttentionRank(attentionSources[i]), sourceAttentionRank(attentionSources[j])
+		if left != right {
+			return left < right
+		}
+		return attentionSources[i].ManagedAccountCount < attentionSources[j].ManagedAccountCount
+	})
+	if len(attentionSources) > 8 {
+		attentionSources = attentionSources[:8]
+	}
+	balanceSources := make([]Source, 0, len(sourceItems))
+	for _, item := range sourceItems {
+		if item.Balance != nil {
+			balanceSources = append(balanceSources, item)
+		}
+	}
+	sort.SliceStable(balanceSources, func(i, j int) bool { return *balanceSources[i].Balance < *balanceSources[j].Balance })
+	lowestBalanceSources := append([]Source(nil), balanceSources...)
+	if len(lowestBalanceSources) > 5 {
+		lowestBalanceSources = lowestBalanceSources[:5]
+	}
+	highestBalanceSources := append([]Source(nil), balanceSources...)
+	for left, right := 0, len(highestBalanceSources)-1; left < right; left, right = left+1, right-1 {
+		highestBalanceSources[left], highestBalanceSources[right] = highestBalanceSources[right], highestBalanceSources[left]
+	}
+	if len(highestBalanceSources) > 5 {
+		highestBalanceSources = highestBalanceSources[:5]
+	}
 	shadow, _ := a.settingBool(ctx, "shadow_mode")
 	freeze, _ := a.settingBool(ctx, "emergency_freeze")
-	return map[string]any{"sources": sources, "channels": channels, "healthyChannels": healthy, "managedAccounts": managed, "openEvents": events, "pendingActions": actions, "minimumMultiplier": nullableFloat(minMultiplier), "shadowMode": shadow, "emergencyFreeze": freeze, "version": Version}, nil
+	return map[string]any{
+		"sources": sources, "channels": channels, "healthyChannels": healthy, "managedAccounts": managed,
+		"openEvents": events, "pendingActions": actions, "minimumMultiplier": nullableFloat(minMultiplier),
+		"totalSourceGroups": totalSourceGroups, "boundSourceGroups": boundSourceGroups,
+		"unboundSourceGroups": totalSourceGroups - boundSourceGroups, "unboundSources": unboundSources,
+		"attentionSources": attentionSources, "lowestBalanceSources": lowestBalanceSources,
+		"highestBalanceSources": highestBalanceSources,
+		"shadowMode":            shadow, "emergencyFreeze": freeze, "version": Version,
+	}, nil
+}
+
+func sourceAttentionRank(item Source) int {
+	if item.ScanStatus == "FAILED" {
+		return 0
+	}
+	if item.ManagedAccountCount == 0 {
+		return 1
+	}
+	if item.BoundGroupCount < item.GroupCount {
+		return 2
+	}
+	return 3
 }
 
 func (a *App) marketGroups(ctx context.Context) ([]map[string]any, error) {

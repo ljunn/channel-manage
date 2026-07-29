@@ -157,6 +157,10 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if int(request["concurrency"].(float64)) != 1000 {
 			t.Fatalf("account %d concurrency=%v, want 1000", index, request["concurrency"])
 		}
+		credentials := request["credentials"].(map[string]any)
+		if credentials["base_url"] != "https://source.example/v1" {
+			t.Fatalf("account %d base_url=%v, want published source API endpoint", index, credentials["base_url"])
+		}
 	}
 }
 
@@ -209,6 +213,39 @@ func TestDeploymentErrorExplainsTokenNameLimit(t *testing.T) {
 	err := deploymentError("UPSTREAM_KEY_CREATE_FAILED", "CCMAX自营3可外接", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "Token name is too long"})
 	apiErr, ok := err.(*apiError)
 	if !ok || apiErr.Status != http.StatusUnprocessableEntity || !strings.Contains(apiErr.Message, "50 字节") {
+		t.Fatalf("unexpected deployment error: %#v", err)
+	}
+}
+
+func TestDiscoverSourceAPIBaseURL(t *testing.T) {
+	t.Setenv("ALLOW_INSECURE_UPSTREAMS", "true")
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{}}`))
+	}))
+	defer apiServer.Close()
+	panelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/settings/public" {
+			t.Fatalf("unexpected public settings path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"api_base_url":%q}}`, apiServer.URL)))
+	}))
+	defer panelServer.Close()
+
+	app := &App{httpClient: panelServer.Client()}
+	baseURL, err := app.discoverSourceAPIBaseURL(context.Background(), Source{Platform: "SUB2API", BaseURL: panelServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseURL != apiServer.URL {
+		t.Fatalf("discovered base URL=%q, want %q", baseURL, apiServer.URL)
+	}
+}
+
+func TestDeploymentErrorExplainsPanelDomain(t *testing.T) {
+	err := deploymentError("UPSTREAM_MODEL_READ_FAILED", "Codex - Pro - B", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "The API endpoint is not served from the panel domain. Please use the published API endpoint for this service."})
+	apiErr, ok := err.(*apiError)
+	if !ok || apiErr.Status != http.StatusUnprocessableEntity || !strings.Contains(apiErr.Message, "面板域名不提供 API") {
 		t.Fatalf("unexpected deployment error: %#v", err)
 	}
 }

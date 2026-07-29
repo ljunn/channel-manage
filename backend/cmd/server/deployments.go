@@ -111,6 +111,10 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if err != nil {
 		return err
 	}
+	sourceAPIBase, err := a.discoverSourceAPIBaseURL(requestCtx, source)
+	if err != nil {
+		return deploymentError("SOURCE_API_ENDPOINT_READ_FAILED", source.Name, err)
+	}
 
 	created := make([]createdDeployment, 0, len(sourceGroups))
 	committed := false
@@ -130,14 +134,14 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		}
 		item := createdDeployment{SourceGroup: group, Key: remoteKey}
 		created = append(created, item)
-		models, modelErr := a.readModelsWithKey(requestCtx, source.BaseURL, remoteKey.Key)
+		models, modelErr := a.readModelsWithKey(requestCtx, sourceAPIBase, remoteKey.Key)
 		if modelErr != nil {
 			return deploymentError("UPSTREAM_MODEL_READ_FAILED", group.Name, modelErr)
 		}
 		if len(models) == 0 {
 			return &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
 		}
-		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, source.BaseURL, source.Platform, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
+		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Platform, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
 		created[len(created)-1].Models = models
 		created[len(created)-1].Accounts = accounts
 		if accountErr != nil {
@@ -355,6 +359,33 @@ func (a *App) readModelsWithKey(ctx context.Context, baseURL, key string) ([]str
 	return models, nil
 }
 
+func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (string, error) {
+	if source.Platform != "SUB2API" {
+		return source.BaseURL, nil
+	}
+	value, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/settings/public", remoteSession{}, nil)
+	if err != nil {
+		if remoteRouteUnavailable(err) {
+			return source.BaseURL, nil
+		}
+		return "", err
+	}
+	data, err := unwrapEnvelope(value, source.Platform)
+	if err != nil {
+		return "", err
+	}
+	record, _ := data.(map[string]any)
+	publishedBase := strings.TrimSpace(text(record["api_base_url"], ""))
+	if publishedBase == "" {
+		return source.BaseURL, nil
+	}
+	normalized, err := validateRemoteURL(publishedBase)
+	if err != nil {
+		return "", &apiError{Status: http.StatusUnprocessableEntity, Code: "SOURCE_API_ENDPOINT_INVALID", Message: "源站发布的 API 地址无效：" + publishedBase}
+	}
+	return normalized, nil
+}
+
 func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourcePlatform, key string, models []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
 	modelMap := map[string]string{}
 	for _, model := range models {
@@ -491,6 +522,9 @@ func deploymentError(code, groupName string, err error) error {
 		if strings.Contains(upperMessage, "TOKEN NAME IS TOO LONG") {
 			status = http.StatusUnprocessableEntity
 			message = "源站拒绝创建专用 Key：名称超过 50 字节限制"
+		} else if strings.Contains(upperMessage, "API ENDPOINT IS NOT SERVED FROM THE PANEL DOMAIN") {
+			status = http.StatusUnprocessableEntity
+			message = "源站面板域名不提供 API，且未能读取有效的发布 API 地址"
 		} else if strings.Contains(upperMessage, "INSUFFICIENT_BALANCE") {
 			status = http.StatusConflict
 			message = "源站账户余额不足，无法验证新建专用 Key 的可用模型"

@@ -30,6 +30,8 @@ type Source struct {
 	BalanceCurrency     string     `json:"balanceCurrency"`
 	KeyCount            int        `json:"keyCount"`
 	GroupCount          int        `json:"groupCount"`
+	BoundGroupCount     int        `json:"boundGroupCount"`
+	ManagedAccountCount int        `json:"managedAccountCount"`
 	CreatedAt           time.Time  `json:"createdAt"`
 }
 
@@ -46,7 +48,11 @@ type sourceCredentials struct {
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.status,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
-		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id) FROM sources s ORDER BY s.created_at DESC`)
+		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),
+		(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id),
+		(SELECT count(DISTINCT c.source_group_id) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=s.id AND c.source_group_id IS NOT NULL),
+		(SELECT count(*) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=s.id)
+		FROM sources s ORDER BY s.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +62,7 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		var item Source
 		var lastScan sql.NullTime
 		var balance sql.NullFloat64
-		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.Status, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.Status, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
 			return nil, err
 		}
 		if lastScan.Valid {
