@@ -158,6 +158,7 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		defer platformCancel()
 		a.syncManagedAccountSchedulableStates(platformCtx, target, session)
 		a.syncManagedAccountPlatforms(platformCtx, target, session)
+		a.syncManagedAccountModelMappings(platformCtx, target, session)
 	}()
 	return nil
 }
@@ -325,6 +326,132 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 	}
 }
 
+func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target, session remoteSession) {
+	if !target.WriteEnabled {
+		return
+	}
+	a.targetModelMu.Lock()
+	if a.targetModelSyncs == nil {
+		a.targetModelSyncs = make(map[string]struct{})
+	}
+	if _, running := a.targetModelSyncs[target.ID]; running {
+		a.targetModelMu.Unlock()
+		return
+	}
+	a.targetModelSyncs[target.ID] = struct{}{}
+	a.targetModelMu.Unlock()
+	defer func() {
+		a.targetModelMu.Lock()
+		delete(a.targetModelSyncs, target.ID)
+		a.targetModelMu.Unlock()
+	}()
+
+	type mappingAccount struct {
+		id, remoteID, platform, sourceID, sourceName, sourcePlatform, sourceBase, modelsJSON, currentHash string
+		encryptedKey                                                                                      []byte
+		mapping                                                                                           map[string]string
+		desiredHash                                                                                       string
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,tg.platform,s.id,s.name,s.platform,s.base_url,k.models,m.model_mapping_hash,k.key_cipher
+		FROM managed_accounts m
+		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
+		JOIN target_groups tg ON tg.id=mg.target_group_id
+		JOIN channels c ON c.id=m.channel_id
+		JOIN sources s ON s.id=c.source_id
+		JOIN source_keys k ON k.id=c.source_key_id
+		WHERE m.target_id=$1 AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'`, target.ID)
+	if err != nil {
+		log.Printf("读取托管账号模型映射失败 [%s]: %v", target.ID, err)
+		return
+	}
+	items := []mappingAccount{}
+	for rows.Next() {
+		var item mappingAccount
+		if err = rows.Scan(&item.id, &item.remoteID, &item.platform, &item.sourceID, &item.sourceName, &item.sourcePlatform, &item.sourceBase, &item.modelsJSON, &item.currentHash, &item.encryptedKey); err != nil {
+			break
+		}
+		item.mapping = modelMappingForPlatform(item.platform, decodeModels(item.modelsJSON))
+		item.desiredHash = modelMappingHash(item.mapping)
+		if item.desiredHash == item.currentHash {
+			continue
+		}
+		items = append(items, item)
+	}
+	_ = rows.Close()
+	if err != nil {
+		log.Printf("读取托管账号模型映射失败 [%s]: %v", target.ID, err)
+		return
+	}
+
+	sourceBases := map[string]string{}
+	sourceErrors := map[string]error{}
+	for _, item := range items {
+		if _, known := sourceBases[item.sourceID]; known {
+			continue
+		}
+		if _, failed := sourceErrors[item.sourceID]; failed {
+			continue
+		}
+		base, discoverErr := a.discoverSourceAPIBaseURL(ctx, Source{ID: item.sourceID, Name: item.sourceName, Platform: item.sourcePlatform, BaseURL: item.sourceBase})
+		if discoverErr != nil {
+			sourceErrors[item.sourceID] = discoverErr
+			continue
+		}
+		sourceBases[item.sourceID] = base
+	}
+
+	corrected := 0
+	failed := 0
+	for _, item := range items {
+		if len(item.mapping) == 0 {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error='源渠道没有目标分组平台可用的模型',updated_at=now() WHERE id=$1`, item.id)
+			continue
+		}
+		sourceBase, ok := sourceBases[item.sourceID]
+		if !ok {
+			failed++
+			message := "读取源站 API 地址失败"
+			if sourceErrors[item.sourceID] != nil {
+				message += ": " + sourceErrors[item.sourceID].Error()
+			}
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate(message, 500))
+			continue
+		}
+		key, decryptErr := a.decryptSecret(item.encryptedKey)
+		if decryptErr != nil {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error='读取托管 Key 失败',updated_at=now() WHERE id=$1`, item.id)
+			continue
+		}
+		credentials := map[string]any{
+			"api_key":                      string(key),
+			"base_url":                     strings.TrimSuffix(sourceBase, "/") + "/v1",
+			"model_mapping":                item.mapping,
+			"pool_mode":                    true,
+			"pool_mode_retry_count":        3,
+			"pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504},
+		}
+		if err = a.syncTargetAccountFields(ctx, target.BaseURL, item.remoteID, session, map[string]any{"credentials": credentials}); err != nil {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate("模型映射校正失败: "+err.Error(), 500))
+			continue
+		}
+		corrected++
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET model_mapping_hash=$2,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, item.id, item.desiredHash)
+		a.audit(context.Background(), "RECONCILE_MODEL_MAPPING", "managed_account", item.id, map[string]any{"remote_id": item.remoteID, "platform": item.platform, "models": len(item.mapping)})
+	}
+	if corrected > 0 {
+		log.Printf("已校正目标节点 %s 的托管账号模型族映射: %d 个", target.Name, corrected)
+	}
+	if failed > 0 {
+		detail := fmt.Sprintf("%s 有 %d 个托管账号的模型族映射校正失败，系统会在下一轮目标同步时重试。", target.Name, failed)
+		a.openEvent(context.Background(), "P1", "ACCOUNT_MODEL_SYNC", "账号模型映射同步失败", detail, "target-model-sync:"+target.ID)
+	} else {
+		a.resolveEvent(context.Background(), "target-model-sync:"+target.ID)
+	}
+}
+
 func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string) error {
 	groupID, err := strconv.Atoi(targetGroupRemoteID)
 	if err != nil {
@@ -365,7 +492,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
 		}
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID)
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, modelMappingHash(modelMappingForPlatform(platform, models)))
 	if err != nil {
 		return fmt.Errorf("保存新账号关联失败: %w", err)
 	}

@@ -316,6 +316,7 @@ type policyConfig struct {
 	MinSuccessRate       float64 `json:"minSuccessRate"`
 	MinSamples           int     `json:"minSamples"`
 	AllowEqualMultiplier bool    `json:"allowEqualMultiplier"`
+	ProbeModel           string  `json:"probeModel"`
 }
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
@@ -331,8 +332,33 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	return config
 }
 
+func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, config policyConfig) (policyConfig, error) {
+	var platform, modelsJSON, defaultModel string
+	if err := a.db.QueryRowContext(ctx, `SELECT platform,models,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &modelsJSON, &defaultModel); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return config, &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
+		}
+		return config, err
+	}
+	config.ProbeModel = strings.TrimSpace(config.ProbeModel)
+	if config.ProbeModel == "" {
+		config.ProbeModel = defaultModel
+	}
+	allowed := false
+	for _, model := range decodeModels(modelsJSON) {
+		if model == config.ProbeModel && probeModelMatchesPlatform(platform, model) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return config, &apiError{400, "INVALID_PROBE_MODEL", "测试模型必须来自目标分组的同平台文本模型"}
+	}
+	return config, nil
+}
+
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id,
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id,COALESCE(tg.models,'[]'::jsonb),
 		(SELECT count(*) FROM managed_account_groups mg WHERE mg.target_group_id=p.scope_id),
 		(SELECT count(*) FROM managed_account_groups mg JOIN managed_accounts m ON m.id=mg.managed_account_id WHERE mg.target_group_id=p.scope_id AND m.schedulable=true)
 		FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
@@ -342,17 +368,17 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, name, scope, status, config, targetGroupName, targetName string
+		var id, name, scope, status, config, targetGroupName, targetName, probeModels string
 		var scopeID, targetID sql.NullString
 		var active sql.NullInt64
 		var managedCount, schedulableCount int
 		var created time.Time
-		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID, &managedCount, &schedulableCount); err != nil {
+		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID, &probeModels, &managedCount, &schedulableCount); err != nil {
 			return nil, err
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": fastProbeIntervalSeconds, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "probeModels": json.RawMessage(probeModels), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": fastProbeIntervalSeconds, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -370,6 +396,18 @@ func (a *App) updatePolicy(w http.ResponseWriter, r *http.Request, id string) er
 		return &apiError{400, "INVALID_INPUT", "请填写策略名称"}
 	}
 	input.Config = normalizePolicyConfig(input.Config)
+	var scopeID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT scope_id FROM policies WHERE id=$1`, id).Scan(&scopeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
+		}
+		return err
+	}
+	validatedConfig, err := a.validatePolicyProbeModel(r.Context(), scopeID, input.Config)
+	if err != nil {
+		return err
+	}
+	input.Config = validatedConfig
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		return err
@@ -441,6 +479,11 @@ func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
 		return &apiError{400, "INVALID_POLICY_SCOPE", "请选择策略对应的目标分组"}
 	}
 	input.Config = normalizePolicyConfig(input.Config)
+	validatedConfig, err := a.validatePolicyProbeModel(r.Context(), input.ScopeID, input.Config)
+	if err != nil {
+		return err
+	}
+	input.Config = validatedConfig
 	id := uuid.NewString()
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -487,8 +530,17 @@ func (a *App) createPolicyVersion(w http.ResponseWriter, r *http.Request, id str
 		return err
 	}
 	input.Config = normalizePolicyConfig(input.Config)
+	var scopeID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT scope_id FROM policies WHERE id=$1`, id).Scan(&scopeID); err != nil {
+		return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
+	}
+	var err error
+	input.Config, err = a.validatePolicyProbeModel(r.Context(), scopeID, input.Config)
+	if err != nil {
+		return err
+	}
 	var version int
-	err := a.db.QueryRowContext(r.Context(), `INSERT INTO policy_versions(policy_id,version,config) SELECT $1,COALESCE(max(version),0)+1,$2 FROM policy_versions WHERE policy_id=$1 RETURNING version`, id, jsonValue(input.Config)).Scan(&version)
+	err = a.db.QueryRowContext(r.Context(), `INSERT INTO policy_versions(policy_id,version,config) SELECT $1,COALESCE(max(version),0)+1,$2 FROM policy_versions WHERE policy_id=$1 RETURNING version`, id, jsonValue(input.Config)).Scan(&version)
 	if err != nil {
 		return err
 	}
@@ -572,23 +624,6 @@ func (a *App) getSettings(ctx context.Context) (map[string]any, error) {
 	result["version"] = Version
 	result["buildType"] = BuildType
 	result["githubRepo"] = GitHubRepo
-	groupRows, err := a.db.QueryContext(ctx, `SELECT tg.id,t.name,tg.name,tg.platform,tg.models,tg.probe_model FROM target_groups tg JOIN targets t ON t.id=tg.target_id ORDER BY t.name,tg.name`)
-	if err != nil {
-		return nil, err
-	}
-	probeGroups := []map[string]any{}
-	for groupRows.Next() {
-		var id, targetName, name, platform, models, probeModel string
-		if err = groupRows.Scan(&id, &targetName, &name, &platform, &models, &probeModel); err != nil {
-			groupRows.Close()
-			return nil, err
-		}
-		probeGroups = append(probeGroups, map[string]any{"id": id, "targetName": targetName, "name": name, "platform": platform, "models": json.RawMessage(models), "probeModel": probeModel})
-	}
-	if err = groupRows.Close(); err != nil {
-		return nil, err
-	}
-	result["probe_groups"] = probeGroups
 	return result, rows.Err()
 }
 
@@ -613,37 +648,6 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer tx.Rollback()
 	for key, value := range input {
-		if key == "probe_models" {
-			models, ok := value.(map[string]any)
-			if !ok {
-				return &apiError{400, "INVALID_PROBE_MODELS", "分组测试模型格式无效"}
-			}
-			for groupID, rawModel := range models {
-				model, ok := rawModel.(string)
-				model = strings.TrimSpace(model)
-				if !ok || model == "" {
-					return &apiError{400, "INVALID_PROBE_MODEL", "每个目标分组都必须指定测试模型"}
-				}
-				var platform, modelsJSON string
-				if err = tx.QueryRowContext(r.Context(), `SELECT platform,models FROM target_groups WHERE id=$1`, groupID).Scan(&platform, &modelsJSON); err != nil {
-					return &apiError{400, "INVALID_PROBE_MODEL_GROUP", "目标分组不存在"}
-				}
-				valid := false
-				for _, allowedModel := range decodeModels(modelsJSON) {
-					if allowedModel == model && probeModelMatchesPlatform(platform, model) {
-						valid = true
-						break
-					}
-				}
-				if !valid {
-					return &apiError{400, "INVALID_PROBE_MODEL", "测试模型不属于该目标分组的文本模型"}
-				}
-				if _, err = tx.ExecContext(r.Context(), `UPDATE target_groups SET probe_model=$2,updated_at=now() WHERE id=$1`, groupID, model); err != nil {
-					return err
-				}
-			}
-			continue
-		}
 		if !allowed[key] {
 			return &apiError{400, "INVALID_SETTING", "包含不支持的系统设置"}
 		}

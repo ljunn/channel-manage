@@ -457,9 +457,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
-	modelMap := map[string]string{}
-	for _, model := range models {
-		modelMap[model] = model
+	modelMap := modelMappingForPlatform(targetPlatform, models)
+	if len(modelMap) == 0 {
+		return &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
 	}
 	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(requestCtx, targetBase, http.MethodPost, "/api/v1/admin/accounts", session, payload)
@@ -486,7 +486,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id)
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id, modelMappingHash(modelMap))
 	if err != nil {
 		return err
 	}

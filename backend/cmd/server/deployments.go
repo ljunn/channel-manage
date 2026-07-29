@@ -266,7 +266,8 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		}
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
-			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID)
+			mappingHash := modelMappingHash(modelMappingForPlatform(account.TargetGroup.Platform, item.Models))
+			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID, mappingHash)
 			if err != nil {
 				return nil, err
 			}
@@ -481,9 +482,9 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 }
 
 func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
-	modelMap := map[string]string{}
-	for _, model := range models {
-		modelMap[model] = model
+	modelMap := modelMappingForPlatform(targetPlatform, models)
+	if len(modelMap) == 0 {
+		return "", &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
 	}
 	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)

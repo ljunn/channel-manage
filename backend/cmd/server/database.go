@@ -119,6 +119,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)`,
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
+		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS model_mapping_hash TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE managed_accounts ALTER COLUMN concurrency SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts DROP CONSTRAINT IF EXISTS managed_accounts_target_id_channel_id_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_accounts_target_remote ON managed_accounts(target_id,remote_id) WHERE remote_id<>''`,
@@ -150,6 +151,10 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), policy_id UUID NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
 			version INT NOT NULL, config JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(policy_id, version)
 		)`,
+		`UPDATE policy_versions v
+		SET config=jsonb_set(v.config,'{probeModel}',to_jsonb(tg.probe_model),true)
+		FROM policies p JOIN target_groups tg ON tg.id=p.scope_id
+		WHERE v.policy_id=p.id AND COALESCE(v.config->>'probeModel','')=''`,
 		`CREATE TABLE IF NOT EXISTS action_intents (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), managed_account_id UUID REFERENCES managed_accounts(id) ON DELETE SET NULL,
 			action_type TEXT NOT NULL, before_state JSONB NOT NULL DEFAULT '{}'::jsonb, after_state JSONB NOT NULL DEFAULT '{}'::jsonb,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -26,13 +27,21 @@ func targetGroupProbeModels(record map[string]any, platform string) []string {
 
 func probeModelMatchesPlatform(platform, model string) bool {
 	value := strings.ToLower(strings.TrimSpace(model))
-	if value == "" {
+	if !modelMatchesPlatform(platform, value) {
 		return false
 	}
 	for _, marker := range []string{"auto-review", "embedding", "rerank", "moderation", "whisper", "audio", "realtime", "tts", "image", "dall-e", "video"} {
 		if strings.Contains(value, marker) {
 			return false
 		}
+	}
+	return true
+}
+
+func modelMatchesPlatform(platform, model string) bool {
+	value := strings.ToLower(strings.TrimSpace(model))
+	if value == "" {
+		return false
 	}
 	switch managedPlatform(platform) {
 	case "openai":
@@ -46,6 +55,26 @@ func probeModelMatchesPlatform(platform, model string) bool {
 	default:
 		return true
 	}
+}
+
+func modelMappingForPlatform(platform string, models []string) map[string]string {
+	mapping := map[string]string{}
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if modelMatchesPlatform(platform, model) {
+			mapping[model] = model
+		}
+	}
+	return mapping
+}
+
+func modelMappingHash(mapping map[string]string) string {
+	keys := make([]string, 0, len(mapping))
+	for model := range mapping {
+		keys = append(keys, model)
+	}
+	sort.Strings(keys)
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(keys, "\n"))))
 }
 
 func decodeModels(raw string) []string {
@@ -137,7 +166,7 @@ func (a *App) ensureTargetProbeModels(ctx context.Context, targetID string) erro
 }
 
 func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string, sourceModels []string) ([]string, []string, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT tg.name,tg.probe_model FROM managed_accounts m JOIN managed_account_groups mg ON mg.managed_account_id=m.id JOIN target_groups tg ON tg.id=mg.target_group_id WHERE m.channel_id=$1 ORDER BY tg.name`, channelID)
+	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT tg.name,COALESCE(v.config->>'probeModel','') FROM managed_accounts m JOIN managed_account_groups mg ON mg.managed_account_id=m.id JOIN target_groups tg ON tg.id=mg.target_group_id JOIN policies p ON p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE m.channel_id=$1 ORDER BY tg.name`, channelID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -170,7 +199,7 @@ func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string
 		if len(unavailable) > 0 {
 			return models, unavailable, rows.Err()
 		}
-		return nil, nil, fmt.Errorf("渠道没有关联可测试的目标分组")
+		return models, []string{"未关联已启用策略"}, rows.Err()
 	}
 	sort.Strings(models)
 	sort.Strings(unavailable)

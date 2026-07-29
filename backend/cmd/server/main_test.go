@@ -140,7 +140,7 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		{ID: "local-1", Name: "低倍率", Platform: "anthropic", RemoteID: 11},
 		{ID: "local-2", Name: "高质量", Platform: "grok", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"claude-test", "grok-test"}, targetGroups, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,6 +711,25 @@ func TestTargetGroupProbeModelsKeepsOnlyPlatformTextModels(t *testing.T) {
 	}
 	if got := preferredProbeModel("openai", models); got != "gpt-5.5" {
 		t.Fatalf("preferred probe model=%q", got)
+	}
+}
+
+func TestModelMappingForPlatformKeepsOnlyMatchingFamily(t *testing.T) {
+	models := []string{"gpt-5.5", "codex-auto-review", "deepseek-v4-pro", "claude-sonnet-4-6", "gemini-3.5-flash", "grok-4.5"}
+	tests := []struct {
+		platform string
+		expected string
+	}{
+		{"openai", "gpt-5.5"},
+		{"anthropic", "claude-sonnet-4-6"},
+		{"gemini", "gemini-3.5-flash"},
+		{"grok", "grok-4.5"},
+	}
+	for _, test := range tests {
+		mapping := modelMappingForPlatform(test.platform, models)
+		if len(mapping) != 1 || mapping[test.expected] != test.expected {
+			t.Fatalf("%s mapping=%#v", test.platform, mapping)
+		}
 	}
 }
 
