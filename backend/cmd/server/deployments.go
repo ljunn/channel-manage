@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -50,11 +51,7 @@ type createdRemoteAccount struct {
 	TargetGroup deploymentTargetGroup
 }
 
-func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceID string) error {
-	var input sourceDeploymentRequest
-	if err := decodeJSON(r, &input); err != nil {
-		return err
-	}
+func normalizeDeploymentRequest(input *sourceDeploymentRequest) error {
 	if input.TargetID == "" || len(input.SourceGroupIDs) == 0 || len(input.TargetGroupIDs) == 0 {
 		return &apiError{400, "INVALID_INPUT", "请选择源分组、目标节点和目标分组"}
 	}
@@ -70,6 +67,17 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if input.Concurrency < 1 {
 		input.Concurrency = 1000
 	}
+	return nil
+}
+
+func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceID string) error {
+	var input sourceDeploymentRequest
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	if err := normalizeDeploymentRequest(&input); err != nil {
+		return err
+	}
 	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
 	if frozen {
 		return &apiError{409, "EMERGENCY_FREEZE", "紧急冻结已开启，禁止远程写入"}
@@ -78,10 +86,15 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if shadow {
 		return &apiError{409, "SHADOW_MODE", "请先在系统设置中关闭影子模式，再创建托管账号"}
 	}
-
-	source, sourceCredential, err := a.sourceCredentials(r.Context(), sourceID)
-	if err != nil {
+	if _, _, err := a.sourceCredentials(r.Context(), sourceID); err != nil {
 		return err
+	}
+	var scanStatus, sourceError string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT scan_status,last_error FROM sources WHERE id=$1`, sourceID).Scan(&scanStatus, &sourceError); err != nil {
+		return err
+	}
+	if scanStatus == "AUTH_REQUIRED" {
+		return &apiError{409, "SOURCE_AUTH_ACTION_REQUIRED", sourceError}
 	}
 	target, _, err := a.targetCredentials(r.Context(), input.TargetID)
 	if err != nil {
@@ -90,30 +103,108 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if !target.WriteEnabled {
 		return &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入"}
 	}
+	if _, err = a.validateDeploymentSourceGroups(r.Context(), sourceID, input.TargetID, input.SourceGroupIDs); err != nil {
+		return err
+	}
+	if _, err = a.validateDeploymentTargetGroups(r.Context(), input.TargetID, input.TargetGroupIDs); err != nil {
+		return err
+	}
 
-	sourceGroups, err := a.validateDeploymentSourceGroups(r.Context(), sourceID, input.TargetID, input.SourceGroupIDs)
+	jobID := uuid.NewString()
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO deployment_jobs(id,source_id,target_id,request,progress_total) VALUES($1,$2,$3,$4,$5)`, jobID, sourceID, input.TargetID, jsonValue(input), len(input.SourceGroupIDs))
+	if err != nil {
+		if strings.Contains(err.Error(), "idx_deployment_jobs_active_source") || strings.Contains(err.Error(), "duplicate key") {
+			return &apiError{409, "DEPLOYMENT_ALREADY_RUNNING", "该数据源已有后台创建任务，请等待完成后再提交"}
+		}
+		return err
+	}
+	operator, _ := r.Context().Value(userContextKey).(Operator)
+	go a.runDeploymentJob(jobID, sourceID, input, operator)
+	writeData(w, map[string]any{"jobId": jobID, "status": "QUEUED", "progressDone": 0, "progressTotal": len(input.SourceGroupIDs)})
+	return nil
+}
+
+func (a *App) runDeploymentJob(jobID, sourceID string, input sourceDeploymentRequest, operator Operator) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	if operator.ID != "" {
+		ctx = context.WithValue(ctx, userContextKey, operator)
+	}
+	_, _ = a.db.ExecContext(ctx, `UPDATE deployment_jobs SET status='RUNNING',started_at=now() WHERE id=$1 AND status='QUEUED'`, jobID)
+	result, err := a.executeSourceDeployment(ctx, sourceID, input, func(done, total int) {
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE deployment_jobs SET progress_done=$2,progress_total=$3 WHERE id=$1`, jobID, done, total)
+	})
+	if err != nil {
+		message := truncate(userErrorMessage(err), 500)
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE deployment_jobs SET status='FAILED',error=$2,finished_at=now() WHERE id=$1`, jobID, message)
+		a.audit(ctx, "AUTO_DEPLOY_FAILED", "deployment_job", jobID, map[string]any{"source_id": sourceID, "error": message})
+		return
+	}
+	_, _ = a.db.ExecContext(context.Background(), `UPDATE deployment_jobs SET status='COMPLETED',progress_done=progress_total,result=$2,finished_at=now() WHERE id=$1`, jobID, jsonValue(result))
+	a.audit(ctx, "AUTO_DEPLOY_COMPLETED", "deployment_job", jobID, map[string]any{"source_id": sourceID, "created": result["created"]})
+}
+
+func (a *App) listDeploymentJobs(w http.ResponseWriter, r *http.Request, sourceID string) error {
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,target_id,status,progress_done,progress_total,result,error,created_at,started_at,finished_at FROM deployment_jobs WHERE source_id=$1 ORDER BY created_at DESC LIMIT 20`, sourceID)
 	if err != nil {
 		return err
 	}
-	targetGroups, err := a.validateDeploymentTargetGroups(r.Context(), input.TargetID, input.TargetGroupIDs)
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, targetID, status, result, jobError string
+		var done, total int
+		var created time.Time
+		var started, finished sql.NullTime
+		if err = rows.Scan(&id, &targetID, &status, &done, &total, &result, &jobError, &created, &started, &finished); err != nil {
+			return err
+		}
+		items = append(items, map[string]any{"id": id, "targetId": targetID, "status": status, "progressDone": done, "progressTotal": total, "result": json.RawMessage(result), "error": jobError, "createdAt": created, "startedAt": nullableTime(started), "finishedAt": nullableTime(finished)})
+	}
+	writeData(w, items)
+	return rows.Err()
+}
+
+func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, input sourceDeploymentRequest, progress func(int, int)) (map[string]any, error) {
+	if err := normalizeDeploymentRequest(&input); err != nil {
+		return nil, err
+	}
+
+	source, sourceCredential, err := a.sourceCredentials(ctx, sourceID)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	target, _, err := a.targetCredentials(ctx, input.TargetID)
+	if err != nil {
+		return nil, err
+	}
+	if !target.WriteEnabled {
+		return nil, &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入"}
+	}
+
+	sourceGroups, err := a.validateDeploymentSourceGroups(ctx, sourceID, input.TargetID, input.SourceGroupIDs)
+	if err != nil {
+		return nil, err
+	}
+	targetGroups, err := a.validateDeploymentTargetGroups(ctx, input.TargetID, input.TargetGroupIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	operationCount := len(sourceGroups) + len(sourceGroups)*len(targetGroups)
-	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(operationCount+1)*30*time.Second)
+	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(operationCount+1)*30*time.Second)
 	defer cancel()
 	sourceSession, err := a.authenticateSource(requestCtx, source, sourceCredential, true)
 	if err != nil {
-		return err
+		return nil, sourceAuthenticationActionError(source, err)
 	}
 	targetSession, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sourceAPIBase, err := a.discoverSourceAPIBaseURL(requestCtx, source)
 	if err != nil {
-		return deploymentError("SOURCE_API_ENDPOINT_READ_FAILED", source.Name, err)
+		return nil, deploymentError("SOURCE_API_ENDPOINT_READ_FAILED", source.Name, err)
 	}
 
 	created := make([]createdDeployment, 0, len(sourceGroups))
@@ -130,28 +221,31 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		keyName := managedObjectName(source.Name, group.Name, uuid.NewString()[:8])
 		remoteKey, createErr := a.createGeneratedRemoteKey(requestCtx, source.BaseURL, source.Platform, sourceSession, group.RemoteID, keyName)
 		if createErr != nil {
-			return deploymentError("UPSTREAM_KEY_CREATE_FAILED", group.Name, createErr)
+			return nil, deploymentError("UPSTREAM_KEY_CREATE_FAILED", group.Name, createErr)
 		}
 		item := createdDeployment{SourceGroup: group, Key: remoteKey}
 		created = append(created, item)
 		models, modelErr := a.readModelsWithKey(requestCtx, sourceAPIBase, remoteKey.Key)
 		if modelErr != nil {
-			return deploymentError("UPSTREAM_MODEL_READ_FAILED", group.Name, modelErr)
+			return nil, deploymentError("UPSTREAM_MODEL_READ_FAILED", group.Name, modelErr)
 		}
 		if len(models) == 0 {
-			return &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
+			return nil, &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
 		}
 		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
 		created[len(created)-1].Models = models
 		created[len(created)-1].Accounts = accounts
 		if accountErr != nil {
-			return deploymentError("TARGET_ACCOUNT_CREATE_FAILED", group.Name, accountErr)
+			return nil, deploymentError("TARGET_ACCOUNT_CREATE_FAILED", group.Name, accountErr)
+		}
+		if progress != nil {
+			progress(len(created), len(sourceGroups))
 		}
 	}
 
-	tx, err := a.db.BeginTx(r.Context(), nil)
+	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	result := make([]map[string]any, 0, len(sourceGroups)*len(targetGroups))
@@ -159,38 +253,37 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		keyID := uuid.NewString()
 		encryptedKey, encryptErr := a.encryptSecret([]byte(item.Key.Key))
 		if encryptErr != nil {
-			return encryptErr
+			return nil, encryptErr
 		}
-		_, err = tx.ExecContext(r.Context(), `INSERT INTO source_keys(id,source_id,name,key_cipher,key_hint,production_authorized,concurrency,models,remote_id,auto_generated) VALUES($1,$2,$3,$4,$5,true,$6,$7,$8,true)`, keyID, sourceID, item.Key.Name, encryptedKey, mask(item.Key.Key), input.Concurrency, jsonValue(item.Models), item.Key.ID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO source_keys(id,source_id,name,key_cipher,key_hint,production_authorized,concurrency,models,remote_id,auto_generated) VALUES($1,$2,$3,$4,$5,true,$6,$7,$8,true)`, keyID, sourceID, item.Key.Name, encryptedKey, mask(item.Key.Key), input.Concurrency, jsonValue(item.Models), item.Key.ID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		channelID := uuid.NewString()
-		_, err = tx.ExecContext(r.Context(), `INSERT INTO channels(id,source_id,source_key_id,source_group_id,lifecycle_state,state_reason,score,last_probe_at) VALUES($1,$2,$3,$4,'HEALTHY','自动映射已完成模型验证',100,now())`, channelID, sourceID, keyID, item.SourceGroup.ID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO channels(id,source_id,source_key_id,source_group_id,lifecycle_state,state_reason,score,last_probe_at) VALUES($1,$2,$3,$4,'HEALTHY','自动映射已完成模型验证',100,now())`, channelID, sourceID, keyID, item.SourceGroup.ID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
-			_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID)
+			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			if _, err = tx.ExecContext(r.Context(), `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, account.TargetGroup.ID); err != nil {
-				return err
+			if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, account.TargetGroup.ID); err != nil {
+				return nil, err
 			}
 			result = append(result, map[string]any{"sourceGroupId": item.SourceGroup.ID, "sourceGroupName": item.SourceGroup.Name, "targetGroupId": account.TargetGroup.ID, "targetGroupName": account.TargetGroup.Name, "managedAccountId": managedID, "remoteAccountId": account.RemoteID})
 		}
 	}
 	if err = tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
 	committed = true
 	for _, item := range result {
-		a.audit(r.Context(), "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_id": item["targetGroupId"]})
+		a.audit(ctx, "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_id": item["targetGroupId"]})
 	}
-	writeData(w, map[string]any{"created": len(result), "sourceKeysCreated": len(created), "items": result, "schedulable": false})
-	return nil
+	return map[string]any{"created": len(result), "sourceKeysCreated": len(created), "items": result, "schedulable": false}, nil
 }
 
 func (a *App) rollbackDeployment(created []createdDeployment, sourceBase, sourcePlatform string, sourceSession remoteSession, targetBase string, targetSession remoteSession) {

@@ -982,6 +982,35 @@ func TestRemoteRateLimitedClassification(t *testing.T) {
 	}
 }
 
+func TestRemoteInteractiveAuthRequiredClassification(t *testing.T) {
+	for _, message := range []string{
+		"Please complete the slider verification first",
+		"AUTH_SESSION_LIMIT: Conflict",
+		"远端登录会话上限",
+	} {
+		if !remoteInteractiveAuthRequired(&apiError{Status: 502, Code: "REMOTE_REJECTED", Message: message}) {
+			t.Fatalf("interactive authentication error was not classified: %s", message)
+		}
+	}
+	if remoteInteractiveAuthRequired(&apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "INSUFFICIENT_BALANCE"}) {
+		t.Fatal("ordinary remote rejection was classified as interactive authentication")
+	}
+}
+
+func TestNormalizeDeploymentRequestUsesAsyncDefaults(t *testing.T) {
+	request := sourceDeploymentRequest{TargetID: "target", SourceGroupIDs: []string{"source-group"}, TargetGroupIDs: []string{"target-group"}}
+	if err := normalizeDeploymentRequest(&request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Priority != 1000 || request.Concurrency != 1000 {
+		t.Fatalf("unexpected deployment defaults: %#v", request)
+	}
+	tooLarge := sourceDeploymentRequest{TargetID: "target", SourceGroupIDs: make([]string, 11), TargetGroupIDs: make([]string, 10)}
+	if err := normalizeDeploymentRequest(&tooLarge); err == nil {
+		t.Fatal("deployment larger than 100 mappings was accepted")
+	}
+}
+
 func TestRemoteRouteFallbackRequiresNotFound(t *testing.T) {
 	if !remoteRouteUnavailable(&apiError{Status: 502, Code: "REMOTE_NOT_FOUND", Message: "not found"}) {
 		t.Fatal("not found response did not allow route fallback")

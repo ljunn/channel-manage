@@ -75,7 +75,7 @@ func (a *App) runPolicyEvaluation(ctx context.Context) {
 }
 
 func (a *App) scanDueSources(ctx context.Context) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id FROM sources WHERE status='ACTIVE' AND scan_status<>'RUNNING' AND (last_scan_at IS NULL OR last_scan_at + scan_interval_seconds * interval '1 second' <= now())`)
+	rows, err := a.db.QueryContext(ctx, `SELECT id FROM sources WHERE status='ACTIVE' AND scan_status NOT IN ('RUNNING','AUTH_REQUIRED') AND (last_scan_at IS NULL OR last_scan_at + scan_interval_seconds * interval '1 second' <= now())`)
 	if err != nil {
 		log.Printf("读取待扫描数据源失败: %v", err)
 		return

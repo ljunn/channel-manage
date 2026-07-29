@@ -228,8 +228,13 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 3 && parts[2] == "deploy" && method == http.MethodPost {
 			return a.deploySourceGroups(w, r, id)
 		}
+		if len(parts) == 3 && parts[2] == "deployments" && method == http.MethodGet {
+			return a.listDeploymentJobs(w, r, id)
+		}
 		if len(parts) == 3 && (parts[2] == "scan" || parts[2] == "test-connection") && method == http.MethodPost {
-			go a.scanSource(context.Background(), id)
+			if err := a.retrySourceScan(r.Context(), id); err != nil {
+				return err
+			}
 			writeData(w, map[string]string{"id": id, "status": "ACCEPTED"})
 			return nil
 		}

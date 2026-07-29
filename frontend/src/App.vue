@@ -30,6 +30,7 @@ const targetGroups = ref([])
 const sourceOpening = ref(false)
 const targetGroupsLoading = ref(false)
 const deploymentBusy = ref(false)
+const deploymentJobs = ref([])
 const policyTargetGroups = ref([])
 const form = reactive({})
 const marketMetric = ref('average')
@@ -49,6 +50,7 @@ const updateInfo = reactive({latestVersion:'',hasUpdate:false,name:'',body:'',ht
 const updateBusy = ref(false)
 const updateReady = ref(false)
 let targetGroupsRequest = 0
+let deploymentPollTimer = 0
 
 const nav = [
   { label: '经营视图', items: [['/overview','运营总览',Gauge],['/market','市场大盘',CircleDollarSign],['/sources','数据源',Database]] },
@@ -66,6 +68,8 @@ const selectedSourceGroups = computed(() => (sourceDetail.value?.groups||[]).fil
 const selectedTargetGroups = computed(() => targetGroups.value.filter(group => form.targetGroupIDs?.includes(group.id)))
 const mappingPairs = computed(() => selectedSourceGroups.value.flatMap(sourceGroup => selectedTargetGroups.value.map(targetGroup => ({ id:`${sourceGroup.id}:${targetGroup.id}`, sourceGroup, targetGroup }))))
 const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
+const activeDeploymentJob = computed(() => deploymentJobs.value.find(item=>item.status==='QUEUED'||item.status==='RUNNING')||null)
+const latestDeploymentJob = computed(() => deploymentJobs.value[0]||null)
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
 const paged = items => filtered(items).slice((page.value-1)*pageSize.value,page.value*pageSize.value)
 const filteredCount = items => filtered(items).length
@@ -181,20 +185,25 @@ async function loadPage(){
 }
 
 function open(name, initial={}){Object.keys(form).forEach(key=>delete form[key]);Object.assign(form,initial);modal.value=name;clearMessages()}
-function close(){targetGroupsRequest++;targetGroupsLoading.value=false;modal.value='';sourceDetail.value=null;selectedSource.value='';targetGroups.value=[]}
+function close(){targetGroupsRequest++;targetGroupsLoading.value=false;clearTimeout(deploymentPollTimer);deploymentPollTimer=0;deploymentJobs.value=[];modal.value='';sourceDetail.value=null;selectedSource.value='';targetGroups.value=[]}
 async function submit(action, success){if(loading.value)return;loading.value=true;clearMessages();try{await action();notice.value=success;close();await loadPage()}catch(reason){showError(reason)}finally{loading.value=false}}
 async function createSource(){await submit(()=>api('/sources',{method:'POST',body:body({name:form.name,platform:form.platform,baseURL:form.baseURL,authMode:form.platform==='SUB2API'?(form.authMode||'PASSWORD'):'PASSWORD',username:form.username,password:form.password,accessToken:form.accessToken,refreshToken:form.refreshToken,valueNumerator:Number(form.valueNumerator),valueDenominator:Number(form.valueDenominator),scanIntervalSeconds:Number(form.interval||900)})}),'数据源已保存，首次扫描已开始')}
-function editSource(row){open('source-edit',{id:row.id,name:row.name,baseURL:row.baseUrl,valueNumerator:1,valueDenominator:Number(row.valueDivisor||1),interval:row.scanIntervalSeconds||900})}
-async function updateSource(){await submit(()=>api(`/sources/${form.id}`,{method:'PATCH',body:body({name:form.name,valueNumerator:Number(form.valueNumerator),valueDenominator:Number(form.valueDenominator),scanIntervalSeconds:Number(form.interval||900)})}),'数据源设置已更新，余额与倍率已按新比例重算')}
+function editSource(row){open('source-edit',{id:row.id,name:row.name,platform:row.platform,baseURL:row.baseUrl,valueNumerator:1,valueDenominator:Number(row.valueDivisor||1),interval:row.scanIntervalSeconds||900,reauth:false,authMode:'PASSWORD',username:'',password:'',accessToken:'',refreshToken:''})}
+async function updateSource(){
+  const credentials=form.reauth?{authMode:form.authMode,username:form.username,password:form.password,accessToken:form.accessToken,refreshToken:form.refreshToken}:{}
+  await submit(()=>api(`/sources/${form.id}`,{method:'PATCH',body:body({name:form.name,valueNumerator:Number(form.valueNumerator),valueDenominator:Number(form.valueDenominator),scanIntervalSeconds:Number(form.interval||900),...credentials})}),form.reauth?'数据源认证已更新，正在重新扫描':'数据源设置已更新，余额与倍率已按新比例重算')
+}
 async function viewSource(id){
 	if(sourceOpening.value)return
 	selectedSource.value=id;sourceOpening.value=true;targetGroups.value=[];clearMessages();Object.keys(form).forEach(key=>delete form[key])
 	try{
-		const [detail,targets,settings]=await Promise.all([api(`/sources/${id}`),api('/targets'),api('/settings')])
+		const [detail,targets,settings,jobs]=await Promise.all([api(`/sources/${id}`),api('/targets'),api('/settings'),api(`/sources/${id}/deployments`)])
 		sourceDetail.value=detail;data.targets=targets;data.settings=settings
+		deploymentJobs.value=jobs
 		Object.assign(form,{sourceGroupIDs:[],targetGroupIDs:[],targetID:writableTargets.value[0]?.id||'',priority:1000,concurrency:1000})
 		modal.value='source-detail'
 		if(form.targetID)void loadTargetGroups()
+		if(activeDeploymentJob.value)scheduleDeploymentPoll(id)
 	}catch(reason){showError(reason)}finally{sourceOpening.value=false}
 }
 async function createTarget(){await submit(()=>api('/targets',{method:'POST',body:body({name:form.name,baseURL:form.baseURL,username:form.username,password:form.password,writeEnabled:!!form.writeEnabled})}),'目标节点已保存并开始同步')}
@@ -219,20 +228,37 @@ function mappedTargets(group){return (group.deployments||[]).map(item=>item.targ
 function toggleSourceGroups(){const available=(sourceDetail.value?.groups||[]).filter(group=>!isGroupMapped(group)).map(group=>group.id);form.sourceGroupIDs=form.sourceGroupIDs?.length===available.length?[]:available}
 function toggleTargetGroups(){const available=targetGroups.value.map(group=>group.id);form.targetGroupIDs=form.targetGroupIDs?.length===available.length?[]:available}
 async function deploySourceGroups(){
-	if(deploymentBusy.value)return
+	if(deploymentBusy.value||activeDeploymentJob.value)return
   if(!form.sourceGroupIDs?.length){showError(new Error('请至少选择一个源分组'));return}
   if(!form.targetID||!form.targetGroupIDs?.length){showError(new Error('请选择目标节点和目标分组'));return}
 	const sourceID=selectedSource.value
 	const sourceGroupCount=form.sourceGroupIDs.length
   const accountCount=form.sourceGroupIDs.length*form.targetGroupIDs.length
-  const timeout=(form.sourceGroupIDs.length+accountCount+1)*30000
 	deploymentBusy.value=true;clearMessages()
 	try{
-		await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)}),timeout})
-		const [detail,sources]=await Promise.all([api(`/sources/${sourceID}`),api('/sources')])
-		sourceDetail.value=detail;data.sources=sources;form.sourceGroupIDs=[]
-		notice.value=`已自动创建 ${sourceGroupCount} 个专用 Key 和 ${accountCount} 个独立托管账号，可继续选择其他源分组`
+		const job=await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)})})
+		deploymentJobs.value=[{id:job.jobId,status:job.status,progressDone:job.progressDone,progressTotal:job.progressTotal,error:'',result:{}},...deploymentJobs.value]
+		form.sourceGroupIDs=[];form.targetGroupIDs=[]
+		notice.value=`后台任务已提交：将创建 ${sourceGroupCount} 个专用 Key 和 ${accountCount} 个独立托管账号`
+		scheduleDeploymentPoll(sourceID)
 	}catch(reason){showError(reason)}finally{deploymentBusy.value=false}
+}
+function scheduleDeploymentPoll(sourceID){
+	clearTimeout(deploymentPollTimer)
+	deploymentPollTimer=setTimeout(()=>void pollDeploymentJobs(sourceID),1500)
+}
+async function pollDeploymentJobs(sourceID){
+	if(selectedSource.value!==sourceID||modal.value!=='source-detail')return
+	try{
+		deploymentJobs.value=await api(`/sources/${sourceID}/deployments`)
+		if(activeDeploymentJob.value){scheduleDeploymentPoll(sourceID);return}
+		const latest=latestDeploymentJob.value
+		if(latest?.status==='COMPLETED'){
+			const [detail,sources]=await Promise.all([api(`/sources/${sourceID}`),api('/sources')])
+			sourceDetail.value=detail;data.sources=sources
+			notice.value=`后台创建完成：${latest.result?.sourceKeysCreated||0} 个专用 Key，${latest.result?.created||0} 个独立托管账号`
+		}else if(latest?.status==='FAILED')showError(new Error(latest.error||'后台创建失败'))
+	}catch(reason){showError(reason);scheduleDeploymentPoll(sourceID)}
 }
 async function openPolicy(){open('policy',{targetID:writableTargets.value[0]?.id||'',targetGroupID:'',mode:'PRICE',allowEqualMultiplier:false,minSuccessRate:95,minSamples:5});await loadPolicyTargetGroups()}
 async function loadPolicyTargetGroups(){policyTargetGroups.value=form.targetID?await api(`/targets/${form.targetID}/groups`):[];form.targetGroupID=''}
@@ -283,8 +309,8 @@ async function runAutomation(){
 async function rescanSource(row){await action(()=>api(`/sources/${row.id}/scan`,{method:'POST'}),'扫描任务已提交')}
 async function syncTarget(row){await action(()=>api(`/targets/${row.id}/test-connection`,{method:'POST'}),'同步任务已提交')}
 
-function statusTone(value){if(['ACTIVE','ONLINE','HEALTHY','SUCCESS','EXECUTED','RESOLVED','SYNCED'].includes(value))return'success';if(['FAILED','OFFLINE','QUARANTINED','CREDENTIAL_BLOCKED','P0','P1'].includes(value))return'danger';if(['UNKNOWN','PENDING','VALIDATING','SUSPECT','ACKNOWLEDGED','DRAFT'].includes(value))return'warning';return'neutral'}
-function statusText(value){return {UNKNOWN:'待同步',ACTIVE:'启用',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',PENDING:'待审批',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',SUCCESS:'成功',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
+function statusTone(value){if(['ACTIVE','ONLINE','HEALTHY','SUCCESS','EXECUTED','RESOLVED','SYNCED','COMPLETED'].includes(value))return'success';if(['FAILED','OFFLINE','QUARANTINED','CREDENTIAL_BLOCKED','AUTH_REQUIRED','P0','P1'].includes(value))return'danger';if(['UNKNOWN','PENDING','QUEUED','RUNNING','VALIDATING','SUSPECT','ACKNOWLEDGED','DRAFT'].includes(value))return'warning';return'neutral'}
+function statusText(value){return {UNKNOWN:'待同步',ACTIVE:'启用',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',PENDING:'待审批',QUEUED:'排队中',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',AUTH_REQUIRED:'需要重新认证',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',SUCCESS:'成功',COMPLETED:'已完成',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
 function date(value){return value?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)):'--'}
 function money(value){return value==null?'--':`$${Number(value).toFixed(2)}`}
 function balanceEta(row){if(row.balanceEtaHours==null)return'正在积累消耗样本';const hours=Number(row.balanceEtaHours);if(hours<1)return`预计可用 ${Math.max(1,Math.round(hours*60))} 分钟`;if(hours<48)return`预计可用 ${hours.toFixed(1)} 小时`;return`预计可用 ${(hours/24).toFixed(1)} 天`}
@@ -374,7 +400,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <template v-else-if="route==='/sources'">
           <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></div>
           <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></StateBlock>
-          <template v-else><div class="source-controls"><label><span>绑定状态</span><select v-model="sourceBindingFilter"><option value="all">全部</option><option value="unbound">未绑定账号</option><option value="partial">部分绑定</option><option value="complete">已全部绑定</option></select></label><label><span>扫描状态</span><select v-model="sourceStatusFilter"><option value="all">全部状态</option><option value="SUCCESS">扫描成功</option><option value="FAILED">扫描失败</option><option value="RUNNING">扫描中</option></select></label><label><span>排序</span><select v-model="sourceSort"><option value="created">最近接入</option><option value="accountsAsc">托管账号少 → 多</option><option value="accountsDesc">托管账号多 → 少</option><option value="balanceDesc">余额高 → 低</option><option value="balanceAsc">余额低 → 高</option><option value="groupsDesc">源分组多 → 少</option></select></label><span class="source-result-count">{{ sourceRows.length }} 个符合条件</span></div><StateBlock v-if="!sourceRows.length" title="没有符合条件的数据源"/><div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额预测</th><th>绑定覆盖</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in sourcePagedRows" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td class="balance-forecast"><strong>{{ money(row.balance) }}</strong><small>{{ balanceEta(row) }}</small><small v-if="row.balanceBurnRate!=null">消耗 {{ money(row.balanceBurnRate) }} / 小时</small></td><td class="binding-progress"><strong>{{ row.boundGroupCount||0 }} / {{ row.groupCount||0 }} 个源分组</strong><small>{{ row.managedAccountCount||0 }} 个托管账号 · {{ sourceBindingText(row) }}</small></td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div></template>
+          <template v-else><div class="source-controls"><label><span>绑定状态</span><select v-model="sourceBindingFilter"><option value="all">全部</option><option value="unbound">未绑定账号</option><option value="partial">部分绑定</option><option value="complete">已全部绑定</option></select></label><label><span>扫描状态</span><select v-model="sourceStatusFilter"><option value="all">全部状态</option><option value="SUCCESS">扫描成功</option><option value="AUTH_REQUIRED">需要重新认证</option><option value="FAILED">扫描失败</option><option value="RUNNING">扫描中</option></select></label><label><span>排序</span><select v-model="sourceSort"><option value="created">最近接入</option><option value="accountsAsc">托管账号少 → 多</option><option value="accountsDesc">托管账号多 → 少</option><option value="balanceDesc">余额高 → 低</option><option value="balanceAsc">余额低 → 高</option><option value="groupsDesc">源分组多 → 少</option></select></label><span class="source-result-count">{{ sourceRows.length }} 个符合条件</span></div><StateBlock v-if="!sourceRows.length" title="没有符合条件的数据源"/><div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额预测</th><th>绑定覆盖</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in sourcePagedRows" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td class="balance-forecast"><strong>{{ money(row.balance) }}</strong><small>{{ balanceEta(row) }}</small><small v-if="row.balanceBurnRate!=null">消耗 {{ money(row.balanceBurnRate) }} / 小时</small></td><td class="binding-progress"><strong>{{ row.boundGroupCount||0 }} / {{ row.groupCount||0 }} 个源分组</strong><small>{{ row.managedAccountCount||0 }} 个托管账号 · {{ sourceBindingText(row) }}</small></td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div></template>
           <PaginationBar v-if="!loading&&sourceRows.length" v-model:page="page" v-model:page-size="pageSize" :total="sourceRows.length"/>
         </template>
 
@@ -467,7 +493,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
   </div>
 
   <ModalShell v-if="modal==='source'" title="接入数据源" @close="close"><form class="modal-form" @submit.prevent="createSource"><label><span>平台名称</span><input v-model="form.name" required/></label><label><span>平台类型</span><select v-model="form.platform" @change="form.authMode='PASSWORD'"><option value="SUB2API">Sub2API</option><option value="NEW_API">New API</option></select></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" type="url" placeholder="https://" required/></label><fieldset v-if="form.platform==='SUB2API'" class="auth-mode full"><legend>认证方式</legend><label :class="{active:form.authMode==='PASSWORD'}"><input v-model="form.authMode" type="radio" value="PASSWORD"/><span>账号密码</span></label><label :class="{active:form.authMode==='TOKEN'}"><input v-model="form.authMode" type="radio" value="TOKEN"/><span>Access Token + RT</span></label></fieldset><template v-if="form.platform!=='SUB2API'||form.authMode!=='TOKEN'"><label><span>{{ form.platform==='SUB2API'?'管理员邮箱':'用户名' }}</span><input v-model="form.username" :type="form.platform==='SUB2API'?'email':'text'" required/></label><label><span>密码</span><input v-model="form.password" type="password" required/></label></template><template v-else><label><span>Access Token</span><input v-model="form.accessToken" type="password" autocomplete="off" required/></label><label><span>Refresh Token (RT)</span><input v-model="form.refreshToken" type="password" autocomplete="off" required/></label></template><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存</button></footer></form></ModalShell>
-  <ModalShell v-if="modal==='source-edit'" title="编辑数据源" @close="close"><form class="modal-form" @submit.prevent="updateSource"><label class="full"><span>平台名称</span><input v-model="form.name" required/></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" disabled/></label><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存并重算</button></footer></form></ModalShell>
+  <ModalShell v-if="modal==='source-edit'" title="编辑数据源" @close="close"><form class="modal-form" @submit.prevent="updateSource"><label class="full"><span>平台名称</span><input v-model="form.name" required/></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" disabled/></label><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><label class="check-row full"><input v-model="form.reauth" type="checkbox"/><span><strong>更新远端认证</strong><small>{{ form.platform==='SUB2API'?'遇到滑块验证或会话上限时，处理源站后在这里换新令牌':'更新源站用户名和密码后重新扫描' }}</small></span></label><template v-if="form.reauth"><fieldset v-if="form.platform==='SUB2API'" class="auth-mode full"><legend>认证方式</legend><label :class="{active:form.authMode==='PASSWORD'}"><input v-model="form.authMode" type="radio" value="PASSWORD"/><span>账号密码</span></label><label :class="{active:form.authMode==='TOKEN'}"><input v-model="form.authMode" type="radio" value="TOKEN"/><span>Access Token + RT</span></label></fieldset><template v-if="form.platform!=='SUB2API'||form.authMode==='PASSWORD'"><label><span>{{ form.platform==='SUB2API'?'管理员邮箱':'用户名' }}</span><input v-model="form.username" :type="form.platform==='SUB2API'?'email':'text'" required/></label><label><span>密码</span><input v-model="form.password" type="password" required/></label></template><template v-else><label><span>Access Token</span><input v-model="form.accessToken" type="password" autocomplete="off" required/></label><label><span>Refresh Token (RT)</span><input v-model="form.refreshToken" type="password" autocomplete="off" required/></label></template></template><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='source-detail'&&sourceDetail" :title="sourceDetail.source.name" wide @close="close">
     <form class="mapping-workspace" @submit.prevent="deploySourceGroups">
       <div class="mapping-context">
@@ -476,6 +502,8 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <div><Network :size="18"/><span><small>目标节点</small><strong>{{ selectedTarget?.name||'尚未选择' }}</strong></span></div>
         <span class="mapping-cardinality">1 个源分组 : N 个独立账号</span>
       </div>
+      <div v-if="activeDeploymentJob" class="message warning mapping-job-status"><span class="spinner"/><span><strong>后台创建中 · {{ activeDeploymentJob.progressDone }}/{{ activeDeploymentJob.progressTotal }} 个源分组</strong><small>可以关闭页面，任务会继续运行；完成后这里会自动刷新</small></span></div>
+      <div v-else-if="latestDeploymentJob?.status==='FAILED'" class="message error mapping-job-status"><AlertTriangle :size="16"/><span><strong>上次后台创建失败</strong><small>{{ latestDeploymentJob.error }}</small></span></div>
       <div class="mapping-builder">
         <section class="mapping-step">
           <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>每个源分组为每个目标分组创建独立账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
@@ -506,7 +534,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
       </section>
       <footer class="mapping-submit">
         <div class="mapping-options"><label><span>初始优先级</span><input v-model="form.priority" type="number" min="1"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
-        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），账号类型跟随各自目标分组</small><button class="btn primary" :disabled="deploymentBusy||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>{{ deploymentBusy?'正在创建':'确认创建' }}</button></div>
+        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），账号类型跟随各自目标分组</small><button class="btn primary" :disabled="deploymentBusy||activeDeploymentJob||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>{{ deploymentBusy?'正在提交':activeDeploymentJob?'后台创建中':'确认创建' }}</button></div>
       </footer>
     </form>
   </ModalShell>

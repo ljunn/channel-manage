@@ -183,9 +183,10 @@ func normalizeAccessToken(value string) string {
 
 func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) error {
 	var input struct {
-		Name                             string
-		ValueNumerator, ValueDenominator float64
-		ScanIntervalSeconds              int
+		Name                                                    string
+		AuthMode, Username, Password, AccessToken, RefreshToken string
+		ValueNumerator, ValueDenominator                        float64
+		ScanIntervalSeconds                                     int
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		return err
@@ -199,6 +200,42 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 	}
 	if input.ScanIntervalSeconds < 60 {
 		input.ScanIntervalSeconds = 900
+	}
+	credentialChanged := input.AuthMode != "" || input.Username != "" || input.Password != "" || input.AccessToken != "" || input.RefreshToken != ""
+	var encryptedCredential []byte
+	credentialHint := ""
+	credentialMode := ""
+	if credentialChanged {
+		source, _, credentialErr := a.sourceCredentials(r.Context(), id)
+		if credentialErr != nil {
+			return credentialErr
+		}
+		credentialMode = strings.ToUpper(strings.TrimSpace(input.AuthMode))
+		if credentialMode == "" {
+			credentialMode = "PASSWORD"
+		}
+		credential := sourceCredentials{AuthMode: credentialMode}
+		if credentialMode == "TOKEN" {
+			credential.AccessToken = normalizeAccessToken(input.AccessToken)
+			credential.RefreshToken = strings.TrimSpace(input.RefreshToken)
+			if source.Platform != "SUB2API" || credential.AccessToken == "" || credential.RefreshToken == "" {
+				return &apiError{400, "INVALID_INPUT", "令牌认证需要同时填写 Access Token 和 Refresh Token"}
+			}
+			credentialHint = "令牌认证"
+		} else if credentialMode == "PASSWORD" {
+			credential.Username = strings.TrimSpace(input.Username)
+			credential.Password = input.Password
+			if credential.Username == "" || credential.Password == "" {
+				return &apiError{400, "INVALID_INPUT", "重新认证时请同时填写账号和密码"}
+			}
+			credentialHint = mask(credential.Username)
+		} else {
+			return &apiError{400, "INVALID_AUTH_MODE", "认证方式必须是账号密码或令牌"}
+		}
+		encryptedCredential, err = a.encryptSecret([]byte(jsonValue(credential)))
+		if err != nil {
+			return err
+		}
 	}
 
 	tx, err := a.db.BeginTx(r.Context(), nil)
@@ -216,6 +253,11 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET name=$2,value_divisor=$3,scan_interval_seconds=$4,balance=balance*$5,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name), divisor, input.ScanIntervalSeconds, scale); err != nil {
 		return err
 	}
+	if credentialChanged {
+		if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET credential_cipher=$2,username_hint=$3,scan_status='UNKNOWN',last_error='',updated_at=now() WHERE id=$1`, id, encryptedCredential, credentialHint); err != nil {
+			return err
+		}
+	}
 	if oldDivisor != divisor {
 		if _, err = tx.ExecContext(r.Context(), `UPDATE source_groups SET multiplier=multiplier*$2 WHERE source_id=$1 AND multiplier IS NOT NULL`, id, scale); err != nil {
 			return err
@@ -230,7 +272,7 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	a.audit(r.Context(), "UPDATE", "source", id, map[string]any{"name": strings.TrimSpace(input.Name), "value_divisor": divisor, "previous_value_divisor": oldDivisor})
+	a.audit(r.Context(), "UPDATE", "source", id, map[string]any{"name": strings.TrimSpace(input.Name), "value_divisor": divisor, "previous_value_divisor": oldDivisor, "credentials_changed": credentialChanged, "auth_mode": credentialMode})
 	go a.scanSource(context.Background(), id)
 	writeData(w, map[string]any{"id": id, "valueDivisor": divisor, "status": "ACCEPTED"})
 	return nil
@@ -280,7 +322,7 @@ func (a *App) sourceCredentials(ctx context.Context, id string) (Source, sourceC
 }
 
 func (a *App) scanSource(ctx context.Context, id string) error {
-	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='RUNNING',last_error='',updated_at=now() WHERE id=$1 AND scan_status<>'RUNNING'`, id)
+	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='RUNNING',last_error='',updated_at=now() WHERE id=$1 AND scan_status NOT IN ('RUNNING','AUTH_REQUIRED')`, id)
 	if err != nil {
 		return err
 	}
@@ -305,9 +347,15 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		}
 	}
 	if err != nil {
-		_, _ = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='FAILED',last_scan_at=now(),last_error=$2,updated_at=now() WHERE id=$1`, id, truncate(err.Error(), 500))
-		a.openEvent(ctx, "P1", "SOURCE_SCAN", "数据源扫描失败", source.Name+": "+err.Error(), "source-scan:"+id)
-		return err
+		reported := sourceAuthenticationActionError(source, err)
+		status := "FAILED"
+		if remoteInteractiveAuthRequired(err) {
+			status = "AUTH_REQUIRED"
+		}
+		message := userErrorMessage(reported)
+		_, _ = a.db.ExecContext(ctx, `UPDATE sources SET scan_status=$2,last_scan_at=now(),last_error=$3,updated_at=now() WHERE id=$1`, id, status, truncate(message, 500))
+		a.openEvent(ctx, "P1", "SOURCE_SCAN", "数据源扫描失败", source.Name+": "+message, "source-scan:"+id)
+		return reported
 	}
 	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
 	if err == nil {
@@ -315,6 +363,29 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		a.evaluateSourceBalance(ctx, id)
 	}
 	return err
+}
+
+func sourceAuthenticationActionError(source Source, err error) error {
+	if !remoteInteractiveAuthRequired(err) {
+		return err
+	}
+	action := "远端要求完成滑块验证"
+	if strings.Contains(strings.ToLower(err.Error()), "auth_session_limit") || strings.Contains(strings.ToLower(err.Error()), "session limit") {
+		action = "远端登录会话已达到上限"
+	}
+	return &apiError{Status: 409, Code: "SOURCE_AUTH_ACTION_REQUIRED", Message: fmt.Sprintf("%s：%s。系统已停止自动重登；请登录源站处理后，在数据源编辑中更新 Access Token + Refresh Token", source.Name, action)}
+}
+
+func (a *App) retrySourceScan(ctx context.Context, id string) error {
+	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='UNKNOWN',last_error='',updated_at=now() WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if count, _ := result.RowsAffected(); count == 0 {
+		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
+	}
+	go a.scanSource(context.Background(), id)
+	return nil
 }
 
 func (a *App) authenticateSource(ctx context.Context, source Source, credential sourceCredentials, validate bool) (remoteSession, error) {

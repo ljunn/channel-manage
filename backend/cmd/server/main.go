@@ -65,6 +65,17 @@ func (e *apiError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+func userErrorMessage(err error) string {
+	var typed *apiError
+	if errors.As(err, &typed) && typed.Message != "" {
+		return typed.Message
+	}
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func main() {
 	ctx := context.Background()
 	db, err := sql.Open("postgres", databaseURL())

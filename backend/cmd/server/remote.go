@@ -285,6 +285,17 @@ func remoteRateLimited(err error) bool {
 	return errors.As(err, &typed) && typed.Code == "REMOTE_RATE_LIMITED"
 }
 
+func remoteInteractiveAuthRequired(err error) bool {
+	var typed *apiError
+	if !errors.As(err, &typed) {
+		return false
+	}
+	message := strings.ToLower(typed.Message)
+	return typed.Code == "REMOTE_REJECTED" && (strings.Contains(message, "slider verification") ||
+		strings.Contains(message, "auth_session_limit") || strings.Contains(message, "session limit") ||
+		strings.Contains(message, "滑块") || strings.Contains(message, "会话上限"))
+}
+
 func remoteAuthenticationExpired(err error) bool {
 	var typed *apiError
 	if !errors.As(err, &typed) {

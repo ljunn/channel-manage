@@ -448,6 +448,10 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .mapping-context small { color: var(--muted); font-size: 10px; }
 .mapping-context strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .mapping-context > svg { flex: 0 0 auto; color: var(--ink-400); }
+.mapping-job-status { margin: 0; }
+.mapping-job-status > span:last-child { min-width: 0; display: grid; gap: 2px; }
+.mapping-job-status strong, .mapping-job-status small { display: block; }
+.mapping-job-status small { color: inherit; opacity: .82; }
 .mapping-cardinality { margin-left: auto; color: var(--teal-700); font-size: 12px; font-weight: 700; }
 .mapping-builder { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 20px; }
 .mapping-step { min-width: 0; display: grid; align-content: start; gap: 12px; }
