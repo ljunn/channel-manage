@@ -93,10 +93,24 @@ func TestUnwrapEnvelope(t *testing.T) {
 
 func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T) {
 	requests := []map[string]any{}
+	stopped := map[string]bool{}
 	var mu sync.Mutex
 	active := 0
 	maxActive := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/schedulable") {
+			var payload map[string]bool
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			parts := strings.Split(r.URL.Path, "/")
+			mu.Lock()
+			stopped[parts[len(parts)-2]] = !payload["schedulable"]
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"updated":true}}`))
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -132,6 +146,9 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 	}
 	if len(accounts) != 2 || len(requests) != 2 {
 		t.Fatalf("expected two independent accounts, got accounts=%d requests=%d", len(accounts), len(requests))
+	}
+	if !stopped["11"] || !stopped["22"] {
+		t.Fatalf("new accounts were not explicitly stopped: %#v", stopped)
 	}
 	if maxActive < 2 {
 		t.Fatalf("expected account creation to run concurrently, max active requests=%d", maxActive)
@@ -170,6 +187,11 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 
 func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/schedulable") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":0,"data":{"updated":true}}`))
+			return
+		}
 		var payload map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
@@ -549,8 +571,12 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 		State: "HEALTHY", Schedulable: true, SourceMultiplier: sql.NullFloat64{Float64: .5, Valid: true}, TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
 		SuccessRate: sql.NullFloat64{Float64: 100, Valid: true}, Samples: 5,
 	}
+	if reasons := policyRejectionReasons(eligible, config); len(reasons) != 1 || !strings.Contains(reasons[0], "未允许等倍率") {
+		t.Fatalf("equal source and target multipliers should be rejected by default: %#v", reasons)
+	}
+	config.AllowEqualMultiplier = true
 	if reasons := policyRejectionReasons(eligible, config); len(reasons) != 0 {
-		t.Fatalf("equal source and target multipliers should be eligible: %#v", reasons)
+		t.Fatalf("equal source and target multipliers should be eligible when enabled: %#v", reasons)
 	}
 	eligible.SourceMultiplier.Float64 = .51
 	reasons := policyRejectionReasons(eligible, config)

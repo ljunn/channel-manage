@@ -304,9 +304,10 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
-	Mode           string  `json:"mode"`
-	MinSuccessRate float64 `json:"minSuccessRate"`
-	MinSamples     int     `json:"minSamples"`
+	Mode                 string  `json:"mode"`
+	MinSuccessRate       float64 `json:"minSuccessRate"`
+	MinSamples           int     `json:"minSamples"`
+	AllowEqualMultiplier bool    `json:"allowEqualMultiplier"`
 }
 
 func normalizePolicyConfig(config policyConfig) policyConfig {

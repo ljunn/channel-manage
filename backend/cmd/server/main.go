@@ -45,6 +45,8 @@ type App struct {
 	targetMultiplierRefreshes map[string]struct{}
 	targetPlatformMu          sync.Mutex
 	targetPlatformSyncs       map[string]struct{}
+	targetSchedulableMu       sync.Mutex
+	targetSchedulableSyncs    map[string]struct{}
 }
 
 type apiError struct {

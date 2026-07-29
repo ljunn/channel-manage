@@ -406,7 +406,12 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 	if !ok {
 		return "", &apiError{502, "SCHEMA_CHANGED", "目标节点未返回账号 ID"}
 	}
-	return strconv.Itoa(int(remoteID)), nil
+	remoteIDText := strconv.Itoa(int(remoteID))
+	if err = a.syncTargetAccountSchedulable(ctx, targetBase, remoteIDText, targetSession, false); err != nil {
+		a.deleteRemoteManagedAccount(context.Background(), targetBase, targetSession, remoteIDText)
+		return "", fmt.Errorf("初始化托管账号停止状态失败: %w", err)
+	}
+	return remoteIDText, nil
 }
 
 func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {

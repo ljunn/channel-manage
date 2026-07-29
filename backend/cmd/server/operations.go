@@ -416,6 +416,10 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return &apiError{502, "SCHEMA_CHANGED", "目标节点未返回账号 ID"}
 	}
 	remoteID := strconv.Itoa(int(remoteNumber))
+	if err = a.syncTargetAccountSchedulable(requestCtx, targetBase, remoteID, session, false); err != nil {
+		a.deleteRemoteManagedAccount(context.Background(), targetBase, session, remoteID)
+		return fmt.Errorf("初始化托管账号停止状态失败: %w", err)
+	}
 	id := uuid.NewString()
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {

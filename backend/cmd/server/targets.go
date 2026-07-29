@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -151,9 +152,102 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	go func() {
 		platformCtx, platformCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer platformCancel()
+		a.syncManagedAccountSchedulableStates(platformCtx, target, session)
 		a.syncManagedAccountPlatforms(platformCtx, target, session)
 	}()
 	return nil
+}
+
+func (a *App) syncManagedAccountSchedulableStates(ctx context.Context, target Target, session remoteSession) {
+	if !target.WriteEnabled {
+		return
+	}
+	a.targetSchedulableMu.Lock()
+	if a.targetSchedulableSyncs == nil {
+		a.targetSchedulableSyncs = make(map[string]struct{})
+	}
+	if _, running := a.targetSchedulableSyncs[target.ID]; running {
+		a.targetSchedulableMu.Unlock()
+		return
+	}
+	a.targetSchedulableSyncs[target.ID] = struct{}{}
+	a.targetSchedulableMu.Unlock()
+	defer func() {
+		a.targetSchedulableMu.Lock()
+		delete(a.targetSchedulableSyncs, target.ID)
+		a.targetSchedulableMu.Unlock()
+	}()
+
+	type managedState struct {
+		id, remoteID, remoteName string
+		schedulable              bool
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.schedulable
+		FROM managed_accounts m
+		WHERE m.target_id=$1 AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'
+		AND NOT EXISTS(SELECT 1 FROM action_intents i WHERE i.managed_account_id=m.id AND i.action_type='SET_SCHEDULABLE' AND i.status='APPROVED')`, target.ID)
+	if err != nil {
+		log.Printf("读取托管账号启停状态失败 [%s]: %v", target.ID, err)
+		return
+	}
+	local := map[string]managedState{}
+	for rows.Next() {
+		var item managedState
+		if err = rows.Scan(&item.id, &item.remoteID, &item.remoteName, &item.schedulable); err != nil {
+			break
+		}
+		local[item.remoteID] = item
+	}
+	_ = rows.Close()
+	if err != nil || len(local) == 0 {
+		return
+	}
+
+	accounts, err := a.fetchPaged(ctx, target.BaseURL, "/api/v1/admin/accounts?search="+url.QueryEscape("[托管]"), session)
+	if err != nil {
+		log.Printf("读取远端托管账号启停状态失败 [%s]: %v", target.ID, err)
+		return
+	}
+	remote := map[string]bool{}
+	for _, account := range accounts {
+		id, ok := number(account["id"])
+		if !ok {
+			continue
+		}
+		remoteID := strconv.Itoa(int(id))
+		if _, managed := local[remoteID]; !managed {
+			continue
+		}
+		if schedulable, ok := account["schedulable"].(bool); ok {
+			remote[remoteID] = schedulable
+		}
+	}
+
+	failed := 0
+	corrected := 0
+	for remoteID, item := range local {
+		actual, found := remote[remoteID]
+		if !found || actual == item.schedulable {
+			continue
+		}
+		if err = a.syncTargetAccountSchedulable(ctx, target.BaseURL, remoteID, session, item.schedulable); err != nil {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate("远端调度状态校正失败: "+err.Error(), 500))
+			continue
+		}
+		corrected++
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, item.id)
+		a.audit(context.Background(), "RECONCILE_SCHEDULABLE", "managed_account", item.id, map[string]any{"remote_id": remoteID, "remote_before": actual, "desired": item.schedulable})
+	}
+	if corrected > 0 {
+		log.Printf("已校正目标节点 %s 的远端托管账号启停漂移: %d 个", target.Name, corrected)
+	}
+	if failed > 0 {
+		detail := fmt.Sprintf("%s 有 %d 个本系统托管账号的远端启停状态与策略不一致，自动校正失败。请检查目标节点写入权限。", target.Name, failed)
+		a.openEvent(context.Background(), "P0", "ACTION_EXECUTION", "托管账号远端启停状态校正失败", detail, "target-schedulable-drift:"+target.ID)
+	} else {
+		a.resolveEvent(context.Background(), "target-schedulable-drift:"+target.ID)
+	}
 }
 
 func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, session remoteSession) {

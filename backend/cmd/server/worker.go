@@ -191,7 +191,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.State == "MANUAL_HOLD" || !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid || item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64 {
+	if item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) {
 		return false
 	}
 	return item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -301,7 +301,7 @@ func groupNeedsAvailabilityAlert(items []managedPolicyCandidate, config policyCo
 		if item.Schedulable || item.State != "HEALTHY" {
 			return true
 		}
-		if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid || item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64 {
+		if !policyMultiplierQualified(item, config) {
 			return true
 		}
 		if item.Samples >= config.MinSamples && !policySuccessQualified(item, config) {
@@ -403,14 +403,17 @@ func policyModeText(mode string) string {
 }
 
 func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []string {
+	config = normalizePolicyConfig(config)
 	reasons := []string{}
 	if item.State != "HEALTHY" {
 		reasons = append(reasons, "渠道状态为 "+item.State+"："+item.StateReason)
 	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
 		reasons = append(reasons, "源分组或目标分组倍率缺失")
-	} else if item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64 {
+	} else if item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64+multiplierComparisonTolerance {
 		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 超过目标分组上限 %.4fx", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
+	} else if !config.AllowEqualMultiplier && item.SourceMultiplier.Float64 >= item.TargetMultiplier.Float64-multiplierComparisonTolerance {
+		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 与目标分组倍率 %.4fx 相同，策略未允许等倍率账号参与", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
 	}
 	if item.Samples < config.MinSamples {
 		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
@@ -423,6 +426,18 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 		reasons = append(reasons, fmt.Sprintf("7 天成功率 %s 低于 %.1f%%，或最近探测成功 %d/%d", actual, config.MinSuccessRate, item.RecentSuccesses, recoverySuccessSamples))
 	}
 	return reasons
+}
+
+const multiplierComparisonTolerance = 1e-9
+
+func policyMultiplierQualified(item managedPolicyCandidate, config policyConfig) bool {
+	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
+		return false
+	}
+	if item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64+multiplierComparisonTolerance {
+		return false
+	}
+	return config.AllowEqualMultiplier || item.SourceMultiplier.Float64 < item.TargetMultiplier.Float64-multiplierComparisonTolerance
 }
 
 func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bool {
