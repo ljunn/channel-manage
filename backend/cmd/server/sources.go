@@ -593,13 +593,15 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 }
 
 func sub2APIGroupMultiplier(record, rates map[string]any, remoteID string) *float64 {
+	// /groups/rates contains the current user's custom group rates. Sub2API
+	// bills with that value when present, otherwise it uses the group default.
+	if value, ok := number(rates[remoteID]); ok {
+		return &value
+	}
 	for _, field := range []string{"rate_multiplier", "rate", "ratio", "multiplier", "group_ratio"} {
 		if value, ok := number(record[field]); ok {
 			return &value
 		}
-	}
-	if value, ok := number(rates[remoteID]); ok {
-		return &value
 	}
 	return nil
 }

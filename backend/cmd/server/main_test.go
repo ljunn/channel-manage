@@ -776,17 +776,20 @@ func TestSourceValueDivisor(t *testing.T) {
 	}
 }
 
-func TestSub2APIGroupMultiplierPrefersAvailableGroupRate(t *testing.T) {
+func TestSub2APIGroupMultiplierPrefersUserSpecificRate(t *testing.T) {
 	record := map[string]any{"rate_multiplier": float64(.12)}
 	rates := map[string]any{"43": float64(.5)}
 	value := sub2APIGroupMultiplier(record, rates, "43")
-	if value == nil || *value != .12 {
-		t.Fatalf("unexpected available group multiplier: %v", value)
-	}
-	delete(record, "rate_multiplier")
-	value = sub2APIGroupMultiplier(record, rates, "43")
 	if value == nil || *value != .5 {
-		t.Fatalf("unexpected legacy rate multiplier: %v", value)
+		t.Fatalf("unexpected user-specific multiplier: %v", value)
+	}
+	value = sub2APIGroupMultiplier(record, map[string]any{}, "43")
+	if value == nil || *value != .12 {
+		t.Fatalf("unexpected default group multiplier: %v", value)
+	}
+	value = sub2APIGroupMultiplier(record, map[string]any{"43": float64(0)}, "43")
+	if value == nil || *value != 0 {
+		t.Fatalf("unexpected zero user-specific multiplier: %v", value)
 	}
 	for _, field := range []string{"rate", "ratio", "multiplier", "group_ratio"} {
 		value = sub2APIGroupMultiplier(map[string]any{field: ".25"}, map[string]any{}, "43")
