@@ -176,7 +176,7 @@ func (a *App) notifyEvent(ctx context.Context, eventID, severity, title, detail 
 		return
 	}
 	guidance := eventEmailGuidanceFor(category, severity == "恢复")
-	subject := fmt.Sprintf("[%s][%s] %s", severity, guidance.Scene, title)
+	subject := eventEmailSubject(severity, category, title, detail, guidance)
 	content := formatEventEmail(eventID, severity, title, detail, createdAt, guidance)
 	rows, err := a.db.QueryContext(ctx, `SELECT id FROM notification_channels WHERE status='ACTIVE'`)
 	if err != nil {
@@ -204,6 +204,47 @@ func (a *App) notifyEvent(ctx context.Context, eventID, severity, title, detail 
 		_, _ = a.db.ExecContext(ctx, `INSERT INTO notification_deliveries(event_id,channel_id,status,error) VALUES($1,$2,$3,$4)`, eventID, id, deliveryStatus, errorMessage)
 		_, _ = a.db.ExecContext(ctx, `UPDATE notification_channels SET last_error=$2,updated_at=now() WHERE id=$1`, id, errorMessage)
 	}
+}
+
+func eventEmailSubject(severity, category, title, detail string, guidance eventEmailGuidance) string {
+	fallback := fmt.Sprintf("[%s][%s] %s", severity, guidance.Scene, title)
+	if category != "SOURCE_BALANCE" {
+		return fallback
+	}
+	source := strings.TrimSpace(strings.TrimRight(eventDetailField(detail, "数据源"), "。.!！"))
+	if source == "" {
+		return fallback
+	}
+	if severity == "恢复" {
+		return fmt.Sprintf("[恢复] %s余额已恢复", source)
+	}
+	balance := eventDetailField(detail, "当前余额")
+	if strings.Contains(title, "预计") {
+		subject := fmt.Sprintf("[%s] %s余额预计不足", severity, source)
+		if balance != "" {
+			subject += "，当前 " + balance
+		}
+		if remaining := eventDetailField(detail, "预计剩余"); remaining != "" {
+			subject += "，预计剩余 " + remaining
+		}
+		return subject
+	}
+	subject := fmt.Sprintf("[%s] %s余额不足", severity, source)
+	if balance != "" {
+		subject += "，当前 " + balance
+	}
+	return subject
+}
+
+func eventDetailField(detail, field string) string {
+	prefix := field + "："
+	for _, line := range strings.Split(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
 }
 
 func emailDeliveryKind(severity string) string {

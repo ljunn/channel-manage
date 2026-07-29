@@ -321,6 +321,29 @@ func TestEventEmailGuidanceIsActionable(t *testing.T) {
 	}
 }
 
+func TestBalanceEmailSubjectNamesSourceAndBalance(t *testing.T) {
+	guidance := eventEmailGuidanceFor("SOURCE_BALANCE", false)
+	tests := []struct {
+		severity string
+		title    string
+		detail   string
+		want     string
+	}{
+		{"P0", "账户可用余额已耗尽", "数据源：微信 。\n当前余额：-0.06 USD", "[P0] 微信余额不足，当前 -0.06 USD"},
+		{"P1", "账户可用余额预计 3.2 小时后耗尽", "数据源：vincent\n当前余额：12.00 USD\n预计剩余：3.2 小时", "[P1] vincent余额预计不足，当前 12.00 USD，预计剩余 3.2 小时"},
+		{"恢复", "账户可用余额已耗尽已恢复", "数据源：微信 。\n当前余额：-0.06 USD", "[恢复] 微信余额已恢复"},
+	}
+	for _, test := range tests {
+		if got := eventEmailSubject(test.severity, "SOURCE_BALANCE", test.title, test.detail, guidance); got != test.want {
+			t.Fatalf("eventEmailSubject() = %q, want %q", got, test.want)
+		}
+	}
+	otherGuidance := eventEmailGuidanceFor("SOURCE_SCAN", false)
+	if got := eventEmailSubject("P1", "SOURCE_SCAN", "同步失败", "数据源：微信", otherGuidance); got != "[P1][数据源扫描失败] 同步失败" {
+		t.Fatalf("non-balance subject changed: %q", got)
+	}
+}
+
 func TestSendEmailRetriesTemporaryProviderFailureWithStableIdempotencyKey(t *testing.T) {
 	requests := 0
 	keys := []string{}
