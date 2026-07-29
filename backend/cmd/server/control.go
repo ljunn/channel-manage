@@ -197,10 +197,18 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 		estimatedValidationSeconds := 0
 		if fastValidation {
 			remainingProbes := max(0, policy.Config.MinSamples-candidate.Samples)
+			recentSuccesses := candidate.RecentSuccesses
+			if isSlowFirstTokenQuarantine(candidate.State, candidate.StateReason) {
+				recentSuccesses = candidate.RecoverySuccesses
+			}
 			if !candidate.Schedulable || candidate.State != "HEALTHY" || !policySuccessQualified(candidate, policy.Config) {
-				remainingProbes = max(remainingProbes, max(0, recoverySuccessSamples-candidate.RecentSuccesses))
+				remainingProbes = max(remainingProbes, max(0, recoverySuccessSamples-recentSuccesses))
 			}
 			estimatedValidationSeconds = remainingProbes * fastInterval
+		}
+		displayedSuccesses := candidate.RecentSuccesses
+		if isSlowFirstTokenQuarantine(candidate.State, candidate.StateReason) {
+			displayedSuccesses = candidate.RecoverySuccesses
 		}
 		items = append(items, map[string]any{
 			"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName,
@@ -208,7 +216,7 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
 			"schedulable": candidate.Schedulable, "eligible": eligible, "priority": candidate.Priority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
-			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "recentSuccesses": candidate.RecentSuccesses,
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "recentSuccesses": displayedSuccesses,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
 			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate,
 			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,

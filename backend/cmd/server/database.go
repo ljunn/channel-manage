@@ -90,9 +90,10 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			source_key_id UUID NOT NULL REFERENCES source_keys(id) ON DELETE CASCADE, source_group_id UUID REFERENCES source_groups(id) ON DELETE SET NULL,
 			lifecycle_state TEXT NOT NULL DEFAULT 'DISCOVERED', state_reason TEXT NOT NULL DEFAULT '', score NUMERIC(8,3),
 			priority_tier TEXT NOT NULL DEFAULT 'STANDARD', consecutive_failures INT NOT NULL DEFAULT 0,
-			last_probe_at TIMESTAMPTZ, state_changed_at TIMESTAMPTZ NOT NULL DEFAULT now(), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			last_probe_at TIMESTAMPTZ, last_slow_sample_at TIMESTAMPTZ, state_changed_at TIMESTAMPTZ NOT NULL DEFAULT now(), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(source_key_id, source_group_id)
 		)`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_slow_sample_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS probe_runs (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
 			kind TEXT NOT NULL, success BOOLEAN NOT NULL, status_code INT, latency_ms INT, first_token_ms INT,

@@ -662,6 +662,76 @@ func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 	}
 }
 
+func TestRankManagedAccountsBySpeedPutsUnknownBusinessLatencyLast(t *testing.T) {
+	known := eligiblePolicyCandidate("known", .5, 900)
+	unknown := eligiblePolicyCandidate("unknown", .2, 100)
+	unknown.FirstTokenP95 = sql.NullFloat64{}
+	priorities := rankManagedAccounts([]managedPolicyCandidate{unknown, known}, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
+	if priorities["known"] != 1000 || priorities["unknown"] != 1100 {
+		t.Fatalf("unknown real-business latency was not ranked last: %#v", priorities)
+	}
+}
+
+func TestSlowFirstTokenQuarantineUsesSampledRecovery(t *testing.T) {
+	candidate := eligiblePolicyCandidate("slow", .2, maxFirstTokenMs+1)
+	candidate.State = "QUARANTINED"
+	candidate.StateReason = slowFirstTokenReason(maxFirstTokenMs + 1)
+	if !candidateCanRecoverWithProbe(candidate, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5}) {
+		t.Fatal("slow first-token quarantine did not enter sampled recovery")
+	}
+	if !strings.Contains(candidate.StateReason, "60.00 秒超过 60 秒上限") {
+		t.Fatalf("unexpected quarantine reason: %s", candidate.StateReason)
+	}
+}
+
+func TestSlowRecoveryIntervalBacksOff(t *testing.T) {
+	want := []int{60, 300, 1800, 7200, 21600, 86400, 86400}
+	for failures, expected := range want {
+		if got := slowRecoveryIntervalSeconds(failures, 0); got != expected {
+			t.Fatalf("failures=%d interval=%d, want %d", failures, got, expected)
+		}
+	}
+	if got := slowRecoveryIntervalSeconds(6, 1); got != 30 {
+		t.Fatalf("successful recovery sample interval=%d, want 30", got)
+	}
+}
+
+func TestSelectFirstTokenProbeModelSkipsNonTextModels(t *testing.T) {
+	models := []string{"text-embedding-3-small", "whisper-1", "gpt-4.1-mini"}
+	if got := selectFirstTokenProbeModel(models); got != "gpt-4.1-mini" {
+		t.Fatalf("selected model=%q", got)
+	}
+}
+
+func TestMeasureFirstTokenUsesStreamingGeneration(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer probe-key" {
+			t.Fatalf("unexpected authorization: %q", r.Header.Get("Authorization"))
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["model"] != "gpt-test" || payload["stream"] != true {
+			t.Fatalf("unexpected payload: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n"))
+	}))
+	defer server.Close()
+	app := &App{httpClient: server.Client()}
+	firstTokenMs, err := app.measureFirstToken(context.Background(), server.URL, "probe-key", "gpt-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstTokenMs < 0 || firstTokenMs > 1000 {
+		t.Fatalf("unexpected first token time: %dms", firstTokenMs)
+	}
+}
+
 func TestRankManagedAccountsExcludesIneligibleChannels(t *testing.T) {
 	healthy := eligiblePolicyCandidate("healthy", .2, 120)
 	unhealthy := eligiblePolicyCandidate("unhealthy", .1, 100)

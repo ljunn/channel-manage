@@ -20,6 +20,7 @@ const (
 	maxConcurrentProbes      = 6
 	managedPriorityStart     = 1000
 	managedPriorityStep      = 100
+	maxFirstTokenMs          = 60_000
 )
 
 func (a *App) runScheduler(ctx context.Context) {
@@ -142,10 +143,27 @@ func (a *App) probeDueChannels(ctx context.Context) {
 }
 
 func (a *App) fastProbeIntervals(ctx context.Context) map[string]int {
+	result := map[string]int{}
+	slowRows, slowErr := a.db.QueryContext(ctx, `SELECT c.id,c.consecutive_failures,
+		COALESCE((SELECT count(*) FROM (
+			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
+			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id AND p.kind='RECOVERY' ORDER BY p.started_at DESC LIMIT $1) recent
+		) streak WHERE success_streak),0)
+		FROM channels c WHERE c.lifecycle_state='QUARANTINED' AND c.state_reason LIKE '%真实业务首 Token%'`, recoverySuccessSamples)
+	if slowErr == nil {
+		for slowRows.Next() {
+			var channelID string
+			var failures, successes int
+			if slowRows.Scan(&channelID, &failures, &successes) == nil {
+				result[channelID] = slowRecoveryIntervalSeconds(failures, successes)
+			}
+		}
+		_ = slowRows.Close()
+	}
 	configs := map[string]policyConfig{}
 	rows, err := a.db.QueryContext(ctx, `SELECT p.scope_id,v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' AND p.scope_type='TARGET_GROUP'`)
 	if err != nil {
-		return nil
+		return result
 	}
 	for rows.Next() {
 		var scopeID, configData string
@@ -157,14 +175,16 @@ func (a *App) fastProbeIntervals(ctx context.Context) map[string]int {
 	}
 	_ = rows.Close()
 	if len(configs) == 0 {
-		return nil
+		return result
 	}
 	candidates, err := a.managedPolicyCandidates(ctx)
 	if err != nil {
-		return nil
+		return result
 	}
-	result := map[string]int{}
 	for _, candidate := range candidates {
+		if _, slowRecovery := result[candidate.ChannelID]; slowRecovery {
+			continue
+		}
 		config, configured := configs[candidate.TargetGroupID]
 		if !configured || !candidateCanRecoverWithProbe(candidate, config) {
 			continue
@@ -181,6 +201,9 @@ func (a *App) fastProbeIntervals(ctx context.Context) map[string]int {
 }
 
 func fastProbeIntervalFor(item managedPolicyCandidate) int {
+	if isSlowFirstTokenQuarantine(item.State, item.StateReason) {
+		return slowRecoveryIntervalSeconds(item.ConsecutiveFailures, item.RecoverySuccesses)
+	}
 	if item.RecentSuccesses > 0 || item.ConsecutiveFailures <= 3 {
 		return fastProbeIntervalSeconds
 	}
@@ -326,7 +349,7 @@ type managedPolicyCandidate struct {
 	Schedulable                                                      bool
 	Priority                                                         int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
-	Samples, RecentSuccesses, ConsecutiveFailures                    int
+	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures int
 }
 
 const policyMetricWindowDays = 7
@@ -335,10 +358,14 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-$1 * interval '1 day'),
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY b.first_token_p95_ms) FROM metric_buckets b WHERE b.channel_id=c.id AND b.first_token_p95_ms IS NOT NULL AND b.window_start>now()-interval '1 hour'),
 		(SELECT count(*) FROM (
 			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
 			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id ORDER BY p.started_at DESC LIMIT $2) recent
+		) streak WHERE success_streak),
+		(SELECT count(*) FROM (
+			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
+			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id AND p.kind='RECOVERY' ORDER BY p.started_at DESC LIMIT $2) recent
 		) streak WHERE success_streak)
 		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
 		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples)
@@ -349,7 +376,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	items := []managedPolicyCandidate{}
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95, &item.RecentSuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
