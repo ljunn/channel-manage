@@ -119,6 +119,14 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		writeData(w, value)
 		return nil
 	}
+	if method == http.MethodGet && path == "/scheduling/status" {
+		value, err := a.listSchedulingStatus(r.Context())
+		if err != nil {
+			return err
+		}
+		writeData(w, value)
+		return nil
+	}
 	if method == http.MethodGet && path == "/events" {
 		value, err := a.listEvents(r.Context())
 		if err != nil {

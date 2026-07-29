@@ -157,7 +157,7 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 			reasons := policyRejectionReasons(item, policy.Config)
 			desired := len(reasons) == 0
 			if desired != item.Schedulable {
-				reason := "渠道与目标分组倍率均符合策略，建议恢复调度"
+				reason := "渠道与目标分组倍率均符合策略，自动恢复参与调度"
 				if !desired {
 					reason = strings.Join(reasons, "；")
 				}
@@ -183,21 +183,22 @@ func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string
 }
 
 type managedPolicyCandidate struct {
-	ID, TargetGroupID, State, StateReason, SourceGroup, TargetGroup string
-	Schedulable                                                     bool
-	Priority                                                        int
-	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95  sql.NullFloat64
-	Samples                                                         int
+	ID, TargetGroupID, RemoteName, SourceName, TargetName          string
+	State, StateReason, SourceGroup, TargetGroup, SyncStatus       string
+	Schedulable                                                    bool
+	Priority                                                       int
+	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95 sql.NullFloat64
+	Samples                                                        int
 }
 
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,COALESCE(min(tg.id::text),''),m.schedulable,m.priority,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-$1 * interval '1 day')
-		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
+		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
 		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays)
 	if err != nil {
 		return nil, err
@@ -206,7 +207,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	items := []managedPolicyCandidate{}
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.TargetGroupID, &item.Schedulable, &item.Priority, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95); err != nil {
+		if err := rows.Scan(&item.ID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95); err != nil {
 			return nil, err
 		}
 		items = append(items, item)

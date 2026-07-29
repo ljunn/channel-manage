@@ -98,9 +98,15 @@ func (a *App) listAudit(ctx context.Context) ([]map[string]any, error) {
 func (a *App) listActions(ctx context.Context, latest bool) ([]map[string]any, error) {
 	where := ""
 	if latest {
-		where = " WHERE created_at>now()-interval '24 hours'"
+		where = " WHERE i.created_at>now()-interval '24 hours'"
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT id,managed_account_id,action_type,before_state,after_state,reason,status,approved_at,executed_at,error,created_at FROM action_intents`+where+` ORDER BY created_at DESC LIMIT 500`)
+	rows, err := a.db.QueryContext(ctx, `SELECT i.id,i.managed_account_id,i.action_type,i.before_state,i.after_state,i.reason,i.status,i.approved_at,i.executed_at,i.error,i.created_at,
+		COALESCE(m.remote_name,''),COALESCE(s.name,''),COALESCE(sg.name,''),COALESCE(t.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),'')
+		FROM action_intents i
+		LEFT JOIN managed_accounts m ON m.id=i.managed_account_id
+		LEFT JOIN channels c ON c.id=m.channel_id LEFT JOIN sources s ON s.id=c.source_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id
+		LEFT JOIN targets t ON t.id=m.target_id LEFT JOIN managed_account_groups mag ON mag.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mag.target_group_id`+where+`
+		GROUP BY i.id,m.id,s.name,sg.name,t.name ORDER BY i.created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}
@@ -110,14 +116,71 @@ func (a *App) listActions(ctx context.Context, latest bool) ([]map[string]any, e
 		var id string
 		var managedID sql.NullString
 		var action, before, after, reason, status, errorMessage string
+		var remoteName, sourceName, sourceGroup, targetName, targetGroup string
 		var approved, executed sql.NullTime
 		var created time.Time
-		if err := rows.Scan(&id, &managedID, &action, &before, &after, &reason, &status, &approved, &executed, &errorMessage, &created); err != nil {
+		if err := rows.Scan(&id, &managedID, &action, &before, &after, &reason, &status, &approved, &executed, &errorMessage, &created, &remoteName, &sourceName, &sourceGroup, &targetName, &targetGroup); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "managedAccountId": nullableString(managedID), "actionType": action, "beforeState": json.RawMessage(before), "afterState": json.RawMessage(after), "reason": reason, "status": status, "approvedAt": nullableTime(approved), "executedAt": nullableTime(executed), "error": errorMessage, "createdAt": created})
+		items = append(items, map[string]any{"id": id, "managedAccountId": nullableString(managedID), "remoteName": remoteName, "sourceName": sourceName, "sourceGroup": sourceGroup, "targetName": targetName, "targetGroup": targetGroup, "actionType": action, "beforeState": json.RawMessage(before), "afterState": json.RawMessage(after), "reason": reason, "status": status, "approvedAt": nullableTime(approved), "executedAt": nullableTime(executed), "error": errorMessage, "createdAt": created})
 	}
 	return items, rows.Err()
+}
+
+func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error) {
+	if err := a.ensureManagedTargetMultiplierCaches(ctx); err != nil {
+		return nil, err
+	}
+	candidates, err := a.managedPolicyCandidates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	type activePolicy struct {
+		ID, Name string
+		Config   policyConfig
+	}
+	policies := map[string]activePolicy{}
+	probeInterval := a.settingInt(ctx, "probe_interval_seconds", 900)
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_id,v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' AND p.scope_type='TARGET_GROUP'`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id, name, scopeID, configData string
+		if err := rows.Scan(&id, &name, &scopeID, &configData); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		policies[scopeID] = activePolicy{ID: id, Name: name, Config: normalizePolicyConfig(config)}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	items := make([]map[string]any, 0, len(candidates))
+	for _, candidate := range candidates {
+		policy, configured := policies[candidate.TargetGroupID]
+		reasons := []string{"目标分组未配置启用策略"}
+		eligible := false
+		if configured {
+			reasons = policyRejectionReasons(candidate, policy.Config)
+			eligible = len(reasons) == 0
+		}
+		items = append(items, map[string]any{
+			"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName,
+			"sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup,
+			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
+			"schedulable": candidate.Schedulable, "eligible": eligible, "priority": candidate.Priority, "syncStatus": candidate.SyncStatus,
+			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95),
+			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
+			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate,
+			"probeIntervalSeconds": probeInterval, "estimatedValidationSeconds": max(0, policy.Config.MinSamples-candidate.Samples) * probeInterval,
+			"reasons": reasons,
+		})
+	}
+	return items, nil
 }
 
 func nullableString(value sql.NullString) any {
@@ -439,7 +502,7 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	preview := []map[string]any{}
 	for _, candidate := range candidatesForTargetGroup(candidates, scopeID) {
 		reasons := policyRejectionReasons(candidate, config)
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

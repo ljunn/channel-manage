@@ -184,6 +184,20 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .source-controls select:focus { border-color: var(--teal-500); box-shadow: 0 0 0 3px rgba(53,181,170,.12); }
 .source-result-count { margin: 0 2px 8px auto; color: var(--ink-400); font-size: 11px; white-space: nowrap; }
 .binding-progress strong { font-variant-numeric: tabular-nums; }
+.scheduling-tabs { min-height: 48px; display: flex; gap: 22px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+.scheduling-tabs button { position: relative; padding: 0 4px; border: 0; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600; }
+.scheduling-tabs button.active { color: var(--teal-700); }
+.scheduling-tabs button.active::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; content: ''; background: var(--teal-600); }
+.scheduling-controls label:first-child { min-width: 260px; }
+.schedule-reason { min-width: 240px; max-width: 420px; white-space: normal; }
+.warning-text { color: var(--amber); }
+.simulation-summary { display: grid; grid-template-columns: repeat(3,1fr); margin-bottom: 14px; border: 1px solid var(--line); border-radius: 7px; }
+.simulation-summary span { min-height: 72px; display: grid; align-content: center; gap: 2px; padding: 12px 16px; border-right: 1px solid var(--line-soft); }
+.simulation-summary span:last-child { border-right: 0; }
+.simulation-summary strong { font: 700 22px var(--mono); }
+.simulation-summary small { font-size: 11px; }
+.simulation-table { max-height: 62dvh; }
+.simulation-table table { min-width: 980px; }
 
 .table-wrap { overflow: auto; overscroll-behavior-inline: contain; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); box-shadow: var(--shadow-card); }
 .table-wrap.inner { border-radius: 7px; box-shadow: none; }
@@ -467,6 +481,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .source-controls label { min-width: calc(50% - 6px); flex: 1; }
   .source-controls select { height: 42px; }
   .source-result-count { width: 100%; margin: 0; }
+  .scheduling-controls label:first-child { min-width: 100%; }
+  .simulation-summary { grid-template-columns: 1fr 1fr 1fr; }
+  .simulation-summary span { padding: 10px; }
   .market-ticker { grid-template-columns: 1fr 1fr; }
   .market-ticker article:nth-child(2) { border-right: 0; }
   .market-ticker article:nth-child(-n+2) { border-bottom: 1px solid var(--line-soft); }

@@ -33,22 +33,19 @@ const endpointLabels={
     ctx.textBaseline='middle'
     labels.forEach(item=>{
       const fullLabel=item.dataset.label||''
-      const rightSpace=chartArea.right-item.last.x-10
-      const leftSpace=item.last.x-chartArea.left-10
-      const placeRight=rightSpace>=ctx.measureText(fullLabel).width||rightSpace>=leftSpace
-      const maxWidth=Math.max(38,(placeRight?rightSpace:leftSpace)-4)
+      const labelX=chartArea.right+16
+      const maxWidth=chart.width-labelX-8
       let label=fullLabel
       while(label.length>2&&ctx.measureText(`${label}…`).width>maxWidth)label=label.slice(0,-1)
       if(label!==fullLabel)label+='…'
-      const labelX=placeRight?item.last.x+8:item.last.x-8
       ctx.strokeStyle=item.color
       ctx.lineWidth=1
       ctx.beginPath()
       ctx.moveTo(item.last.x,item.last.y)
-      ctx.lineTo(placeRight?labelX-3:labelX+3,item.labelY)
+      ctx.lineTo(chartArea.right+7,item.labelY)
       ctx.stroke()
       ctx.fillStyle=item.color
-      ctx.textAlign=placeRight?'left':'right'
+      ctx.textAlign='left'
       ctx.fillText(label,labelX,item.labelY)
     })
     ctx.restore()
@@ -59,7 +56,8 @@ function render(){
   if(!canvas.value)return
   chart?.destroy()
   const datasets=activeGroups.value.map((group,index)=>({label:group.targetName?`${group.targetName} / ${group.name}`:group.name,data:props.points.filter(point=>point.targetGroupId===group.id&&point[props.metric]!=null).map(point=>({x:new Date(point.capturedAt).getTime(),y:Number(point[props.metric])})),borderColor:palette[index%palette.length],backgroundColor:palette[index%palette.length],borderWidth:2,pointRadius:2.5,pointHoverRadius:5,tension:.24,spanGaps:true}))
-  chart=new Chart(canvas.value,{type:'line',data:{datasets},plugins:[endpointLabels],options:{responsive:true,maintainAspectRatio:false,layout:{padding:{right:12}},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:activeGroups.value.length>1,position:'bottom',labels:{boxWidth:10,boxHeight:10,usePointStyle:true,padding:18,font:{size:11}}},tooltip:{callbacks:{label:context=>`${context.dataset.label} · ${metricLabels[props.metric]} ×${context.parsed.y.toFixed(4)}`}}},scales:{x:{type:'linear',grid:{display:false},ticks:{maxTicksLimit:7,callback:value=>new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit'}).format(new Date(value))},title:{display:true,text:'时间'}},y:{beginAtZero:false,grid:{color:'#edf1f3'},ticks:{callback:value=>`×${Number(value).toFixed(2)}`},title:{display:true,text:'倍率'}}}}})
+  const compact=window.matchMedia('(max-width: 760px)').matches
+  chart=new Chart(canvas.value,{type:'line',data:{datasets},plugins:[endpointLabels],options:{responsive:true,maintainAspectRatio:false,layout:{padding:{right:compact?100:235}},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:context=>`${context.dataset.label} · ${metricLabels[props.metric]} ×${context.parsed.y.toFixed(4)}`}}},scales:{x:{type:'linear',grid:{display:false},ticks:{maxTicksLimit:compact?4:7,callback:value=>new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit'}).format(new Date(value))},title:{display:true,text:'时间'}},y:{beginAtZero:false,grid:{color:'#edf1f3'},ticks:{callback:value=>`×${Number(value).toFixed(2)}`},title:{display:true,text:'倍率'}}}}})
 }
 onMounted(render)
 watch(()=>[props.points,props.metric,props.selectedGroup,props.groups],render,{deep:true})
