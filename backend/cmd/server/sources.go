@@ -524,7 +524,7 @@ func (a *App) addSourceKey(w http.ResponseWriter, r *http.Request, sourceID stri
 		return &apiError{400, "INVALID_UPSTREAM_KEY", "请填写 Key 名称和内容"}
 	}
 	if input.Concurrency < 1 {
-		input.Concurrency = 1
+		input.Concurrency = 1000
 	}
 	encrypted, err := a.encryptSecret([]byte(input.APIKey))
 	if err != nil {

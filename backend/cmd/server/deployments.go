@@ -66,7 +66,7 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		input.Priority = 1000
 	}
 	if input.Concurrency < 1 {
-		input.Concurrency = 1
+		input.Concurrency = 1000
 	}
 	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
 	if frozen {

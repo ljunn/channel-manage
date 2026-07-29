@@ -36,7 +36,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS source_keys (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 			name TEXT NOT NULL, key_cipher BYTEA NOT NULL, key_hint TEXT NOT NULL, production_authorized BOOLEAN NOT NULL DEFAULT false,
-			status TEXT NOT NULL DEFAULT 'ACTIVE', models JSONB NOT NULL DEFAULT '[]'::jsonb, concurrency INT NOT NULL DEFAULT 1,
+			status TEXT NOT NULL DEFAULT 'ACTIVE', models JSONB NOT NULL DEFAULT '[]'::jsonb, concurrency INT NOT NULL DEFAULT 1000,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE TABLE IF NOT EXISTS source_groups (
@@ -48,6 +48,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE source_groups ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE source_keys ADD COLUMN IF NOT EXISTS remote_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE source_keys ADD COLUMN IF NOT EXISTS auto_generated BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE source_keys ALTER COLUMN concurrency SET DEFAULT 1000`,
+		`UPDATE source_keys SET concurrency=1000 WHERE auto_generated=true AND concurrency=1`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_keys_remote_id ON source_keys(source_id,remote_id) WHERE remote_id<>''`,
 		`CREATE TABLE IF NOT EXISTS group_samples (
 			id BIGSERIAL PRIMARY KEY, source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -96,11 +98,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS managed_accounts (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE RESTRICT,
 			channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE RESTRICT, remote_id TEXT NOT NULL DEFAULT '', remote_name TEXT NOT NULL,
-			priority INT NOT NULL DEFAULT 1000, concurrency INT NOT NULL DEFAULT 1, schedulable BOOLEAN NOT NULL DEFAULT false,
+			priority INT NOT NULL DEFAULT 1000, concurrency INT NOT NULL DEFAULT 1000, schedulable BOOLEAN NOT NULL DEFAULT false,
 			ownership_marker TEXT NOT NULL, sync_status TEXT NOT NULL DEFAULT 'PENDING', last_error TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, channel_id)
 		)`,
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
+		`ALTER TABLE managed_accounts ALTER COLUMN concurrency SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts DROP CONSTRAINT IF EXISTS managed_accounts_target_id_channel_id_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_accounts_target_remote ON managed_accounts(target_id,remote_id) WHERE remote_id<>''`,
 		`DELETE FROM channels c USING source_keys k,source_groups g WHERE c.source_key_id=k.id AND c.source_group_id=g.id AND k.auto_generated=true AND (SELECT count(*) FROM channels siblings WHERE siblings.source_key_id=k.id)>1 AND strpos(k.name,g.name)=0 AND NOT EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id)`,

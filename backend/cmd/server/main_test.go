@@ -107,7 +107,7 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		{ID: "local-1", Name: "低倍率", RemoteID: 11},
 		{ID: "local-2", Name: "高质量", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +124,9 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		}
 		if int(request["priority"].(float64)) != 1000 {
 			t.Fatalf("account %d priority=%v, want 1000", index, request["priority"])
+		}
+		if int(request["concurrency"].(float64)) != 1000 {
+			t.Fatalf("account %d concurrency=%v, want 1000", index, request["concurrency"])
 		}
 	}
 }
@@ -147,6 +150,29 @@ func TestSyncTargetAccountPriority(t *testing.T) {
 
 	app := &App{httpClient: server.Client()}
 	if err := app.syncTargetAccountPriority(context.Background(), server.URL, "42", remoteSession{}, 1007); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncTargetAccountConcurrency(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/admin/accounts/42" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]int
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["concurrency"] != 1000 {
+			t.Fatalf("concurrency=%d, want 1000", payload["concurrency"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	if err := app.syncTargetAccountNumbers(context.Background(), server.URL, "42", remoteSession{}, map[string]int{"concurrency": 1000}); err != nil {
 		t.Fatal(err)
 	}
 }

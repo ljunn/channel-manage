@@ -220,6 +220,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 	if len(parts) == 3 && parts[0] == "managed-accounts" && parts[2] == "priority" && method == http.MethodPatch {
 		return a.updateManagedAccountPriority(w, r, parts[1])
 	}
+	if len(parts) == 3 && parts[0] == "managed-accounts" && parts[2] == "concurrency" && method == http.MethodPatch {
+		return a.updateManagedAccountConcurrency(w, r, parts[1])
+	}
 	if len(parts) == 3 && parts[0] == "policies" && parts[2] == "versions" && method == http.MethodPost {
 		return a.createPolicyVersion(w, r, parts[1])
 	}

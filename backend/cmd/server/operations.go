@@ -175,9 +175,8 @@ func (a *App) updateManagedAccountPriority(w http.ResponseWriter, r *http.Reques
 		return &apiError{400, "INVALID_PRIORITY", "优先级必须在 1 到 1000000 之间"}
 	}
 	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
-	shadow, _ := a.settingBool(r.Context(), "shadow_mode")
-	if frozen || shadow {
-		return &apiError{409, "REMOTE_WRITE_BLOCKED", "安全冻结或影子模式禁止同步优先级"}
+	if frozen {
+		return &apiError{409, "REMOTE_WRITE_BLOCKED", "紧急冻结禁止同步优先级"}
 	}
 	var targetID, targetBase, remoteID, marker string
 	var writeEnabled bool
@@ -213,7 +212,58 @@ func (a *App) updateManagedAccountPriority(w http.ResponseWriter, r *http.Reques
 }
 
 func (a *App) syncTargetAccountPriority(ctx context.Context, targetBase, remoteID string, session remoteSession, priority int) error {
-	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPut, "/api/v1/admin/accounts/"+remoteID, session, map[string]int{"priority": priority})
+	return a.syncTargetAccountNumbers(ctx, targetBase, remoteID, session, map[string]int{"priority": priority})
+}
+
+func (a *App) updateManagedAccountConcurrency(w http.ResponseWriter, r *http.Request, id string) error {
+	var input struct {
+		Concurrency int `json:"concurrency"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	if input.Concurrency < 1 || input.Concurrency > 1000000 {
+		return &apiError{400, "INVALID_CONCURRENCY", "并发必须在 1 到 1000000 之间"}
+	}
+	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
+	if frozen {
+		return &apiError{409, "REMOTE_WRITE_BLOCKED", "紧急冻结禁止同步并发"}
+	}
+	var targetID, targetBase, remoteID, marker string
+	var writeEnabled bool
+	err := a.db.QueryRowContext(r.Context(), `SELECT t.id,t.base_url,t.write_enabled,m.remote_id,m.ownership_marker FROM managed_accounts m JOIN targets t ON t.id=m.target_id WHERE m.id=$1`, id).Scan(&targetID, &targetBase, &writeEnabled, &remoteID, &marker)
+	if err == sql.ErrNoRows {
+		return &apiError{404, "MANAGED_ACCOUNT_NOT_FOUND", "托管账号不存在"}
+	}
+	if err != nil {
+		return err
+	}
+	if !writeEnabled || !strings.HasPrefix(marker, "channel-manage:") {
+		return &apiError{409, "TARGET_WRITE_DISABLED", "目标写入未授权或托管所有权无效"}
+	}
+	requestCtx, cancel := timeoutContext(r.Context())
+	defer cancel()
+	target, _, err := a.targetCredentials(requestCtx, targetID)
+	if err != nil {
+		return err
+	}
+	session, err := a.authenticateTarget(requestCtx, target, true)
+	if err != nil {
+		return err
+	}
+	if err = a.syncTargetAccountNumbers(requestCtx, targetBase, remoteID, session, map[string]int{"concurrency": input.Concurrency}); err != nil {
+		return err
+	}
+	if _, err = a.db.ExecContext(r.Context(), `UPDATE managed_accounts SET concurrency=$2,updated_at=now() WHERE id=$1`, id, input.Concurrency); err != nil {
+		return err
+	}
+	a.audit(r.Context(), "SET_CONCURRENCY", "managed_account", id, map[string]any{"concurrency": input.Concurrency, "remote_id": remoteID})
+	writeData(w, map[string]any{"id": id, "concurrency": input.Concurrency, "syncStatus": "SYNCED"})
+	return nil
+}
+
+func (a *App) syncTargetAccountNumbers(ctx context.Context, targetBase, remoteID string, session remoteSession, payload map[string]int) error {
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPut, "/api/v1/admin/accounts/"+remoteID, session, payload)
 	if err != nil {
 		return err
 	}
@@ -240,7 +290,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		input.Priority = 1000
 	}
 	if input.Concurrency < 1 {
-		input.Concurrency = 1
+		input.Concurrency = 1000
 	}
 	if input.Name == "" {
 		input.Name = "渠道"
