@@ -244,13 +244,14 @@ func (a *App) targetSyncFailed(ctx context.Context, target Target, cause error) 
 }
 
 func (a *App) fetchPaged(ctx context.Context, baseURL, path string, session remoteSession) ([]map[string]any, error) {
+	const pageSize = 100
 	result := []map[string]any{}
 	for page := 1; page <= 100; page++ {
 		separator := "?"
 		if strings.Contains(path, "?") {
 			separator = "&"
 		}
-		raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, path+separator+"page="+strconv.Itoa(page)+"&page_size=1000", session, nil)
+		raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, path+separator+"page="+strconv.Itoa(page)+"&page_size="+strconv.Itoa(pageSize), session, nil)
 		if err != nil {
 			return nil, err
 		}

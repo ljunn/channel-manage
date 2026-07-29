@@ -23,6 +23,8 @@ type remoteSession struct {
 	SessionID     string
 }
 
+const maxRemoteResponseBytes = 8 << 20
+
 func newRemoteHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
@@ -131,9 +133,16 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 		return nil, nil, &apiError{Status: 502, Code: "REMOTE_UNAVAILABLE", Message: "无法连接远端平台"}
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxRemoteResponseBytes+1))
 	if err != nil {
 		return nil, response.Header, err
+	}
+	if len(data) > maxRemoteResponseBytes {
+		return nil, response.Header, &apiError{
+			Status:  http.StatusBadGateway,
+			Code:    "REMOTE_RESPONSE_TOO_LARGE",
+			Message: fmt.Sprintf("远端接口 %s 单次响应超过 8 MiB，请减小分页大小", path),
+		}
 	}
 	var value any
 	var decodeErr error

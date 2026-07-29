@@ -213,6 +213,46 @@ func TestRemoteJSONMarksSub2APIAdminRequests(t *testing.T) {
 	}
 }
 
+func TestRemoteJSONReportsOversizedResponse(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":"`))
+		_, _ = w.Write([]byte(strings.Repeat("x", maxRemoteResponseBytes)))
+		_, _ = w.Write([]byte(`"}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, _, err := app.remoteJSON(context.Background(), server.URL, http.MethodGet, "/large", remoteSession{}, nil)
+	apiErr, ok := err.(*apiError)
+	if !ok || apiErr.Code != "REMOTE_RESPONSE_TOO_LARGE" {
+		t.Fatalf("expected oversized response error, got %v", err)
+	}
+}
+
+func TestFetchPagedUsesBoundedPageSize(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("page_size") != "100" {
+			t.Fatalf("unexpected page size: %s", r.URL.Query().Get("page_size"))
+		}
+		page := r.URL.Query().Get("page")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"id":` + page + `}],"pages":2}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	items, err := app.fetchPaged(context.Background(), server.URL, "/api/v1/admin/accounts?lite=true", remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(items) != 2 {
+		t.Fatalf("requests=%d items=%d", requests, len(items))
+	}
+}
+
 func TestLoginRemoteRetriesRateLimitAndReturnsTokenPair(t *testing.T) {
 	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
 	requests := 0
