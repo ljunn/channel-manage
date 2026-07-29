@@ -6,6 +6,7 @@ import {
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
 import ModalShell from './components/ModalShell.vue'
+import PaginationBar from './components/PaginationBar.vue'
 import StateBlock from './components/StateBlock.vue'
 
 const tokenKey = 'channel_manage_token'
@@ -18,6 +19,8 @@ const notice = ref('')
 const error = ref('')
 const modal = ref('')
 const search = ref('')
+const page = ref(1)
+const pageSize = ref(15)
 const appVersion = ref('')
 const data = reactive({ summary: {}, sources: [], targets: [], channels: [], managed: [], market: [], history: [], policies: [], actions: [], events: [], audit: [], settings: {}, notifications: [] })
 const sourceDetail = ref(null)
@@ -42,9 +45,14 @@ const selectedTargetGroups = computed(() => targetGroups.value.filter(group => f
 const mappingPairs = computed(() => selectedSourceGroups.value.flatMap(sourceGroup => selectedTargetGroups.value.map(targetGroup => ({ id:`${sourceGroup.id}:${targetGroup.id}`, sourceGroup, targetGroup }))))
 const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
+const paged = items => filtered(items).slice((page.value-1)*pageSize.value,page.value*pageSize.value)
+const filteredCount = items => filtered(items).length
+const ranking = index => (page.value-1)*pageSize.value+index+1
 
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/overview'; mobileOpen.value = false })
-watch(route, () => { search.value=''; clearMessages(); if(token.value) void loadPage() })
+watch(route, () => { search.value=''; page.value=1; clearMessages(); if(token.value) void loadPage() })
+watch(search, () => { page.value=1 })
+watch(pageSize, () => { page.value=1 })
 onMounted(async () => { void loadVersion(); if (token.value) { try { operator.value=await api('/auth/me'); await loadPage() } catch {} } else route.value='/login' })
 
 async function loadVersion(){
@@ -63,7 +71,7 @@ async function api(path, init={}) {
   try { response = await fetch(`/api${path}`, { ...requestInit, headers, signal: AbortSignal.timeout(timeout) }) }
   catch (reason) { throw new Error(reason?.name === 'TimeoutError' ? '请求超时' : '无法连接服务') }
   const payload = await response.json().catch(() => ({}))
-  if (!response.ok) { if(response.status===401 && path!='/auth/login') logout(false); throw new Error(payload.error?.message || `请求失败 (${response.status})`) }
+  if (!response.ok) { if(response.status===401 && path!='/auth/login') logout(false); const fallback=response.status===502&&path.endsWith('/deploy')?'绑定请求被网关中断，系统已回滚未完成的数据，请重试':`请求失败 (${response.status})`; throw new Error(payload.error?.message || fallback) }
   return payload.data
 }
 function body(value){ return JSON.stringify(value) }
@@ -79,7 +87,7 @@ async function login(event){
 }
 
 async function loadPage(){
-  loading.value=true;clearMessages()
+  loading.value=true;page.value=1;clearMessages()
   try{
     const path=route.value
     if(path==='/overview') data.summary=await api('/dashboard/summary')
@@ -205,47 +213,56 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <template v-else-if="route==='/sources'">
           <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></div>
           <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></StateBlock>
-          <div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额</th><th>分组</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in filtered(data.sources)" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td>{{ row.groupCount }}</td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div>
+          <div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>余额 / 倍率换算</th><th>连接</th><th>余额</th><th>分组</th><th>上次扫描</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in paged(data.sources)" :key="row.id"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}</td><td class="ratio">{{ valueRatio(row.valueDivisor) }}</td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td>{{ money(row.balance) }}</td><td>{{ row.groupCount }}</td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div>
+          <PaginationBar v-if="!loading" v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.sources)"/>
         </template>
 
         <template v-else-if="route==='/market'">
           <div class="page-head"><div><h1>市场大盘</h1><span>{{ data.market.length }} 个有效报价</span></div></div>
           <section class="market-ticker"><article><span>最低倍率</span><strong>{{ ratio(minimumRatio(data.market)) }}</strong></article><article><span>平均倍率</span><strong>{{ ratio(data.market.length?data.market.reduce((s,x)=>s+Number(x.multiplier||0),0)/data.market.length:null) }}</strong></article><article><span>数据源</span><strong>{{ new Set(data.market.map(x=>x.sourceName)).size }}</strong></article><article><span>30 日样本</span><strong>{{ data.history.length }}</strong></article></section>
-          <div class="table-wrap"><table><thead><tr><th>排名</th><th>数据源</th><th>分组</th><th>口径</th><th>当前倍率</th><th>采集时间</th></tr></thead><tbody><tr v-for="(row,index) in filtered(data.market)" :key="row.id"><td class="rank">{{ String(index+1).padStart(2,'0') }}</td><td>{{ row.sourceName }}</td><td><strong>{{ row.name }}</strong></td><td>{{ row.groupType }}</td><td class="ratio">{{ ratio(row.multiplier) }}</td><td>{{ date(row.capturedAt) }}</td></tr></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>排名</th><th>数据源</th><th>分组</th><th>口径</th><th>当前倍率</th><th>采集时间</th></tr></thead><tbody><tr v-for="(row,index) in paged(data.market)" :key="row.id"><td class="rank">{{ String(ranking(index)).padStart(2,'0') }}</td><td>{{ row.sourceName }}</td><td><strong>{{ row.name }}</strong></td><td>{{ row.groupType }}</td><td class="ratio">{{ ratio(row.multiplier) }}</td><td>{{ date(row.capturedAt) }}</td></tr></tbody></table></div>
+          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.market)"/>
         </template>
 
         <template v-else-if="route==='/targets'">
           <div class="page-head"><div><h1>目标节点</h1><span>{{ data.targets.length }} 个 Sub2API 节点</span></div><button class="btn primary" @click="open('target')"><Plus :size="16"/>接入节点</button></div>
-          <StateBlock v-if="!loading&&!data.targets.length" title="暂无目标节点"/><div v-else class="tile-list"><article v-for="row in filtered(data.targets)" :key="row.id" class="target-tile"><header><span class="target-icon"><Network :size="20"/></span><div><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></div><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><div v-if="row.lastError" class="target-error"><AlertTriangle :size="16"/><span><strong>同步失败</strong><small>{{ row.lastError }}</small></span></div><div class="tile-metrics"><span><b>{{ row.groupCount }}</b>分组</span><span><b>{{ row.managedCount }}</b>托管账号</span><span><b>{{ row.version||'--' }}</b>版本</span></div><footer><span><ShieldCheck :size="15"/>{{ row.writeEnabled?'允许托管写入':'只读' }}</span><div class="row-actions"><button class="icon-btn" title="编辑节点" @click="editTarget(row)"><Pencil :size="15"/></button><button class="btn small" @click="syncTarget(row)"><RefreshCw :size="14"/>同步</button><button class="icon-btn danger" title="删除" @click="remove(`/targets/${row.id}`,row.name)"><Trash2 :size="15"/></button></div></footer></article></div>
+          <StateBlock v-if="!loading&&!data.targets.length" title="暂无目标节点"/><div v-else class="tile-list"><article v-for="row in paged(data.targets)" :key="row.id" class="target-tile"><header><span class="target-icon"><Network :size="20"/></span><div><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></div><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><div v-if="row.lastError" class="target-error"><AlertTriangle :size="16"/><span><strong>同步失败</strong><small>{{ row.lastError }}</small></span></div><div class="tile-metrics"><span><b>{{ row.groupCount }}</b>分组</span><span><b>{{ row.managedCount }}</b>托管账号</span><span><b>{{ row.version||'--' }}</b>版本</span></div><footer><span><ShieldCheck :size="15"/>{{ row.writeEnabled?'允许托管写入':'只读' }}</span><div class="row-actions"><button class="icon-btn" title="编辑节点" @click="editTarget(row)"><Pencil :size="15"/></button><button class="btn small" @click="syncTarget(row)"><RefreshCw :size="14"/>同步</button><button class="icon-btn danger" title="删除" @click="remove(`/targets/${row.id}`,row.name)"><Trash2 :size="15"/></button></div></footer></article></div>
+          <PaginationBar v-if="!loading" v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.targets)"/>
         </template>
 
         <template v-else-if="route==='/channels'">
           <div class="page-head"><div><h1>渠道雷达</h1><span>价格与探测质量</span></div></div>
-          <div class="table-wrap"><table class="has-actions"><thead><tr><th>数据源 / Key</th><th>分组</th><th>倍率</th><th>主动探测</th><th>真实业务</th><th>首次响应 P95</th><th>状态</th><th>原因</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in filtered(data.channels)" :key="row.id"><td><strong>{{ row.sourceName }}</strong><small>{{ row.keyName }}</small></td><td>{{ row.groupName }}</td><td class="ratio">{{ ratio(row.multiplier) }}</td><td>{{ row.successRate==null?'--':`${Number(row.successRate).toFixed(1)}%` }}<small>{{ row.probeSamples1h }} 个样本</small></td><td>{{ row.businessSuccessRate1h==null?'--':`${Number(row.businessSuccessRate1h).toFixed(1)}%` }}<small>{{ row.businessRequests1h }} 个请求</small></td><td>{{ row.firstTokenP95Ms==null?'--':`${(row.firstTokenP95Ms/1000).toFixed(2)} 秒` }}</td><td><span :class="['badge',statusTone(row.lifecycleState)]">{{ statusText(row.lifecycleState) }}</span></td><td>{{ row.stateReason||'--' }}</td><td><div class="row-actions"><button class="icon-btn" title="探测" @click="channelAct(row,'probe')"><Play :size="16"/></button><button class="icon-btn" :title="row.lifecycleState==='MANUAL_HOLD'?'恢复':'暂停'" @click="channelAct(row,row.lifecycleState==='MANUAL_HOLD'?'resume-validation':'manual-hold')"><component :is="row.lifecycleState==='MANUAL_HOLD'?RefreshCw:Pause" :size="16"/></button></div></td></tr></tbody></table></div>
+          <div class="table-wrap"><table class="has-actions"><thead><tr><th>数据源 / Key</th><th>分组</th><th>倍率</th><th>主动探测</th><th>真实业务</th><th>首次响应 P95</th><th>状态</th><th>原因</th><th><span class="sr-only">操作</span></th></tr></thead><tbody><tr v-for="row in paged(data.channels)" :key="row.id"><td><strong>{{ row.sourceName }}</strong><small>{{ row.keyName }}</small></td><td>{{ row.groupName }}</td><td class="ratio">{{ ratio(row.multiplier) }}</td><td>{{ row.successRate==null?'--':`${Number(row.successRate).toFixed(1)}%` }}<small>{{ row.probeSamples1h }} 个样本</small></td><td>{{ row.businessSuccessRate1h==null?'--':`${Number(row.businessSuccessRate1h).toFixed(1)}%` }}<small>{{ row.businessRequests1h }} 个请求</small></td><td>{{ row.firstTokenP95Ms==null?'--':`${(row.firstTokenP95Ms/1000).toFixed(2)} 秒` }}</td><td><span :class="['badge',statusTone(row.lifecycleState)]">{{ statusText(row.lifecycleState) }}</span></td><td>{{ row.stateReason||'--' }}</td><td><div class="row-actions"><button class="icon-btn" title="探测" @click="channelAct(row,'probe')"><Play :size="16"/></button><button class="icon-btn" :title="row.lifecycleState==='MANUAL_HOLD'?'恢复':'暂停'" @click="channelAct(row,row.lifecycleState==='MANUAL_HOLD'?'resume-validation':'manual-hold')"><component :is="row.lifecycleState==='MANUAL_HOLD'?RefreshCw:Pause" :size="16"/></button></div></td></tr></tbody></table></div>
+          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.channels)"/>
         </template>
 
         <template v-else-if="route==='/managed'">
           <div class="page-head"><div><h1>托管账号</h1><span>{{ data.managed.length }} 个目标账号</span></div></div>
-          <StateBlock v-if="!loading&&!data.managed.length" title="暂无托管账号"/><div v-else class="table-wrap"><table><thead><tr><th>账号</th><th>目标节点</th><th>来源</th><th>分组</th><th>优先级</th><th>并发</th><th>调度</th><th>同步</th></tr></thead><tbody><tr v-for="row in filtered(data.managed)" :key="row.id"><td><strong>{{ row.remoteName }}</strong><small>ID {{ row.remoteId }}</small></td><td>{{ row.targetName }}</td><td>{{ row.sourceName }}<small>{{ row.keyName }}</small></td><td><span v-for="group in row.targetGroups" :key="group.id" class="tag">{{ group.name }}</span></td><td><button class="link inline-edit" title="修改并同步优先级" @click="editManagedPriority(row)">{{ row.priority }} <Pencil :size="13"/></button></td><td><button class="link inline-edit" title="修改并同步并发" @click="editManagedConcurrency(row)">{{ row.concurrency }} <Pencil :size="13"/></button></td><td><span :class="['badge',row.schedulable?'success':'neutral']">{{ row.schedulable?'运行':'停止' }}</span></td><td><span :class="['badge',statusTone(row.syncStatus)]">{{ statusText(row.syncStatus) }}</span></td></tr></tbody></table></div>
+          <StateBlock v-if="!loading&&!data.managed.length" title="暂无托管账号"/><div v-else class="table-wrap"><table><thead><tr><th>账号</th><th>目标节点</th><th>来源</th><th>分组</th><th>优先级</th><th>并发</th><th>调度</th><th>同步</th></tr></thead><tbody><tr v-for="row in paged(data.managed)" :key="row.id"><td><strong>{{ row.remoteName }}</strong><small>ID {{ row.remoteId }}</small></td><td>{{ row.targetName }}</td><td>{{ row.sourceName }}<small>{{ row.keyName }}</small></td><td><span v-for="group in row.targetGroups" :key="group.id" class="tag">{{ group.name }}</span></td><td><button class="link inline-edit" title="修改并同步优先级" @click="editManagedPriority(row)">{{ row.priority }} <Pencil :size="13"/></button></td><td><button class="link inline-edit" title="修改并同步并发" @click="editManagedConcurrency(row)">{{ row.concurrency }} <Pencil :size="13"/></button></td><td><span :class="['badge',row.schedulable?'success':'neutral']">{{ row.schedulable?'运行':'停止' }}</span></td><td><span :class="['badge',statusTone(row.syncStatus)]">{{ statusText(row.syncStatus) }}</span></td></tr></tbody></table></div>
+          <PaginationBar v-if="!loading" v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.managed)"/>
         </template>
 
         <template v-else-if="route==='/policies'">
           <div class="page-head"><div><h1>策略配置</h1><span>按目标分组独立排序与调度</span></div><button class="btn primary" @click="openPolicy"><Plus :size="16"/>新建分组策略</button></div>
-          <div class="policy-list"><article v-for="row in filtered(data.policies)" :key="row.id" class="panel policy"><header><div><strong>{{ row.name }}</strong><small>{{ row.targetName }} / {{ row.targetGroupName }} · v{{ row.activeVersion||1 }}</small></div><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><dl><div><dt>排序模式</dt><dd>{{ row.config.mode==='SPEED'?'速度优先':'价格优先' }}</dd></div><div><dt>自动优先级</dt><dd>1000 起</dd></div><div><dt>倍率上限</dt><dd>目标分组自动值</dd></div><div><dt>最低成功率</dt><dd>{{ row.config.minSuccessRate||95 }}%</dd></div></dl><footer><button v-if="row.status!=='ACTIVE'" class="btn primary small" @click="activatePolicy(row)"><Play :size="14"/>启用</button><button class="btn small" @click="action(()=>api(`/policies/${row.id}/simulate`,{method:'POST'}),'模拟完成，结果已生成')"><BarChart3 :size="14"/>模拟</button></footer></article></div>
+          <div class="policy-list"><article v-for="row in paged(data.policies)" :key="row.id" class="panel policy"><header><div><strong>{{ row.name }}</strong><small>{{ row.targetName }} / {{ row.targetGroupName }} · v{{ row.activeVersion||1 }}</small></div><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><dl><div><dt>排序模式</dt><dd>{{ row.config.mode==='SPEED'?'速度优先':'价格优先' }}</dd></div><div><dt>自动优先级</dt><dd>1000 起</dd></div><div><dt>倍率上限</dt><dd>目标分组自动值</dd></div><div><dt>最低成功率</dt><dd>{{ row.config.minSuccessRate||95 }}%</dd></div></dl><footer><button v-if="row.status!=='ACTIVE'" class="btn primary small" @click="activatePolicy(row)"><Play :size="14"/>启用</button><button class="btn small" @click="action(()=>api(`/policies/${row.id}/simulate`,{method:'POST'}),'模拟完成，结果已生成')"><BarChart3 :size="14"/>模拟</button></footer></article></div>
+          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.policies)"/>
         </template>
 
         <template v-else-if="route==='/scheduling'">
           <div class="page-head"><div><h1>调度运行</h1><span>策略自动执行记录</span></div><button class="btn" @click="runAutomation"><Play :size="16"/>立即评估</button></div>
-          <StateBlock v-if="!loading&&!data.actions.length" title="暂无调度记录"/><div v-else class="table-wrap"><table><thead><tr><th>动作</th><th>原因</th><th>变更</th><th>状态</th><th>执行时间</th></tr></thead><tbody><tr v-for="row in filtered(data.actions)" :key="row.id"><td><strong>{{ row.actionType }}</strong><small>{{ row.managedAccountId||'--' }}</small></td><td>{{ row.reason }}</td><td><code>{{ JSON.stringify(row.afterState) }}</code></td><td><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span><small v-if="row.error" class="danger-text">{{ row.error }}</small></td><td>{{ date(row.executedAt||row.createdAt) }}</td></tr></tbody></table></div>
+          <StateBlock v-if="!loading&&!data.actions.length" title="暂无调度记录"/><div v-else class="table-wrap"><table><thead><tr><th>动作</th><th>原因</th><th>变更</th><th>状态</th><th>执行时间</th></tr></thead><tbody><tr v-for="row in paged(data.actions)" :key="row.id"><td><strong>{{ row.actionType }}</strong><small>{{ row.managedAccountId||'--' }}</small></td><td>{{ row.reason }}</td><td><code>{{ JSON.stringify(row.afterState) }}</code></td><td><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span><small v-if="row.error" class="danger-text">{{ row.error }}</small></td><td>{{ date(row.executedAt||row.createdAt) }}</td></tr></tbody></table></div>
+          <PaginationBar v-if="!loading" v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.actions)"/>
         </template>
 
         <template v-else-if="route==='/events'">
           <div class="page-head"><div><h1>事件中心</h1><span>{{ data.events.filter(x=>x.status!=='RESOLVED').length }} 个活动事件 · 恢复后自动关闭</span></div></div>
-          <div class="event-list"><article v-for="row in filtered(data.events)" :key="row.id" :class="['event',row.severity.toLowerCase()]" ><span class="severity">{{ row.severity }}</span><div><header><strong>{{ row.title }}</strong><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><p>{{ row.detail }}</p><small>{{ row.category }} · {{ date(row.createdAt) }}</small></div></article></div>
+          <div class="event-list"><article v-for="row in paged(data.events)" :key="row.id" :class="['event',row.severity.toLowerCase()]" ><span class="severity">{{ row.severity }}</span><div><header><strong>{{ row.title }}</strong><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><p>{{ row.detail }}</p><small>{{ row.category }} · {{ date(row.createdAt) }}</small></div></article></div>
+          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.events)"/>
         </template>
 
         <template v-else-if="route==='/audit'">
-          <div class="page-head"><div><h1>审计日志</h1><span>追加写入，不可修改</span></div></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>对象 ID</th><th>详情</th></tr></thead><tbody><tr v-for="row in filtered(data.audit)" :key="row.id"><td>{{ date(row.createdAt) }}</td><td><strong>{{ row.action }}</strong></td><td>{{ row.objectType }}</td><td><code>{{ row.objectId }}</code></td><td><code>{{ JSON.stringify(row.detail) }}</code></td></tr></tbody></table></div>
+          <div class="page-head"><div><h1>审计日志</h1><span>追加写入，不可修改</span></div></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>动作</th><th>对象</th><th>对象 ID</th><th>详情</th></tr></thead><tbody><tr v-for="row in paged(data.audit)" :key="row.id"><td>{{ date(row.createdAt) }}</td><td><strong>{{ row.action }}</strong></td><td>{{ row.objectType }}</td><td><code>{{ row.objectId }}</code></td><td><code>{{ JSON.stringify(row.detail) }}</code></td></tr></tbody></table></div>
+          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.audit)"/>
         </template>
 
         <template v-else-if="route==='/settings'">

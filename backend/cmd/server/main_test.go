@@ -11,7 +11,9 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestCredentialEncryptionRoundTrip(t *testing.T) {
@@ -88,6 +90,9 @@ func TestUnwrapEnvelope(t *testing.T) {
 
 func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T) {
 	requests := []map[string]any{}
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -96,9 +101,20 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
+		mu.Lock()
 		requests = append(requests, payload)
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		active--
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"id":%d}}`, len(requests))))
+		groupIDs := payload["group_ids"].([]any)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"id":%d}}`, int(groupIDs[0].(float64)))))
 	}))
 	defer server.Close()
 
@@ -114,10 +130,21 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 	if len(accounts) != 2 || len(requests) != 2 {
 		t.Fatalf("expected two independent accounts, got accounts=%d requests=%d", len(accounts), len(requests))
 	}
-	for index, request := range requests {
+	if maxActive < 2 {
+		t.Fatalf("expected account creation to run concurrently, max active requests=%d", maxActive)
+	}
+	requestsByGroup := map[int]map[string]any{}
+	for _, request := range requests {
 		groupIDs, ok := request["group_ids"].([]any)
-		if !ok || len(groupIDs) != 1 || int(groupIDs[0].(float64)) != targetGroups[index].RemoteID {
-			t.Fatalf("account %d has invalid group_ids: %#v", index, request["group_ids"])
+		if !ok || len(groupIDs) != 1 {
+			t.Fatalf("account has invalid group_ids: %#v", request["group_ids"])
+		}
+		requestsByGroup[int(groupIDs[0].(float64))] = request
+	}
+	for index, targetGroup := range targetGroups {
+		request := requestsByGroup[targetGroup.RemoteID]
+		if request == nil {
+			t.Fatalf("target group %d was not created", targetGroup.RemoteID)
 		}
 		if !strings.Contains(request["name"].(string), targetGroups[index].Name) {
 			t.Fatalf("account %d name does not identify target group: %q", index, request["name"])
@@ -128,6 +155,33 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if int(request["concurrency"].(float64)) != 1000 {
 			t.Fatalf("account %d concurrency=%v, want 1000", index, request["concurrency"])
 		}
+	}
+}
+
+func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		groupID := int(payload["group_ids"].([]any)[0].(float64))
+		w.Header().Set("Content-Type", "application/json")
+		if groupID == 22 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"code":1,"message":"create failed"}`))
+			return
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"id":%d}}`, groupID)))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, []deploymentTargetGroup{{ID: "local-1", Name: "成功", RemoteID: 11}, {ID: "local-2", Name: "失败", RemoteID: 22}}, 1000, 1000)
+	if err == nil || !strings.Contains(err.Error(), "失败") {
+		t.Fatalf("expected target-specific failure, got %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].RemoteID != "11" {
+		t.Fatalf("successful account must be returned for rollback: %#v", accounts)
 	}
 }
 

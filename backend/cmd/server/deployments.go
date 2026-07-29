@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -370,16 +371,51 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 }
 
 func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourcePlatform, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {
-	accounts := make([]createdRemoteAccount, 0, len(targetGroups))
-	for _, targetGroup := range targetGroups {
-		remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
-		remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, sourcePlatform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
-		if err != nil {
-			return accounts, fmt.Errorf("目标分组 %s：%w", targetGroup.Name, err)
-		}
-		accounts = append(accounts, createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup})
+	type accountResult struct {
+		index   int
+		account createdRemoteAccount
+		err     error
 	}
-	return accounts, nil
+	results := make(chan accountResult, len(targetGroups))
+	workers := 6
+	if len(targetGroups) < workers {
+		workers = len(targetGroups)
+	}
+	jobs := make(chan int)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			for index := range jobs {
+				targetGroup := targetGroups[index]
+				remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
+				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, sourcePlatform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
+				results <- accountResult{index: index, account: createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup}, err: err}
+			}
+		}()
+	}
+	go func() {
+		for index := range targetGroups {
+			jobs <- index
+		}
+		close(jobs)
+	}()
+
+	ordered := make([]accountResult, len(targetGroups))
+	for range targetGroups {
+		result := <-results
+		ordered[result.index] = result
+	}
+	accounts := make([]createdRemoteAccount, 0, len(targetGroups))
+	var firstErr error
+	for index, result := range ordered {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("目标分组 %s：%w", targetGroups[index].Name, result.err)
+			}
+			continue
+		}
+		accounts = append(accounts, result.account)
+	}
+	return accounts, firstErr
 }
 
 func (a *App) deleteGeneratedRemoteKey(ctx context.Context, baseURL, platform string, session remoteSession, id string) {
@@ -422,6 +458,7 @@ func managedAccountName(sourceName, sourceGroupName, targetGroupName string, tar
 }
 
 func deploymentError(code, groupName string, err error) error {
+	log.Printf("自动绑定失败 [%s] %s: %v", code, groupName, err)
 	if apiErr, ok := err.(*apiError); ok {
 		return &apiError{Status: apiErr.Status, Code: code, Message: groupName + "：" + apiErr.Message}
 	}
