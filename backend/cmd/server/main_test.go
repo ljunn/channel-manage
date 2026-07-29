@@ -197,6 +197,22 @@ func TestLoginRemoteSupportsFlatSub2APILogin(t *testing.T) {
 	}
 }
 
+func TestRemoteJSONMarksSub2APIAdminRequests(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Admin-UI-Request") != "1" {
+			t.Fatalf("missing admin UI request header: %#v", r.Header)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"items":[]}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	if _, _, err := app.remoteJSON(context.Background(), server.URL, http.MethodGet, "/api/v1/admin/groups", remoteSession{}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoginRemoteRetriesRateLimitAndReturnsTokenPair(t *testing.T) {
 	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
 	requests := 0
@@ -236,6 +252,21 @@ func TestRemoteRateLimitedClassification(t *testing.T) {
 	}
 }
 
+func TestRemoteRouteFallbackRequiresNotFound(t *testing.T) {
+	if !remoteRouteUnavailable(&apiError{Status: 502, Code: "REMOTE_NOT_FOUND", Message: "not found"}) {
+		t.Fatal("not found response did not allow route fallback")
+	}
+	for _, err := range []error{
+		&apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "not found in response body"},
+		&apiError{Status: 502, Code: "REMOTE_INVALID_RESPONSE", Message: "text/html"},
+		&apiError{Status: 502, Code: "REMOTE_RATE_LIMITED", Message: "too many requests"},
+	} {
+		if remoteRouteUnavailable(err) {
+			t.Fatalf("unexpected route fallback for %v", err)
+		}
+	}
+}
+
 func TestLoginRemoteDoesNotHideSub2APIAuthenticationError(t *testing.T) {
 	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
 	fallbackCalled := false
@@ -253,6 +284,46 @@ func TestLoginRemoteDoesNotHideSub2APIAuthenticationError(t *testing.T) {
 	_, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
 	if err == nil || !strings.Contains(err.Error(), "INVALID_CREDENTIALS: invalid email or password") || fallbackCalled {
 		t.Fatalf("expected original authentication error, got %v", err)
+	}
+}
+
+func TestLoginRemoteDoesNotFallbackAfterHTMLRateLimit(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	fallbackCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/login" {
+			fallbackCalled = true
+			t.Fatal("flat login fallback must not run after rate limiting")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`<html><title>Too Many Requests</title></html>`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
+	if !remoteRateLimited(err) || fallbackCalled || !strings.Contains(err.Error(), "/api/v1/auth/login") || !strings.Contains(err.Error(), "text/html") {
+		t.Fatalf("expected original HTML rate limit, got %v", err)
+	}
+}
+
+func TestLoginRemoteDoesNotFallbackAfterHTMLSuccessResponse(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	fallbackCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/login" {
+			fallbackCalled = true
+			t.Fatal("flat login fallback must not run after an invalid success response")
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><title>Verification required</title></html>`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	_, err := app.loginRemote(context.Background(), server.URL, "SUB2API", "user", "password")
+	apiErr, ok := err.(*apiError)
+	if !ok || apiErr.Code != "REMOTE_INVALID_RESPONSE" || fallbackCalled || !strings.Contains(apiErr.Message, "/api/v1/auth/login") || !strings.Contains(apiErr.Message, "text/html") {
+		t.Fatalf("expected actionable invalid response error, got %v", err)
 	}
 }
 

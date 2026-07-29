@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
-  Activity, AlertTriangle, BarChart3, Bot, Check, ChevronRight, CircleDollarSign, ClipboardList,
+  Activity, AlertTriangle, ArrowRight, BarChart3, Bot, Check, ChevronRight, CircleDollarSign, ClipboardList,
   Database, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
@@ -36,6 +36,9 @@ const pageIcon = computed(() => nav.flatMap(group => group.items).find(([path]) 
 const searchableRoutes = new Set(['/market','/sources','/scheduling','/channels','/managed','/targets','/policies','/events','/audit'])
 const showSearch = computed(() => searchableRoutes.has(route.value))
 const writableTargets = computed(() => data.targets.filter(item => item.writeEnabled))
+const selectedSourceGroups = computed(() => (sourceDetail.value?.groups||[]).filter(group => form.sourceGroupIDs?.includes(group.id)))
+const selectedTargetGroups = computed(() => targetGroups.value.filter(group => form.targetGroupIDs?.includes(group.id)))
+const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
 
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/overview'; mobileOpen.value = false })
@@ -114,6 +117,7 @@ async function loadTargetGroups(){targetGroups.value=form.targetID?await api(`/t
 function isGroupMapped(group){return !!group?.deployments?.some(item=>item.targetId===form.targetID)}
 function mappedTargets(group){return (group.deployments||[]).map(item=>item.targetName).join('、')}
 function toggleSourceGroups(){const available=(sourceDetail.value?.groups||[]).filter(group=>!isGroupMapped(group)).map(group=>group.id);form.sourceGroupIDs=form.sourceGroupIDs?.length===available.length?[]:available}
+function toggleTargetGroups(){const available=targetGroups.value.map(group=>group.id);form.targetGroupIDs=form.targetGroupIDs?.length===available.length?[]:available}
 async function deploySourceGroups(){
   if(!form.sourceGroupIDs?.length){showError(new Error('请至少选择一个源分组'));return}
   if(!form.targetID||!form.targetGroupIDs?.length){showError(new Error('请选择目标节点和目标分组'));return}
@@ -125,7 +129,6 @@ async function action(run, success){loading.value=true;clearMessages();try{await
 async function remove(path,label){if(!confirm(`确认删除“${label}”？`))return;await action(()=>api(path,{method:'DELETE'}),'已删除')}
 async function channelAct(row,act){await action(()=>api(`/channels/${row.id}/${act}`,{method:'POST'}),act==='probe'?'探测任务已提交':'渠道状态已更新')}
 async function decision(row,value){await action(()=>api(`/action-intents/${row.id}/${value}`,{method:'POST'}),value==='approve'?'动作已批准':'动作已拒绝')}
-async function eventAct(row,value){await action(()=>api(`/events/${row.id}/${value}`,{method:'POST'}),'事件状态已更新')}
 async function saveSettings(){const payload={};for(const key of ['shadow_mode','emergency_freeze','auto_approve'])payload[key]=!!data.settings[key];for(const key of ['probe_interval_seconds','scan_interval_seconds','max_daily_probe_cost_usd','min_healthy_channels','confirmation_failures','metric_window_minutes','min_error_samples','error_rate_threshold'])payload[key]=Number(data.settings[key]);await action(()=>api('/settings',{method:'PATCH',body:body(payload)}),'系统设置已保存')}
 async function createNotification(){await submit(()=>api('/notification-channels',{method:'POST',body:body({name:form.name,apiKey:form.apiKey,fromEmail:form.fromEmail,toEmail:form.toEmail})}),'通知渠道已保存')}
 async function testNotification(row){await action(()=>api(`/notification-channels/${row.id}/test`,{method:'POST'}),'测试邮件已发送')}
@@ -224,8 +227,8 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         </template>
 
         <template v-else-if="route==='/events'">
-          <div class="page-head"><div><h1>事件中心</h1><span>{{ data.events.filter(x=>x.status!=='RESOLVED').length }} 个活动事件</span></div></div>
-          <div class="event-list"><article v-for="row in filtered(data.events)" :key="row.id" :class="['event',row.severity.toLowerCase()]" ><span class="severity">{{ row.severity }}</span><div><header><strong>{{ row.title }}</strong><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><p>{{ row.detail }}</p><small>{{ row.category }} · {{ date(row.createdAt) }}</small></div><div class="row-actions"><button v-if="row.status==='OPEN'" class="btn small" @click="eventAct(row,'acknowledge')">确认</button><button v-if="row.status!=='RESOLVED'" class="btn small" @click="eventAct(row,'resolve')">恢复</button></div></article></div>
+          <div class="page-head"><div><h1>事件中心</h1><span>{{ data.events.filter(x=>x.status!=='RESOLVED').length }} 个活动事件 · 恢复后自动关闭</span></div></div>
+          <div class="event-list"><article v-for="row in filtered(data.events)" :key="row.id" :class="['event',row.severity.toLowerCase()]" ><span class="severity">{{ row.severity }}</span><div><header><strong>{{ row.title }}</strong><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></header><p>{{ row.detail }}</p><small>{{ row.category }} · {{ date(row.createdAt) }}</small></div></article></div>
         </template>
 
         <template v-else-if="route==='/audit'">
@@ -247,21 +250,44 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
   <ModalShell v-if="modal==='source-edit'" title="编辑数据源" @close="close"><form class="modal-form" @submit.prevent="updateSource"><label class="full"><span>平台名称</span><input v-model="form.name" required/></label><label class="full"><span>平台地址</span><input v-model="form.baseURL" disabled/></label><label><span>余额 / 倍率换算</span><span class="ratio-input"><input v-model="form.valueNumerator" type="number" min="0.00000001" step="any" required/><b>:</b><input v-model="form.valueDenominator" type="number" min="0.00000001" step="any" required/></span></label><label><span>扫描周期（秒）</span><input v-model="form.interval" type="number" min="60"/></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary" :disabled="loading">保存并重算</button></footer></form></ModalShell>
   <ModalShell v-if="modal==='source-detail'&&sourceDetail" :title="sourceDetail.source.name" wide @close="close">
     <form class="mapping-workspace" @submit.prevent="deploySourceGroups">
-      <div class="detail-summary"><span><b>{{ sourceDetail.groups.length }}</b>远端分组</span><span><b>{{ form.sourceGroupIDs?.length||0 }}</b>已选择</span><span><b>{{ targetGroups.length }}</b>目标分组</span></div>
-      <div class="mapping-layout">
-        <section class="group-picker">
-          <header><div><h3>源分组</h3><small>每个分组会自动生成独立 Key 和托管账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
-          <div class="table-wrap inner mapping-table"><table><thead><tr><th><span class="sr-only">选择</span></th><th>分组</th><th>倍率</th><th>描述</th><th>映射</th></tr></thead><tbody><tr v-for="group in sourceDetail.groups" :key="group.id" :class="{mapped:isGroupMapped(group)}"><td><input v-model="form.sourceGroupIDs" type="checkbox" :value="group.id" :disabled="isGroupMapped(group)" :aria-label="`选择 ${group.name}`"/></td><td><strong>{{ group.name }}</strong><small>ID {{ group.remoteId }}</small></td><td class="ratio">{{ ratio(group.multiplier) }}</td><td class="group-description">{{ group.description||'--' }}</td><td><span v-if="isGroupMapped(group)" class="badge success">已映射</span><small v-else-if="group.deployments?.length">{{ mappedTargets(group) }}</small><span v-else class="muted">未映射</span></td></tr></tbody></table></div>
-        </section>
-        <aside class="mapping-config">
-          <header><h3>发配位置</h3><small>所选源分组统一写入以下目标分组</small></header>
-          <label><span>目标节点</span><select v-model="form.targetID" required @change="loadTargetGroups"><option value="" disabled>请选择</option><option v-for="item in writableTargets" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
-          <fieldset><legend>目标分组</legend><div v-if="!form.targetID" class="empty-inline">请先选择目标节点</div><div v-else-if="!targetGroups.length" class="empty-inline">该节点尚未同步分组</div><label v-for="group in targetGroups" :key="group.id" class="check-row"><input v-model="form.targetGroupIDs" type="checkbox" :value="group.id"/><span><strong>{{ group.name }}</strong><small>ID {{ group.remoteId }}</small></span></label></fieldset>
-          <div class="mapping-options"><label><span>优先级</span><input v-model="form.priority" type="number" min="101"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
-          <div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div>
-          <button class="btn primary full" :disabled="loading||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>创建 {{ form.sourceGroupIDs?.length||0 }} 个托管账号</button>
-        </aside>
+      <div class="mapping-context">
+        <div><Database :size="18"/><span><small>数据源</small><strong>{{ sourceDetail.source.name }}</strong></span></div>
+        <ArrowRight :size="18"/>
+        <div><Network :size="18"/><span><small>目标节点</small><strong>{{ selectedTarget?.name||'尚未选择' }}</strong></span></div>
+        <span class="mapping-cardinality">1 : N</span>
       </div>
+      <div class="mapping-builder">
+        <section class="mapping-step">
+          <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>每个源分组创建一个独立托管账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
+          <div class="source-option-list">
+            <label v-for="group in sourceDetail.groups" :key="group.id" class="source-option" :class="{selected:form.sourceGroupIDs?.includes(group.id),mapped:isGroupMapped(group)}">
+              <input v-model="form.sourceGroupIDs" type="checkbox" :value="group.id" :disabled="isGroupMapped(group)" :aria-label="`选择 ${group.name}`"/>
+              <span class="source-option-copy"><strong>{{ group.name }}</strong><small>{{ group.description||`远端 ID ${group.remoteId}` }}</small></span>
+              <span class="source-option-meta"><b>{{ ratio(group.multiplier) }}</b><small v-if="isGroupMapped(group)">已映射到 {{ selectedTarget?.name }}</small><small v-else-if="group.deployments?.length">另有 {{ mappedTargets(group) }}</small></span>
+            </label>
+          </div>
+        </section>
+        <section class="mapping-step">
+          <header><span class="step-index">2</span><div><h3>选择目标分组</h3><small>一个托管账号可同时加入多个分组</small></div></header>
+          <label class="target-node-select"><span>目标节点</span><select v-model="form.targetID" required @change="loadTargetGroups"><option value="" disabled>请选择</option><option v-for="item in writableTargets" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+          <div class="target-group-head"><span>目标分组 <b>{{ form.targetGroupIDs?.length||0 }}/{{ targetGroups.length }}</b></span><button v-if="targetGroups.length" type="button" class="btn small" @click="toggleTargetGroups"><Check :size="14"/>全选</button></div>
+          <div class="target-option-list">
+            <div v-if="!form.targetID" class="empty-inline">请先选择目标节点</div><div v-else-if="!targetGroups.length" class="empty-inline">该节点尚未同步分组</div>
+            <label v-for="group in targetGroups" :key="group.id" class="target-option" :class="{selected:form.targetGroupIDs?.includes(group.id)}"><input v-model="form.targetGroupIDs" type="checkbox" :value="group.id"/><span><strong>{{ group.name }}</strong><small>ID {{ group.remoteId }}</small></span></label>
+          </div>
+        </section>
+      </div>
+      <section class="mapping-preview">
+        <header><span class="step-index">3</span><div><h3>映射预览</h3><small>每一行都是一个源分组到多个目标分组的一对多关系</small></div></header>
+        <div v-if="!selectedSourceGroups.length||!selectedTargetGroups.length" class="mapping-preview-empty">选择两侧分组后，这里会显示最终映射关系</div>
+        <div v-else class="mapping-preview-list">
+          <div v-for="group in selectedSourceGroups" :key="group.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ group.name }}</strong><small>源分组</small></span><ArrowRight :size="18"/><span class="preview-targets"><span v-for="targetGroup in selectedTargetGroups" :key="targetGroup.id">{{ targetGroup.name }}</span></span></div>
+        </div>
+      </section>
+      <footer class="mapping-submit">
+        <div class="mapping-options"><label><span>优先级</span><input v-model="form.priority" type="number" min="101"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
+        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ form.sourceGroupIDs?.length||0 }} 个托管账号，每个绑定 {{ form.targetGroupIDs?.length||0 }} 个目标分组</small><button class="btn primary" :disabled="loading||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>确认创建</button></div>
+      </footer>
     </form>
   </ModalShell>
   <ModalShell v-if="modal==='target'" title="接入目标节点" @close="close"><form class="modal-form" @submit.prevent="createTarget"><label><span>节点名称</span><input v-model="form.name" required/></label><label class="full"><span>节点地址</span><input v-model="form.baseURL" type="url" placeholder="https://" required/></label><label><span>管理员邮箱</span><input v-model="form.username" type="email" required/></label><label><span>管理员密码</span><input v-model="form.password" type="password" required/></label><label class="check-row full"><input v-model="form.writeEnabled" type="checkbox"/><span><strong>允许创建和维护托管账号</strong><small>既有账号始终只读</small></span></label><footer class="full"><button type="button" class="btn" @click="close">取消</button><button class="btn primary">保存</button></footer></form></ModalShell>

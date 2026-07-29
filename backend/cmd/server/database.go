@@ -135,6 +135,12 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_status_time ON events(status, created_at DESC)`,
+		`WITH ranked AS (
+			SELECT id,row_number() OVER (PARTITION BY dedupe_key ORDER BY created_at DESC) AS position
+			FROM events WHERE status<>'RESOLVED'
+		) UPDATE events SET status='RESOLVED',resolved_at=COALESCE(resolved_at,now())
+		WHERE id IN (SELECT id FROM ranked WHERE position>1)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_active_dedupe ON events(dedupe_key) WHERE status<>'RESOLVED'`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id BIGSERIAL PRIMARY KEY, operator_id UUID, action TEXT NOT NULL, object_type TEXT NOT NULL, object_id TEXT NOT NULL,
 			detail JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -170,7 +170,12 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	a.resolveEvent(ctx, "target-sync:"+id)
+	a.resolveEvent(ctx, "target-rate-limit:"+id)
+	return nil
 }
 
 func (a *App) authenticateTarget(ctx context.Context, target Target, validate bool) (remoteSession, error) {
@@ -229,10 +234,12 @@ func (a *App) persistTargetSession(ctx context.Context, targetID string, credent
 func (a *App) targetSyncFailed(ctx context.Context, target Target, cause error) {
 	if remoteRateLimited(cause) {
 		_, _ = a.db.ExecContext(ctx, `UPDATE targets SET last_error=$2,updated_at=now() WHERE id=$1`, target.ID, truncate(cause.Error(), 500))
+		a.resolveEvent(ctx, "target-sync:"+target.ID)
 		a.openEvent(ctx, "P2", "TARGET_SYNC", "目标节点请求受限", target.Name+": "+cause.Error(), "target-rate-limit:"+target.ID)
 		return
 	}
 	_, _ = a.db.ExecContext(ctx, `UPDATE targets SET status='OFFLINE',last_error=$2,updated_at=now() WHERE id=$1`, target.ID, truncate(cause.Error(), 500))
+	a.resolveEvent(ctx, "target-rate-limit:"+target.ID)
 	a.openEvent(ctx, "P1", "TARGET_SYNC", "目标节点同步失败", target.Name+": "+cause.Error(), "target-sync:"+target.ID)
 }
 

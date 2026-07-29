@@ -15,7 +15,7 @@ import (
 
 func (a *App) openEvent(ctx context.Context, severity, category, title, detail, dedupeKey string) {
 	var existing string
-	err := a.db.QueryRowContext(ctx, `SELECT id FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' AND created_at>now()-interval '1 hour' LIMIT 1`, dedupeKey).Scan(&existing)
+	err := a.db.QueryRowContext(ctx, `UPDATE events SET severity=$2,category=$3,title=$4,detail=$5,status='OPEN',acknowledged_at=NULL,created_at=now() WHERE id=(SELECT id FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' ORDER BY created_at DESC LIMIT 1) RETURNING id`, dedupeKey, severity, category, title, truncate(detail, 1000)).Scan(&existing)
 	if err == nil {
 		return
 	}
@@ -27,8 +27,13 @@ func (a *App) openEvent(ctx context.Context, severity, category, title, detail, 
 	}
 }
 
+func (a *App) resolveEvent(ctx context.Context, dedupeKey string) {
+	_, err := a.db.ExecContext(ctx, `UPDATE events SET status='RESOLVED',resolved_at=now() WHERE dedupe_key=$1 AND status<>'RESOLVED'`, dedupeKey)
+	logDatabaseError("恢复事件", err)
+}
+
 func (a *App) listEvents(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id,severity,category,title,detail,status,acknowledged_at,resolved_at,created_at FROM events ORDER BY CASE severity WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,created_at DESC LIMIT 500`)
+	rows, err := a.db.QueryContext(ctx, `SELECT id,severity,category,title,detail,status,acknowledged_at,resolved_at,created_at FROM events WHERE status<>'RESOLVED' OR resolved_at>now()-interval '24 hours' ORDER BY CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END,CASE severity WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END,created_at DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}

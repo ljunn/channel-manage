@@ -108,6 +108,9 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "channel-manage/"+Version)
+	if strings.HasPrefix(path, "/api/v1/admin/") {
+		request.Header.Set("X-Admin-UI-Request", "1")
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
@@ -133,12 +136,15 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 		return nil, response.Header, err
 	}
 	var value any
-	if len(data) > 0 && json.Unmarshal(data, &value) != nil {
-		return nil, response.Header, &apiError{Status: 502, Code: "SCHEMA_CHANGED", Message: "远端返回了无法识别的数据"}
+	var decodeErr error
+	if len(data) > 0 {
+		decodeErr = json.Unmarshal(data, &value)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message := fmt.Sprintf("远端请求失败 (%d)", response.StatusCode)
-		if record, ok := value.(map[string]any); ok {
+		if decodeErr != nil {
+			message = fmt.Sprintf("远端接口 %s 返回非 JSON 数据 (%d, %s)", path, response.StatusCode, responseMediaType(response.Header))
+		} else if record, ok := value.(map[string]any); ok {
 			if remoteMessage := text(record["message"], ""); remoteMessage != "" {
 				message = remoteMessage
 			}
@@ -157,10 +163,23 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 			code = "REMOTE_RATE_LIMITED"
 		} else if response.StatusCode == http.StatusUnauthorized {
 			code = "REMOTE_UNAUTHORIZED"
+		} else if response.StatusCode == http.StatusNotFound {
+			code = "REMOTE_NOT_FOUND"
 		}
 		return value, response.Header, &apiError{Status: 502, Code: code, Message: message}
 	}
+	if decodeErr != nil {
+		return nil, response.Header, &apiError{Status: 502, Code: "REMOTE_INVALID_RESPONSE", Message: fmt.Sprintf("远端接口 %s 返回非 JSON 数据 (%d, %s)", path, response.StatusCode, responseMediaType(response.Header))}
+	}
 	return value, response.Header, nil
+}
+
+func responseMediaType(header http.Header) string {
+	value := strings.TrimSpace(strings.Split(header.Get("Content-Type"), ";")[0])
+	if value == "" {
+		return "未知内容类型"
+	}
+	return value
 }
 
 type sub2APITokenPair struct {
@@ -274,11 +293,7 @@ func remoteAuthenticationExpired(err error) bool {
 
 func remoteRouteUnavailable(err error) bool {
 	var typed *apiError
-	if !errors.As(err, &typed) {
-		return false
-	}
-	message := strings.ToLower(typed.Message)
-	return typed.Code == "SCHEMA_CHANGED" || strings.Contains(message, "(404)") || strings.Contains(message, "not found")
+	return errors.As(err, &typed) && typed.Code == "REMOTE_NOT_FOUND"
 }
 
 func unwrapEnvelope(value any, platform string) (any, error) {

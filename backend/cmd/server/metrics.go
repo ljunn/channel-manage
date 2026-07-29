@@ -37,6 +37,8 @@ func (a *App) syncDueTargetMetrics(ctx context.Context) {
 		if err := a.syncTargetMetrics(ctx, id); err != nil {
 			logDatabaseError("同步目标业务指标", err)
 			a.openEvent(ctx, "P2", "TARGET_LOG", "目标业务日志不可用", err.Error(), "target-log:"+id)
+		} else {
+			a.resolveEvent(ctx, "target-log:"+id)
 		}
 	}
 }

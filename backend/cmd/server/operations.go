@@ -123,6 +123,8 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	}
 	if !success {
 		a.openEvent(ctx, "P1", "CHANNEL_PROBE", "渠道探测异常", errorType, "channel-probe:"+id)
+	} else {
+		a.resolveEvent(ctx, "channel-probe:"+id)
 	}
 	return requestErr
 }

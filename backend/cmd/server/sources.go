@@ -283,6 +283,9 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		return err
 	}
 	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
+	if err == nil {
+		a.resolveEvent(ctx, "source-scan:"+id)
+	}
 	return err
 }
 
