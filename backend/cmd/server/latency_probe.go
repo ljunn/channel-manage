@@ -121,14 +121,8 @@ func (a *App) measureFirstToken(ctx context.Context, baseURL, key, model string)
 func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sourceName, sourceBase, keyName, groupName, key, modelsJSON string) error {
 	models := []string{}
 	_ = json.Unmarshal([]byte(modelsJSON), &models)
-	model := selectFirstTokenProbeModel(models)
-	firstTokenMs := 0
-	var requestErr error
-	if model == "" {
-		requestErr = fmt.Errorf("慢首响抽样没有可用的文本模型")
-	} else {
-		firstTokenMs, requestErr = a.measureFirstToken(ctx, sourceBase, key, model)
-	}
+	firstTokenMs, probeModels, requestErr := a.measureProbeModels(ctx, id, sourceBase, key, models)
+	modelLabel := strings.Join(probeModels, "、")
 	success := requestErr == nil && firstTokenMs <= maxFirstTokenMs
 	errorType, summary := classifyProbeFailure(requestErr)
 	if requestErr != nil && errorType != "BALANCE_EXHAUSTED" {
@@ -136,10 +130,10 @@ func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sou
 	}
 	if requestErr == nil && !success {
 		errorType = "FIRST_TOKEN_TOO_SLOW"
-		summary = fmt.Sprintf("抽样首 Token %.2f 秒超过 60 秒", float64(firstTokenMs)/1000)
+		summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
 	}
 	if success {
-		summary = fmt.Sprintf("抽样首 Token %.2f 秒", float64(firstTokenMs)/1000)
+		summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
 	}
 
 	tx, err := a.db.BeginTx(ctx, nil)

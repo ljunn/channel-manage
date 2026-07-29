@@ -572,6 +572,23 @@ func (a *App) getSettings(ctx context.Context) (map[string]any, error) {
 	result["version"] = Version
 	result["buildType"] = BuildType
 	result["githubRepo"] = GitHubRepo
+	groupRows, err := a.db.QueryContext(ctx, `SELECT tg.id,t.name,tg.name,tg.platform,tg.models,tg.probe_model FROM target_groups tg JOIN targets t ON t.id=tg.target_id ORDER BY t.name,tg.name`)
+	if err != nil {
+		return nil, err
+	}
+	probeGroups := []map[string]any{}
+	for groupRows.Next() {
+		var id, targetName, name, platform, models, probeModel string
+		if err = groupRows.Scan(&id, &targetName, &name, &platform, &models, &probeModel); err != nil {
+			groupRows.Close()
+			return nil, err
+		}
+		probeGroups = append(probeGroups, map[string]any{"id": id, "targetName": targetName, "name": name, "platform": platform, "models": json.RawMessage(models), "probeModel": probeModel})
+	}
+	if err = groupRows.Close(); err != nil {
+		return nil, err
+	}
+	result["probe_groups"] = probeGroups
 	return result, rows.Err()
 }
 
@@ -596,6 +613,37 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer tx.Rollback()
 	for key, value := range input {
+		if key == "probe_models" {
+			models, ok := value.(map[string]any)
+			if !ok {
+				return &apiError{400, "INVALID_PROBE_MODELS", "分组测试模型格式无效"}
+			}
+			for groupID, rawModel := range models {
+				model, ok := rawModel.(string)
+				model = strings.TrimSpace(model)
+				if !ok || model == "" {
+					return &apiError{400, "INVALID_PROBE_MODEL", "每个目标分组都必须指定测试模型"}
+				}
+				var platform, modelsJSON string
+				if err = tx.QueryRowContext(r.Context(), `SELECT platform,models FROM target_groups WHERE id=$1`, groupID).Scan(&platform, &modelsJSON); err != nil {
+					return &apiError{400, "INVALID_PROBE_MODEL_GROUP", "目标分组不存在"}
+				}
+				valid := false
+				for _, allowedModel := range decodeModels(modelsJSON) {
+					if allowedModel == model && probeModelMatchesPlatform(platform, model) {
+						valid = true
+						break
+					}
+				}
+				if !valid {
+					return &apiError{400, "INVALID_PROBE_MODEL", "测试模型不属于该目标分组的文本模型"}
+				}
+				if _, err = tx.ExecContext(r.Context(), `UPDATE target_groups SET probe_model=$2,updated_at=now() WHERE id=$1`, groupID, model); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if !allowed[key] {
 			return &apiError{400, "INVALID_SETTING", "包含不支持的系统设置"}
 		}

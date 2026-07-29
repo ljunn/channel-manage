@@ -224,26 +224,52 @@ func (a *App) probeChannels(ctx context.Context, ids []string) {
 	if len(ids) == 0 {
 		return
 	}
-	jobs := make(chan string)
+	requested := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		requested[id] = true
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT id,source_id FROM channels ORDER BY source_id,created_at`)
+	if err != nil {
+		log.Printf("读取渠道探测队列失败: %v", err)
+		return
+	}
+	bySource := map[string][]string{}
+	for rows.Next() {
+		var id, sourceID string
+		if rows.Scan(&id, &sourceID) == nil && requested[id] {
+			bySource[sourceID] = append(bySource[sourceID], id)
+		}
+	}
+	_ = rows.Close()
+	queues := make([][]string, 0, len(bySource))
+	for _, queue := range bySource {
+		queues = append(queues, queue)
+	}
+	if len(queues) == 0 {
+		return
+	}
+	jobs := make(chan []string)
 	var workers sync.WaitGroup
-	for worker := 0; worker < min(maxConcurrentProbes, len(ids)); worker++ {
+	for worker := 0; worker < min(maxConcurrentProbes, len(queues)); worker++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for id := range jobs {
-				if err := a.probeChannel(ctx, id); err != nil {
-					log.Printf("渠道 %s 探测失败: %v", id, err)
+			for queue := range jobs {
+				for _, id := range queue {
+					if err := a.probeChannel(ctx, id); err != nil {
+						log.Printf("渠道 %s 探测失败: %v", id, err)
+					}
 				}
 			}
 		}()
 	}
-	for _, id := range ids {
+	for _, queue := range queues {
 		select {
 		case <-ctx.Done():
 			close(jobs)
 			workers.Wait()
 			return
-		case jobs <- id:
+		case jobs <- queue:
 		}
 	}
 	close(jobs)
@@ -350,6 +376,7 @@ type managedPolicyCandidate struct {
 	Priority                                                         int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
 	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures int
+	ConfirmationFailures                                             int
 }
 
 const policyMetricWindowDays = 7
@@ -374,11 +401,13 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	}
 	defer rows.Close()
 	items := []managedPolicyCandidate{}
+	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
 		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
+		item.ConfirmationFailures = confirmationFailures
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -432,7 +461,8 @@ func policyModeText(mode string) string {
 func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []string {
 	config = normalizePolicyConfig(config)
 	reasons := []string{}
-	if item.State != "HEALTHY" {
+	unconfirmed := unconfirmedProbeFailure(item)
+	if item.State != "HEALTHY" && !unconfirmed {
 		reasons = append(reasons, "渠道状态为 "+item.State+"："+item.StateReason)
 	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
@@ -442,7 +472,7 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	} else if !config.AllowEqualMultiplier && item.SourceMultiplier.Float64 >= item.TargetMultiplier.Float64-multiplierComparisonTolerance {
 		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 与目标分组倍率 %.4fx 相同，策略未允许等倍率账号参与", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
 	}
-	if item.Samples < config.MinSamples {
+	if item.Samples < config.MinSamples && !(item.Schedulable && unconfirmed) {
 		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
 	}
 	if !policySuccessQualified(item, config) {
@@ -468,10 +498,21 @@ func policyMultiplierQualified(item managedPolicyCandidate, config policyConfig)
 }
 
 func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bool {
+	if item.Schedulable && unconfirmedProbeFailure(item) {
+		return true
+	}
 	if !item.Schedulable {
 		return item.Samples >= config.MinSamples && item.RecentSuccesses >= recoverySuccessSamples
 	}
 	return (item.SuccessRate.Valid && item.SuccessRate.Float64 >= config.MinSuccessRate) || (item.Samples >= config.MinSamples && item.RecentSuccesses >= recoverySuccessSamples)
+}
+
+func unconfirmedProbeFailure(item managedPolicyCandidate) bool {
+	limit := item.ConfirmationFailures
+	if limit < 1 {
+		limit = 3
+	}
+	return item.ConsecutiveFailures > 0 && item.ConsecutiveFailures < limit
 }
 
 func stableKey(values ...string) string {

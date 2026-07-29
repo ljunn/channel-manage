@@ -83,6 +83,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier NUMERIC(14,6)`,
 		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier_captured_at TIMESTAMPTZ`,
 		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
+		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS models JSONB NOT NULL DEFAULT '[]'::jsonb`,
+		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS probe_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE target_groups DROP COLUMN IF EXISTS protected_best_priority`,
 		`DROP TABLE IF EXISTS protected_accounts`,
 		`CREATE TABLE IF NOT EXISTS channels (

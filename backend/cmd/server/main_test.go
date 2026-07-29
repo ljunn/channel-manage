@@ -703,6 +703,28 @@ func TestSelectFirstTokenProbeModelSkipsNonTextModels(t *testing.T) {
 	}
 }
 
+func TestTargetGroupProbeModelsKeepsOnlyPlatformTextModels(t *testing.T) {
+	record := map[string]any{"models_list_config": map[string]any{"models": []any{"deepseek-v3", "codex-auto-review", "gpt-image-1", "gpt-5.5", "gpt-5.4"}}}
+	models := targetGroupProbeModels(record, "openai")
+	if !reflect.DeepEqual(models, []string{"gpt-5.5", "gpt-5.4"}) {
+		t.Fatalf("probe models=%#v", models)
+	}
+	if got := preferredProbeModel("openai", models); got != "gpt-5.4" {
+		t.Fatalf("preferred probe model=%q", got)
+	}
+}
+
+func TestUnconfirmedProbeFailureKeepsScheduledAccountEligible(t *testing.T) {
+	candidate := eligiblePolicyCandidate("warming", .2, 120)
+	candidate.Schedulable = true
+	candidate.ConsecutiveFailures = 1
+	candidate.ConfirmationFailures = 3
+	candidate.SuccessRate = sql.NullFloat64{Float64: 0, Valid: true}
+	if reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5}); len(reasons) != 0 {
+		t.Fatalf("unconfirmed failure stopped scheduling: %#v", reasons)
+	}
+}
+
 func TestMeasureFirstTokenUsesStreamingGeneration(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" || r.Method != http.MethodPost {

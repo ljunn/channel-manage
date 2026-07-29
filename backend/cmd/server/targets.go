@@ -135,7 +135,8 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		remoteID := strconv.Itoa(int(idNumber))
 		multiplier := sub2APIGroupMultiplier(record, nil, remoteID)
 		platform := managedPlatform(text(record["platform"], "openai"))
-		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,platform,multiplier,multiplier_captured_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,platform=excluded.platform,multiplier=excluded.multiplier,multiplier_captured_at=now(),updated_at=now()`, id, remoteID, text(record["name"], remoteID), platform, multiplier)
+		models := targetGroupProbeModels(record, platform)
+		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,platform,multiplier,multiplier_captured_at,models,updated_at) VALUES($1,$2,$3,$4,$5,now(),$6,now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,platform=excluded.platform,multiplier=excluded.multiplier,multiplier_captured_at=now(),models=excluded.models,updated_at=now()`, id, remoteID, text(record["name"], remoteID), platform, multiplier, jsonValue(models))
 		if err != nil {
 			return err
 		}
@@ -145,6 +146,9 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if err = a.ensureTargetProbeModels(ctx, id); err != nil {
 		return err
 	}
 	a.resolveEvent(ctx, "target-sync:"+id)
@@ -495,21 +499,21 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 		if err := a.ensureTargetMultiplierCacheForRead(r.Context(), id); err != nil {
 			return err
 		}
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,platform,multiplier,multiplier_captured_at,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,platform,multiplier,multiplier_captured_at,models,probe_model,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		items := []map[string]any{}
 		for rows.Next() {
-			var groupID, remoteID, name, platform string
+			var groupID, remoteID, name, platform, models, probeModel string
 			var multiplier sql.NullFloat64
 			var multiplierCaptured sql.NullTime
 			var updated time.Time
-			if err := rows.Scan(&groupID, &remoteID, &name, &platform, &multiplier, &multiplierCaptured, &updated); err != nil {
+			if err := rows.Scan(&groupID, &remoteID, &name, &platform, &multiplier, &multiplierCaptured, &models, &probeModel, &updated); err != nil {
 				return err
 			}
-			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "platform": platform, "multiplier": nullableFloat(multiplier), "multiplierCapturedAt": nullableTime(multiplierCaptured), "updatedAt": updated})
+			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "platform": platform, "multiplier": nullableFloat(multiplier), "models": json.RawMessage(models), "probeModel": probeModel, "multiplierCapturedAt": nullableTime(multiplierCaptured), "updatedAt": updated})
 		}
 		writeData(w, items)
 		return nil

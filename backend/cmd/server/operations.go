@@ -101,21 +101,24 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	slowFirstToken := false
 	if managed {
 		probeKind = "ACTIVE"
-		model := selectFirstTokenProbeModel(models)
-		if model == "" {
-			requestErr = fmt.Errorf("没有可用于首响抽样的文本模型")
+		firstTokenMs, probeModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
+		if len(probeModels) == 0 {
+			requestErr = sampleErr
 			errorType = "PROBE_MODEL_UNAVAILABLE"
-			summary = requestErr.Error()
+			if requestErr == nil {
+				requestErr = fmt.Errorf("没有已配置的分组测试模型")
+			}
+			summary = truncate(requestErr.Error(), 200)
 			latency = 0
 		} else {
-			firstTokenMs, sampleErr := a.measureFirstToken(ctx, sourceBase, string(keyBytes), model)
 			latency = firstTokenMs
 			firstTokenValue = firstTokenMs
 			requestErr = sampleErr
 			slowFirstToken = firstTokenMs > maxFirstTokenMs
+			modelLabel := strings.Join(probeModels, "、")
 			if slowFirstToken {
 				errorType = "FIRST_TOKEN_TOO_SLOW"
-				summary = fmt.Sprintf("流式抽样首 Token %.2f 秒超过 60 秒", float64(firstTokenMs)/1000)
+				summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
 			} else if sampleErr != nil {
 				errorType, summary = classifyProbeFailure(sampleErr)
 				if errorType != "BALANCE_EXHAUSTED" {
@@ -123,7 +126,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				}
 			} else {
 				errorType = ""
-				summary = fmt.Sprintf("流式抽样首 Token %.2f 秒", float64(firstTokenMs)/1000)
+				summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
 			}
 		}
 	}
@@ -152,7 +155,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 		var businessRequests, businessErrors int
 		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0),COALESCE(sum(errors),0) FROM metric_buckets WHERE channel_id=$1 AND window_start>now()-$2*interval '1 minute'`, id, windowMinutes).Scan(&businessRequests, &businessErrors)
 		businessConfirmed := businessRequests >= minSamples && businessErrors*100 >= businessRequests*errorThreshold
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=now(),score=0 WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures)
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' WHEN $5 THEN 'HEALTHY' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures, managed)
 	}
 	if err != nil {
 		return err
