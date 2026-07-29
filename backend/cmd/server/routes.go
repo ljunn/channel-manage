@@ -154,6 +154,41 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		writeData(w, value)
 		return nil
 	}
+	if method == http.MethodGet && path == "/system/version" {
+		writeData(w, updateSystemInfo())
+		return nil
+	}
+	if method == http.MethodGet && path == "/system/check-updates" {
+		value, err := a.checkSystemUpdate(r.Context(), r.URL.Query().Get("force") == "true")
+		if err != nil {
+			return err
+		}
+		writeData(w, value)
+		return nil
+	}
+	if method == http.MethodPost && path == "/system/update" {
+		value, err := a.performSystemUpdate(r.Context())
+		if err != nil {
+			return err
+		}
+		writeData(w, value)
+		return nil
+	}
+	if method == http.MethodPost && path == "/system/rollback" {
+		if err := rollbackSystemUpdate(); err != nil {
+			return err
+		}
+		writeData(w, map[string]any{"rolledBack": true, "needRestart": true})
+		return nil
+	}
+	if method == http.MethodPost && path == "/system/restart" {
+		if env("DEPLOYMENT_MODE", "docker") != "docker" {
+			return &apiError{409, "RESTART_UNSUPPORTED", "当前部署方式不支持网页重启"}
+		}
+		writeData(w, map[string]any{"restarting": true})
+		restartSystem()
+		return nil
+	}
 	if method == http.MethodPatch && path == "/settings" {
 		return a.saveSettings(w, r)
 	}

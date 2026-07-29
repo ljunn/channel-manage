@@ -254,6 +254,18 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .settings-section > header { display: flex; align-items: center; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--line-soft); color: var(--teal-700); }
 .settings-section > header > .btn { margin-left: auto; }
 .settings-section h2 { color: var(--ink); font-size: 14px; }
+.settings-section > header > div { display: grid; gap: 2px; }
+.update-settings { grid-column: 1/-1; }
+.version-grid { display: grid; grid-template-columns: 1fr 1fr; margin-top: 15px; border: 1px solid var(--line-soft); border-radius: 7px; }
+.version-grid > div { display: grid; gap: 4px; padding: 14px 16px; }
+.version-grid > div:first-child { border-right: 1px solid var(--line-soft); }
+.version-grid span { color: var(--ink-400); font-size: 11px; }
+.version-grid strong { font: 700 18px var(--mono); }
+.version-grid small { font-size: 10px; }
+.release-note { display: grid; gap: 7px; margin-top: 12px; padding: 12px 14px; border-left: 3px solid var(--teal-500); background: var(--teal-50); }
+.release-note strong { font-size: 12px; }
+.release-note p { max-height: 100px; overflow: auto; color: var(--muted); font-size: 11px; white-space: pre-line; }
+.update-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 13px; }
 .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 15px 0; border-bottom: 1px solid var(--line-soft); }
 .toggle-row > div { display: grid; gap: 4px; }
 .toggle-row strong { font-size: 12px; }
@@ -436,6 +448,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .table-wrap .has-actions th:last-child { z-index: 4; }
   .table-wrap .has-actions td:last-child { z-index: 1; background: var(--paper); box-shadow: -8px 0 10px -12px rgba(28,43,51,.7); }
   .form-grid, .modal-form { grid-template-columns: 1fr; }
+  .version-grid { grid-template-columns: 1fr; }
+  .version-grid > div:first-child { border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .update-actions { align-items: stretch; flex-direction: column; }
   .form-grid input, .modal-form input, .modal-form select { height: 44px; }
   .modal-form .full { grid-column: 1; }
   .modal-form fieldset { grid-template-columns: 1fr; }

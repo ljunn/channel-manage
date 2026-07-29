@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   Activity, AlertTriangle, ArrowRight, BarChart3, Bot, Check, ChevronRight, CircleDollarSign, ClipboardList,
-  Database, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
+  Database, Download, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
 import ModalShell from './components/ModalShell.vue'
@@ -32,6 +32,10 @@ const form = reactive({})
 const marketMetric = ref('average')
 const marketGroup = ref('all')
 const marketTab = ref('low')
+const systemVersion = reactive({currentVersion:'',buildType:'',repository:'',updateSupported:false,restartSupported:false,rollbackAvailable:false})
+const updateInfo = reactive({latestVersion:'',hasUpdate:false,name:'',body:'',htmlUrl:'',publishedAt:''})
+const updateBusy = ref(false)
+const updateReady = ref(false)
 
 const nav = [
   { label: '经营视图', items: [['/overview','运营总览',Gauge],['/market','市场大盘',CircleDollarSign],['/sources','数据源',Database]] },
@@ -114,7 +118,7 @@ async function loadPage(){
     else if(path==='/scheduling') data.actions=await api('/action-intents')
     else if(path==='/events') data.events=await api('/events')
     else if(path==='/audit') data.audit=await api('/audit-logs')
-    else if(path==='/settings') [data.settings,data.notifications]=await Promise.all([api('/settings'),api('/notification-channels')])
+    else if(path==='/settings') { const [settings,notifications,version]=await Promise.all([api('/settings'),api('/notification-channels'),api('/system/version')]);data.settings=settings;data.notifications=notifications;Object.assign(systemVersion,version) }
   }catch(reason){showError(reason)}finally{loading.value=false}
 }
 
@@ -162,6 +166,11 @@ async function channelAct(row,act){await action(()=>api(`/channels/${row.id}/${a
 async function saveSettings(){const payload={};for(const key of ['shadow_mode','emergency_freeze'])payload[key]=!!data.settings[key];for(const key of ['probe_interval_seconds','scan_interval_seconds','max_daily_probe_cost_usd','min_healthy_channels','confirmation_failures','metric_window_minutes','min_error_samples','error_rate_threshold'])payload[key]=Number(data.settings[key]);await action(()=>api('/settings',{method:'PATCH',body:body(payload)}),'系统设置已保存')}
 async function createNotification(){await submit(()=>api('/notification-channels',{method:'POST',body:body({name:form.name,apiKey:form.apiKey,fromEmail:form.fromEmail,toEmail:form.toEmail})}),'通知渠道已保存')}
 async function testNotification(row){await action(()=>api(`/notification-channels/${row.id}/test`,{method:'POST'}),'测试邮件已发送')}
+async function checkUpdate(){updateBusy.value=true;clearMessages();try{Object.assign(updateInfo,await api('/system/check-updates?force=true',{timeout:60000}));notice.value=updateInfo.hasUpdate?`发现新版本 v${updateInfo.latestVersion}`:'当前已是最新版本'}catch(reason){showError(reason)}finally{updateBusy.value=false}}
+async function installUpdate(){updateBusy.value=true;clearMessages();try{const result=await api('/system/update',{method:'POST',body:'{}',timeout:900000});if(result.alreadyUpToDate){notice.value='当前已是最新版本';return}updateReady.value=true;notice.value=`v${result.version} 已安装，重启后生效`;Object.assign(systemVersion,await api('/system/version'))}catch(reason){showError(reason)}finally{updateBusy.value=false}}
+async function rollbackUpdate(){if(!confirm('确认回滚到上次在线更新前的版本并重启服务？'))return;updateBusy.value=true;clearMessages();try{await api('/system/rollback',{method:'POST',body:'{}'});await restartUpdatedService()}catch(reason){showError(reason);updateBusy.value=false}}
+async function restartUpdatedService(){updateBusy.value=true;clearMessages();try{await api('/system/restart',{method:'POST',body:'{}'});notice.value='服务正在重启';await waitForRestart()}catch(reason){showError(reason);updateBusy.value=false}}
+async function waitForRestart(){for(let attempt=0;attempt<60;attempt++){await new Promise(resolve=>setTimeout(resolve,2000));try{const response=await fetch('/health',{cache:'no-store'});if(response.ok){location.reload();return}}catch{}}error.value='服务重启时间过长，请稍后刷新页面';updateBusy.value=false}
 async function updateAccount(){
   clearMessages()
   if(form.newPassword && form.newPassword!==form.confirmPassword){showError(new Error('两次输入的新密码不一致'));return}
@@ -290,6 +299,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
           <div class="page-head"><div><h1>系统设置</h1><span>{{ data.settings.buildType }} · {{ data.settings.githubRepo }}</span></div><button class="btn primary" @click="saveSettings"><Check :size="16"/>保存设置</button></div>
           <div class="settings-layout"><section class="settings-section"><header><ShieldCheck :size="20"/><div><h2>安全闸门</h2></div></header><label class="toggle-row"><div><strong>影子模式</strong><small>开启时自动策略只评估，不写入目标节点</small></div><input v-model="data.settings.shadow_mode" type="checkbox"/><span/></label><label class="toggle-row danger-row"><div><strong>紧急冻结</strong><small>保存后阻止全部远程写动作</small></div><input v-model="data.settings.emergency_freeze" type="checkbox"/><span/></label></section>
           <section class="settings-section"><header><Activity :size="20"/><div><h2>采集与判定</h2></div></header><div class="form-grid"><label><span>探测周期（秒）</span><input v-model="data.settings.probe_interval_seconds" type="number" min="60"/></label><label><span>扫描周期（秒）</span><input v-model="data.settings.scan_interval_seconds" type="number" min="60"/></label><label><span>确认失败次数</span><input v-model="data.settings.confirmation_failures" type="number" min="1"/></label><label><span>指标窗口（分钟）</span><input v-model="data.settings.metric_window_minutes" type="number" min="1"/></label><label><span>最少异常样本</span><input v-model="data.settings.min_error_samples" type="number" min="1"/></label><label><span>异常率阈值（%）</span><input v-model="data.settings.error_rate_threshold" type="number" min="1" max="100"/></label></div></section>
+          <section class="settings-section update-settings"><header><Download :size="20"/><div><h2>在线更新</h2><small>从 GitHub Release 安装正式版本</small></div><button class="btn small" :disabled="updateBusy||!systemVersion.updateSupported" @click="checkUpdate"><RefreshCw :size="14" :class="{spinning:updateBusy}"/>检查更新</button></header><div class="version-grid"><div><span>当前版本</span><strong>v{{ systemVersion.currentVersion||appVersion }}</strong><small>{{ systemVersion.buildType==='release'?'正式构建':'开发构建' }}</small></div><div><span>最新版本</span><strong>{{ updateInfo.latestVersion?`v${updateInfo.latestVersion}`:'尚未检查' }}</strong><small>{{ updateInfo.hasUpdate?'发现可用更新':updateInfo.latestVersion?'当前已是最新版本':systemVersion.repository }}</small></div></div><div v-if="updateInfo.latestVersion" class="release-note"><strong>{{ updateInfo.name||`渠道管家 v${updateInfo.latestVersion}` }}</strong><p>{{ updateInfo.body||'该版本没有更新说明' }}</p></div><div class="update-actions"><button v-if="updateInfo.hasUpdate&&!updateReady" class="btn primary" :disabled="updateBusy" @click="installUpdate"><Download :size="15"/>{{ updateBusy?'正在下载并安装':'下载并安装' }}</button><button v-if="updateReady" class="btn primary" :disabled="updateBusy||!systemVersion.restartSupported" @click="restartUpdatedService"><RefreshCw :size="15"/>立即重启</button><button v-if="systemVersion.rollbackAvailable" class="btn" :disabled="updateBusy" @click="rollbackUpdate">回滚上一版本</button></div></section>
           <section class="settings-section notification-settings"><header><UserCog :size="20"/><div><h2>邮件通知</h2></div><button class="btn primary small" @click="open('notification')"><Plus :size="14"/>添加</button></header><StateBlock v-if="!data.notifications.length" title="暂无通知渠道"/><div v-else class="notification-list"><div v-for="row in data.notifications" :key="row.id"><div><strong>{{ row.name }}</strong><small>{{ row.recipientHint }} · {{ row.lastTestAt?date(row.lastTestAt):'未测试' }}</small></div><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span><button class="btn small" @click="testNotification(row)">测试</button></div></div></section></div>
         </template>
       </main>

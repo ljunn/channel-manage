@@ -30,6 +30,9 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      DEPLOYMENT_MODE: docker
+      UPDATE_GITHUB_REPO: ${UPDATE_GITHUB_REPO:-ljunn/channel-manage}
+      UPDATE_GITHUB_TOKEN: ${UPDATE_GITHUB_TOKEN:-}
       TZ: ${TZ:-Asia/Shanghai}
     ports: ["${APP_PORT:-4473}:8080"]
     restart: unless-stopped

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -202,6 +204,46 @@ func TestMarketQualityScoreUsesAvailableMetrics(t *testing.T) {
 	}
 	if score := marketQualityScore(sql.NullFloat64{Float64: 40, Valid: true}, sql.NullFloat64{}, sql.NullFloat64{}); score != 40 {
 		t.Fatalf("current score fallback=%v, want 40", score)
+	}
+}
+
+func TestCompareReleaseVersions(t *testing.T) {
+	if compareReleaseVersions("0.1.19", "0.1.20") >= 0 || compareReleaseVersions("v1.2.3", "1.2.3") != 0 || compareReleaseVersions("2.0.0", "1.9.9") <= 0 {
+		t.Fatal("release version comparison is incorrect")
+	}
+}
+
+func TestUpdateRepositoryAndReleaseURLValidation(t *testing.T) {
+	if !validRepository("ljunn/channel-manage") || validRepository("ljunn/channel/manage") || validRepository("ljunn/channel manage") {
+		t.Fatal("repository validation is incorrect")
+	}
+	for _, value := range []string{"https://github.com/ljunn/channel-manage/releases/download/v1/a.tar.gz", "https://objects.githubusercontent.com/release/a"} {
+		if err := validateReleaseURL(value); err != nil {
+			t.Fatalf("trusted release URL rejected: %v", err)
+		}
+	}
+	if err := validateReleaseURL("https://example.com/update.tar.gz"); err == nil {
+		t.Fatal("untrusted release URL was accepted")
+	}
+}
+
+func TestVerifyUpdateChecksum(t *testing.T) {
+	directory := t.TempDir()
+	archive := filepath.Join(directory, "release.tar.gz")
+	checksums := filepath.Join(directory, "checksums.txt")
+	content := []byte("verified release")
+	if err := os.WriteFile(archive, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(content)
+	if err := os.WriteFile(checksums, []byte(fmt.Sprintf("%x  channel-manage_1.0.0_linux_amd64.tar.gz\n", hash)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyUpdateChecksum(archive, checksums, "channel-manage_1.0.0_linux_amd64.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyUpdateChecksum(archive, checksums, "wrong.tar.gz"); err == nil {
+		t.Fatal("missing checksum entry was accepted")
 	}
 }
 

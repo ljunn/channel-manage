@@ -28,7 +28,9 @@ COPY --from=runtime-files /etc/passwd /etc/passwd
 COPY --from=runtime-files /etc/group /etc/group
 COPY --from=runtime-files /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=runtime-files /usr/share/zoneinfo /usr/share/zoneinfo
-COPY --from=server /out/channel-manage /usr/local/bin/channel-manage
+WORKDIR /app
+RUN mkdir -p /app && chown app:app /app
+COPY --from=server --chown=app:app /out/channel-manage /app/channel-manage
 USER app
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/channel-manage"]
+ENTRYPOINT ["/app/channel-manage"]
