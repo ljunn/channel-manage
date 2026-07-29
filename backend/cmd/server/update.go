@@ -90,8 +90,17 @@ func executablePath() string {
 }
 
 func updateSystemInfo() map[string]any {
-	_, rollbackErr := os.Stat(executablePath() + ".backup")
-	return map[string]any{"currentVersion": strings.TrimPrefix(Version, "v"), "buildType": BuildType, "repository": configuredUpdateRepo(), "updateSupported": updateSupported(), "restartSupported": env("DEPLOYMENT_MODE", "docker") == "docker", "rollbackAvailable": rollbackErr == nil}
+	executable := executablePath()
+	_, rollbackErr := os.Stat(executable + ".backup")
+	pendingVersion := ""
+	if content, err := os.ReadFile(executable + ".pending"); err == nil {
+		pendingVersion = strings.TrimSpace(string(content))
+		if compareReleaseVersions(Version, pendingVersion) == 0 {
+			_ = os.Remove(executable + ".pending")
+			pendingVersion = ""
+		}
+	}
+	return map[string]any{"currentVersion": strings.TrimPrefix(Version, "v"), "buildType": BuildType, "repository": configuredUpdateRepo(), "updateSupported": updateSupported(), "restartSupported": env("DEPLOYMENT_MODE", "docker") == "docker", "rollbackAvailable": rollbackErr == nil, "restartPending": pendingVersion != "", "pendingVersion": pendingVersion}
 }
 
 func (a *App) checkSystemUpdate(ctx context.Context, force bool) (releaseUpdateInfo, error) {
@@ -217,6 +226,7 @@ func applyReleaseBinary(ctx context.Context, info releaseUpdateInfo) error {
 		_ = os.Rename(backup, executable)
 		return &apiError{500, "UPDATE_REPLACE_FAILED", "替换程序失败，已恢复原版本"}
 	}
+	_ = os.WriteFile(executable+".pending", []byte(info.LatestVersion+"\n"), 0600)
 	return nil
 }
 
@@ -355,6 +365,7 @@ func rollbackSystemUpdate() error {
 		_ = os.Rename(current, executable)
 		return &apiError{500, "ROLLBACK_FAILED", "回滚失败，已恢复当前版本"}
 	}
+	_ = os.Remove(executable + ".pending")
 	return nil
 }
 

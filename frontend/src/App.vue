@@ -32,7 +32,7 @@ const form = reactive({})
 const marketMetric = ref('average')
 const marketGroup = ref('all')
 const marketTab = ref('low')
-const systemVersion = reactive({currentVersion:'',buildType:'',repository:'',updateSupported:false,restartSupported:false,rollbackAvailable:false})
+const systemVersion = reactive({currentVersion:'',buildType:'',repository:'',updateSupported:false,restartSupported:false,rollbackAvailable:false,restartPending:false,pendingVersion:''})
 const updateInfo = reactive({latestVersion:'',hasUpdate:false,name:'',body:'',htmlUrl:'',publishedAt:''})
 const updateBusy = ref(false)
 const updateReady = ref(false)
@@ -118,7 +118,7 @@ async function loadPage(){
     else if(path==='/scheduling') data.actions=await api('/action-intents')
     else if(path==='/events') data.events=await api('/events')
     else if(path==='/audit') data.audit=await api('/audit-logs')
-    else if(path==='/settings') { const [settings,notifications,version]=await Promise.all([api('/settings'),api('/notification-channels'),api('/system/version')]);data.settings=settings;data.notifications=notifications;Object.assign(systemVersion,version) }
+    else if(path==='/settings') { const [settings,notifications,version]=await Promise.all([api('/settings'),api('/notification-channels'),api('/system/version')]);data.settings=settings;data.notifications=notifications;Object.assign(systemVersion,version);updateReady.value=!!version.restartPending }
   }catch(reason){showError(reason)}finally{loading.value=false}
 }
 
