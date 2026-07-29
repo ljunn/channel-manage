@@ -278,7 +278,7 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		}
 	}
 	if err != nil {
-		_, _ = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, id, truncate(err.Error(), 500))
+		_, _ = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='FAILED',last_scan_at=now(),last_error=$2,updated_at=now() WHERE id=$1`, id, truncate(err.Error(), 500))
 		a.openEvent(ctx, "P1", "SOURCE_SCAN", "数据源扫描失败", source.Name+": "+err.Error(), "source-scan:"+id)
 		return err
 	}

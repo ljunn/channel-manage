@@ -113,6 +113,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT 'GLOBAL', scope_id UUID,
 			status TEXT NOT NULL DEFAULT 'DRAFT', active_version INT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`UPDATE policies p SET scope_type='TARGET_GROUP',scope_id=tg.id,updated_at=now() FROM target_groups tg WHERE p.scope_type='GLOBAL' AND p.scope_id IS NULL AND p.name=tg.name AND (SELECT count(*) FROM target_groups matches WHERE matches.name=p.name)=1`,
+		`UPDATE policies SET status='DRAFT',active_version=NULL,updated_at=now() WHERE scope_type<>'TARGET_GROUP' OR scope_id IS NULL`,
 		`CREATE TABLE IF NOT EXISTS policy_versions (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), policy_id UUID NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
 			version INT NOT NULL, config JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(policy_id, version)
