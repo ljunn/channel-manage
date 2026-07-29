@@ -1,0 +1,28 @@
+<script setup>
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Chart } from 'chart.js/auto'
+
+const props = defineProps({ groups:{type:Array,required:true}, points:{type:Array,required:true}, metric:{type:String,required:true}, selectedGroup:{type:String,default:'all'} })
+const canvas=ref(null)
+let chart
+const palette=['#117c73','#2869b9','#b63d45','#925b0b','#6956bd','#237a52','#b04a76','#426b78','#8a6830','#4f6fb0']
+const activeGroups=computed(()=>props.selectedGroup==='all'?props.groups:props.groups.filter(group=>group.id===props.selectedGroup))
+const metricLabels={average:'平均值',median:'中位数',minimum:'最低值'}
+
+function render(){
+  if(!canvas.value)return
+  chart?.destroy()
+  const datasets=activeGroups.value.map((group,index)=>({label:group.name,data:props.points.filter(point=>point.targetGroupId===group.id&&point[props.metric]!=null).map(point=>({x:new Date(point.capturedAt).getTime(),y:Number(point[props.metric])})),borderColor:palette[index%palette.length],backgroundColor:palette[index%palette.length],borderWidth:2,pointRadius:2.5,pointHoverRadius:5,tension:.24,spanGaps:true}))
+  chart=new Chart(canvas.value,{type:'line',data:{datasets},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:activeGroups.value.length>1,position:'bottom',labels:{boxWidth:10,boxHeight:10,usePointStyle:true,padding:18,font:{size:11}}},tooltip:{callbacks:{label:context=>`${context.dataset.label} · ${metricLabels[props.metric]} ×${context.parsed.y.toFixed(4)}`}}},scales:{x:{type:'linear',grid:{display:false},ticks:{maxTicksLimit:7,callback:value=>new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit'}).format(new Date(value))},title:{display:true,text:'时间'}},y:{beginAtZero:false,grid:{color:'#edf1f3'},ticks:{callback:value=>`×${Number(value).toFixed(2)}`},title:{display:true,text:'倍率'}}}}})
+}
+onMounted(render)
+watch(()=>[props.points,props.metric,props.selectedGroup,props.groups],render,{deep:true})
+onBeforeUnmount(()=>chart?.destroy())
+</script>
+
+<template><div class="trend-canvas"><canvas ref="canvas"/></div></template>
+
+<style scoped>
+.trend-canvas { position: relative; width: 100%; height: 360px; }
+@media (max-width: 760px) { .trend-canvas { height: 300px; } }
+</style>

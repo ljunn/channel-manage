@@ -43,6 +43,14 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		writeData(w, value)
 		return nil
 	}
+	if method == http.MethodGet && path == "/market/dashboard" {
+		value, err := a.marketDashboard(r.Context())
+		if err != nil {
+			return err
+		}
+		writeData(w, value)
+		return nil
+	}
 	if method == http.MethodGet && (path == "/market/price-history" || path == "/market/managed-price-history") {
 		value, err := a.marketHistory(r.Context())
 		if err != nil {

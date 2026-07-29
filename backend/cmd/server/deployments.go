@@ -117,14 +117,8 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		if committed {
 			return
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		for index := len(created) - 1; index >= 0; index-- {
-			for accountIndex := len(created[index].Accounts) - 1; accountIndex >= 0; accountIndex-- {
-				a.deleteRemoteManagedAccount(cleanupCtx, target.BaseURL, targetSession, created[index].Accounts[accountIndex].RemoteID)
-			}
-			a.deleteGeneratedRemoteKey(cleanupCtx, source.BaseURL, source.Platform, sourceSession, created[index].Key.ID)
-		}
+		rollback := append([]createdDeployment(nil), created...)
+		go a.rollbackDeployment(rollback, source.BaseURL, source.Platform, sourceSession, target.BaseURL, targetSession)
 	}()
 
 	for _, group := range sourceGroups {
@@ -192,6 +186,18 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	}
 	writeData(w, map[string]any{"created": len(result), "sourceKeysCreated": len(created), "items": result, "schedulable": false})
 	return nil
+}
+
+func (a *App) rollbackDeployment(created []createdDeployment, sourceBase, sourcePlatform string, sourceSession remoteSession, targetBase string, targetSession remoteSession) {
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cleanupCancel()
+	for index := len(created) - 1; index >= 0; index-- {
+		for accountIndex := len(created[index].Accounts) - 1; accountIndex >= 0; accountIndex-- {
+			a.deleteRemoteManagedAccount(cleanupCtx, targetBase, targetSession, created[index].Accounts[accountIndex].RemoteID)
+		}
+		a.deleteGeneratedRemoteKey(cleanupCtx, sourceBase, sourcePlatform, sourceSession, created[index].Key.ID)
+	}
+	log.Printf("自动绑定回滚完成: %d 个源分组", len(created))
 }
 
 func (a *App) validateDeploymentSourceGroups(ctx context.Context, sourceID, targetID string, ids []string) ([]deploymentSourceGroup, error) {
@@ -460,7 +466,11 @@ func managedAccountName(sourceName, sourceGroupName, targetGroupName string, tar
 func deploymentError(code, groupName string, err error) error {
 	log.Printf("自动绑定失败 [%s] %s: %v", code, groupName, err)
 	if apiErr, ok := err.(*apiError); ok {
-		return &apiError{Status: apiErr.Status, Code: code, Message: groupName + "：" + apiErr.Message}
+		message := apiErr.Message
+		if strings.Contains(strings.ToUpper(message), "INSUFFICIENT_BALANCE") {
+			message = "源站账户余额不足，无法验证新建专用 Key 的可用模型"
+		}
+		return &apiError{Status: apiErr.Status, Code: code, Message: groupName + "：" + message}
 	}
 	return &apiError{Status: 502, Code: code, Message: groupName + "：" + err.Error()}
 }

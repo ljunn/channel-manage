@@ -185,6 +185,26 @@ func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testin
 	}
 }
 
+func TestDeploymentErrorExplainsInsufficientBalance(t *testing.T) {
+	err := deploymentError("UPSTREAM_MODEL_READ_FAILED", "Pro分组", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "INSUFFICIENT_BALANCE: Insufficient account balance"})
+	apiErr, ok := err.(*apiError)
+	if !ok || !strings.Contains(apiErr.Message, "源站账户余额不足") || !strings.Contains(apiErr.Message, "Pro分组") {
+		t.Fatalf("unexpected deployment error: %#v", err)
+	}
+}
+
+func TestMarketQualityScoreUsesAvailableMetrics(t *testing.T) {
+	if score := marketQualityScore(sql.NullFloat64{Float64: 40, Valid: true}, sql.NullFloat64{Float64: 80, Valid: true}, sql.NullFloat64{Float64: 100, Valid: true}); score != 90 {
+		t.Fatalf("combined score=%v, want 90", score)
+	}
+	if score := marketQualityScore(sql.NullFloat64{Float64: 40, Valid: true}, sql.NullFloat64{}, sql.NullFloat64{Float64: 75, Valid: true}); score != 75 {
+		t.Fatalf("business fallback=%v, want 75", score)
+	}
+	if score := marketQualityScore(sql.NullFloat64{Float64: 40, Valid: true}, sql.NullFloat64{}, sql.NullFloat64{}); score != 40 {
+		t.Fatalf("current score fallback=%v, want 40", score)
+	}
+}
+
 func TestSyncTargetAccountPriority(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/admin/accounts/42" {

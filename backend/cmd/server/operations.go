@@ -477,3 +477,127 @@ func (a *App) marketHistory(ctx context.Context) ([]map[string]any, error) {
 	}
 	return items, rows.Err()
 }
+
+func (a *App) marketDashboard(ctx context.Context) (map[string]any, error) {
+	groups, err := a.marketManagedGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	trend, err := a.marketManagedTrend(ctx)
+	if err != nil {
+		return nil, err
+	}
+	channels, err := a.marketManagedChannels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"groups": groups, "trend": trend, "channels": channels}, nil
+}
+
+func (a *App) marketManagedGroups(ctx context.Context) ([]map[string]any, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT tg.id,t.name,tg.name,count(DISTINCT c.id)
+		FROM managed_account_groups mag
+		JOIN managed_accounts m ON m.id=mag.managed_account_id
+		JOIN channels c ON c.id=m.channel_id
+		JOIN target_groups tg ON tg.id=mag.target_group_id
+		JOIN targets t ON t.id=tg.target_id
+		GROUP BY tg.id,t.name,tg.name ORDER BY t.name,tg.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, targetName, name string
+		var channelCount int
+		if err := rows.Scan(&id, &targetName, &name, &channelCount); err != nil {
+			return nil, err
+		}
+		items = append(items, map[string]any{"id": id, "targetName": targetName, "name": name, "channelCount": channelCount})
+	}
+	return items, rows.Err()
+}
+
+func (a *App) marketManagedTrend(ctx context.Context) ([]map[string]any, error) {
+	rows, err := a.db.QueryContext(ctx, `WITH managed_groups AS (
+			SELECT DISTINCT mag.target_group_id,c.source_group_id
+			FROM managed_account_groups mag
+			JOIN managed_accounts m ON m.id=mag.managed_account_id
+			JOIN channels c ON c.id=m.channel_id
+			WHERE c.source_group_id IS NOT NULL
+		), hourly_source AS (
+			SELECT DISTINCT ON (mg.target_group_id,gs.group_id,date_trunc('hour',gs.captured_at))
+				mg.target_group_id,gs.group_id,date_trunc('hour',gs.captured_at) AS bucket,gs.multiplier
+			FROM managed_groups mg JOIN group_samples gs ON gs.group_id=mg.source_group_id
+			WHERE gs.multiplier IS NOT NULL AND gs.captured_at>now()-interval '30 days'
+			ORDER BY mg.target_group_id,gs.group_id,date_trunc('hour',gs.captured_at),gs.captured_at DESC
+		)
+		SELECT target_group_id,bucket,avg(multiplier),percentile_cont(0.5) WITHIN GROUP (ORDER BY multiplier),min(multiplier),count(*)
+		FROM hourly_source GROUP BY target_group_id,bucket ORDER BY bucket,target_group_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var groupID string
+		var bucket time.Time
+		var average, median, minimum float64
+		var channelCount int
+		if err := rows.Scan(&groupID, &bucket, &average, &median, &minimum, &channelCount); err != nil {
+			return nil, err
+		}
+		items = append(items, map[string]any{"targetGroupId": groupID, "capturedAt": bucket, "average": average, "median": median, "minimum": minimum, "channelCount": channelCount})
+	}
+	return items, rows.Err()
+}
+
+func (a *App) marketManagedChannels(ctx context.Context) ([]map[string]any, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT ON (tg.id,c.id)
+		tg.id,c.id,s.name,COALESCE(g.name,'未关联分组'),g.multiplier,c.lifecycle_state,c.state_reason,c.score,c.state_changed_at,
+		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
+		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
+		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
+		(SELECT CASE WHEN COALESCE(sum(b.requests),0)=0 THEN NULL ELSE 100.0*(sum(b.requests)-sum(b.errors))/sum(b.requests) END FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-interval '7 days')
+		FROM managed_account_groups mag
+		JOIN managed_accounts m ON m.id=mag.managed_account_id
+		JOIN channels c ON c.id=m.channel_id
+		JOIN sources s ON s.id=c.source_id
+		LEFT JOIN source_groups g ON g.id=c.source_group_id
+		JOIN target_groups tg ON tg.id=mag.target_group_id
+		ORDER BY tg.id,c.id,m.created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var groupID, channelID, sourceName, sourceGroupName, state, reason string
+		var multiplier, currentScore, probeRate, businessRate, firstToken sql.NullFloat64
+		var probeSamples, businessSamples int
+		var changed time.Time
+		if err := rows.Scan(&groupID, &channelID, &sourceName, &sourceGroupName, &multiplier, &state, &reason, &currentScore, &changed, &probeSamples, &probeRate, &businessSamples, &businessRate, &firstToken); err != nil {
+			return nil, err
+		}
+		qualityScore := marketQualityScore(currentScore, probeRate, businessRate)
+		items = append(items, map[string]any{"targetGroupId": groupID, "id": channelID, "sourceName": sourceName, "sourceGroupName": sourceGroupName, "multiplier": nullableFloat(multiplier), "lifecycleState": state, "stateReason": reason, "qualityScore": qualityScore, "probeSuccessRate7d": nullableFloat(probeRate), "probeSamples7d": probeSamples, "businessSuccessRate7d": nullableFloat(businessRate), "businessSamples7d": businessSamples, "firstTokenP95Ms": nullableFloat(firstToken), "stateChangedAt": changed})
+	}
+	return items, rows.Err()
+}
+
+func marketQualityScore(current, probe, business sql.NullFloat64) float64 {
+	if probe.Valid && business.Valid {
+		return (probe.Float64 + business.Float64) / 2
+	}
+	if business.Valid {
+		return business.Float64
+	}
+	if probe.Valid {
+		return probe.Float64
+	}
+	if current.Valid {
+		return current.Float64
+	}
+	return 0
+}

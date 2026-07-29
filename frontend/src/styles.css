@@ -186,6 +186,32 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .market-ticker article:last-child { border-right: 0; }
 .market-ticker span { color: var(--ink-400); font-size: 12px; }
 .market-ticker strong { color: var(--ink); font: 700 22px var(--mono); }
+.market-head { align-items: end; }
+.market-group-select { min-width: min(360px,100%); display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+.market-group-select select { height: 40px; padding: 0 34px 0 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); }
+.market-trend-panel, .market-channel-panel { margin-bottom: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); box-shadow: var(--shadow-card); }
+.market-trend-panel > header { min-height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 17px; border-bottom: 1px solid var(--line-soft); }
+.market-trend-panel h2 { font-size: 15px; }
+.market-trend-panel header > div:first-child { display: grid; gap: 3px; }
+.market-trend-panel header small { font-size: 11px; }
+.segmented { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--soft); }
+.segmented button { min-width: 68px; height: 32px; padding: 0 10px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 12px; }
+.segmented button.active { background: var(--paper); color: var(--teal-700); font-weight: 600; box-shadow: 0 1px 4px rgba(28,43,51,.1); }
+.market-trend-panel .trend-canvas { padding: 16px 13px 8px; }
+.market-tabs { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+.market-tabs > div { align-self: stretch; display: flex; gap: 22px; }
+.market-tabs button { position: relative; border: 0; background: transparent; color: var(--muted); font-weight: 600; }
+.market-tabs button.active { color: var(--teal-700); }
+.market-tabs button.active::after { position: absolute; right: 0; bottom: 0; left: 0; height: 2px; content: ''; background: var(--teal-600); }
+.market-tabs > span { color: var(--ink-400); font-size: 11px; }
+.market-channel-list article { min-height: 72px; display: grid; grid-template-columns: 38px minmax(150px,1.3fr) repeat(4,minmax(90px,1fr)) auto; align-items: center; gap: 14px; padding: 11px 16px; border-bottom: 1px solid var(--line-soft); }
+.market-channel-list article:last-child { border-bottom: 0; }
+.market-channel-list article > div { min-width: 0; display: grid; gap: 2px; }
+.market-channel-list article > div > span { color: var(--ink-400); font-size: 10px; }
+.market-channel-list article > div > strong { font-size: 12px; }
+.market-channel-list article small { font-size: 10px; }
+.channel-rank { color: var(--ink-300); font: 700 12px var(--mono); }
+.channel-identity strong, .channel-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile-list, .policy-list { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
 .target-tile, .policy { padding: 17px; }
 .target-tile header { display: flex; align-items: center; gap: 11px; }
@@ -391,6 +417,17 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .market-ticker { grid-template-columns: 1fr 1fr; }
   .market-ticker article:nth-child(2) { border-right: 0; }
   .market-ticker article:nth-child(-n+2) { border-bottom: 1px solid var(--line-soft); }
+  .market-head { align-items: stretch; flex-direction: column; }
+  .market-group-select { width: 100%; min-width: 0; }
+  .market-trend-panel > header { align-items: stretch; flex-direction: column; }
+  .segmented { width: 100%; }
+  .segmented button { min-width: 0; flex: 1; }
+  .market-tabs { align-items: stretch; flex-direction: column; gap: 0; padding-top: 4px; }
+  .market-tabs > div { min-height: 48px; }
+  .market-tabs > span { padding-bottom: 9px; }
+  .market-channel-list article { grid-template-columns: 30px minmax(0,1fr) auto; gap: 9px 12px; }
+  .market-channel-list article > div:not(.channel-identity) { grid-column: 2; display: flex; align-items: baseline; gap: 7px; }
+  .market-channel-list article > .badge { grid-column: 3; grid-row: 1; }
   .table-wrap table { min-width: 720px; }
   .table-wrap th:first-child, .table-wrap td:first-child { position: sticky; left: 0; }
   .table-wrap th:first-child { z-index: 4; }

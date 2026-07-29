@@ -6,6 +6,7 @@ import {
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
 import ModalShell from './components/ModalShell.vue'
+import MarketTrendChart from './components/MarketTrendChart.vue'
 import PaginationBar from './components/PaginationBar.vue'
 import StateBlock from './components/StateBlock.vue'
 
@@ -22,12 +23,15 @@ const search = ref('')
 const page = ref(1)
 const pageSize = ref(15)
 const appVersion = ref('')
-const data = reactive({ summary: {}, sources: [], targets: [], channels: [], managed: [], market: [], history: [], policies: [], actions: [], events: [], audit: [], settings: {}, notifications: [] })
+const data = reactive({ summary: {}, sources: [], targets: [], channels: [], managed: [], market: {groups:[],trend:[],channels:[]}, policies: [], actions: [], events: [], audit: [], settings: {}, notifications: [] })
 const sourceDetail = ref(null)
 const selectedSource = ref('')
 const targetGroups = ref([])
 const policyTargetGroups = ref([])
 const form = reactive({})
+const marketMetric = ref('average')
+const marketGroup = ref('all')
+const marketTab = ref('low')
 
 const nav = [
   { label: '经营视图', items: [['/overview','运营总览',Gauge],['/market','市场大盘',CircleDollarSign],['/sources','数据源',Database]] },
@@ -37,7 +41,7 @@ const nav = [
 const routeNames = Object.fromEntries(nav.flatMap(group => group.items.map(([path,label]) => [path,label])))
 const pageTitle = computed(() => routeNames[route.value] || '渠道管家')
 const pageIcon = computed(() => nav.flatMap(group => group.items).find(([path]) => path === route.value)?.[2] || Gauge)
-const searchableRoutes = new Set(['/market','/sources','/scheduling','/channels','/managed','/targets','/policies','/events','/audit'])
+const searchableRoutes = new Set(['/sources','/scheduling','/channels','/managed','/targets','/policies','/events','/audit'])
 const showSearch = computed(() => searchableRoutes.has(route.value))
 const writableTargets = computed(() => data.targets.filter(item => item.writeEnabled))
 const selectedSourceGroups = computed(() => (sourceDetail.value?.groups||[]).filter(group => form.sourceGroupIDs?.includes(group.id)))
@@ -48,6 +52,16 @@ const filtered = items => !search.value ? items : items.filter(item => JSON.stri
 const paged = items => filtered(items).slice((page.value-1)*pageSize.value,page.value*pageSize.value)
 const filteredCount = items => filtered(items).length
 const ranking = index => (page.value-1)*pageSize.value+index+1
+const marketGroupChannels = computed(() => data.market.channels.filter(item=>marketGroup.value==='all'||item.targetGroupId===marketGroup.value))
+const marketRankedChannels = computed(() => marketGroupChannels.value.filter(item=>marketTab.value!=='stable'||(item.lifecycleState==='HEALTHY'&&Number(item.probeSamples7d||0)+Number(item.businessSamples7d||0)>0)).sort((a,b)=>marketTab.value==='stable'?(Number(b.qualityScore)-Number(a.qualityScore)||Number(b.probeSamples7d+b.businessSamples7d)-Number(a.probeSamples7d+a.businessSamples7d)):(Number(a.qualityScore)-Number(b.qualityScore))))
+const marketUniqueChannels = computed(() => new Set(marketGroupChannels.value.map(item=>item.id)).size)
+const marketLatestValue = computed(() => {
+  const points=data.market.trend.filter(item=>marketGroup.value==='all'||item.targetGroupId===marketGroup.value).filter(item=>item[marketMetric.value]!=null)
+  if(!points.length)return null
+  const latest=Math.max(...points.map(item=>new Date(item.capturedAt).getTime()))
+  const values=points.filter(item=>new Date(item.capturedAt).getTime()===latest).map(item=>Number(item[marketMetric.value]))
+  return values.reduce((sum,value)=>sum+value,0)/values.length
+})
 
 window.addEventListener('hashchange', () => { route.value = location.hash.slice(1) || '/overview'; mobileOpen.value = false })
 watch(route, () => { search.value=''; page.value=1; clearMessages(); if(token.value) void loadPage() })
@@ -71,7 +85,7 @@ async function api(path, init={}) {
   try { response = await fetch(`/api${path}`, { ...requestInit, headers, signal: AbortSignal.timeout(timeout) }) }
   catch (reason) { throw new Error(reason?.name === 'TimeoutError' ? '请求超时' : '无法连接服务') }
   const payload = await response.json().catch(() => ({}))
-  if (!response.ok) { if(response.status===401 && path!='/auth/login') logout(false); const fallback=response.status===502&&path.endsWith('/deploy')?'绑定请求被网关中断，系统已回滚未完成的数据，请重试':`请求失败 (${response.status})`; throw new Error(payload.error?.message || fallback) }
+  if (!response.ok) { if(response.status===401 && path!='/auth/login') logout(false); const fallback=response.status===502&&path.endsWith('/deploy')?'绑定请求被网关中断，请稍后刷新列表确认结果；未完成批次会自动回滚':`请求失败 (${response.status})`; throw new Error(payload.error?.message || fallback) }
   return payload.data
 }
 function body(value){ return JSON.stringify(value) }
@@ -95,7 +109,7 @@ async function loadPage(){
     else if(path==='/targets') data.targets=await api('/targets')
     else if(path==='/channels') data.channels=await api('/channels')
     else if(path==='/managed') data.managed=await api('/managed-accounts')
-    else if(path==='/market') [data.market,data.history]=await Promise.all([api('/market/groups'),api('/market/price-history')])
+    else if(path==='/market') data.market=await api('/market/dashboard')
     else if(path==='/policies') [data.policies,data.targets]=await Promise.all([api('/policies'),api('/targets')])
     else if(path==='/scheduling') data.actions=await api('/action-intents')
     else if(path==='/events') data.events=await api('/events')
@@ -218,10 +232,17 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         </template>
 
         <template v-else-if="route==='/market'">
-          <div class="page-head"><div><h1>市场大盘</h1><span>{{ data.market.length }} 个有效报价</span></div></div>
-          <section class="market-ticker"><article><span>最低倍率</span><strong>{{ ratio(minimumRatio(data.market)) }}</strong></article><article><span>平均倍率</span><strong>{{ ratio(data.market.length?data.market.reduce((s,x)=>s+Number(x.multiplier||0),0)/data.market.length:null) }}</strong></article><article><span>数据源</span><strong>{{ new Set(data.market.map(x=>x.sourceName)).size }}</strong></article><article><span>30 日样本</span><strong>{{ data.history.length }}</strong></article></section>
-          <div class="table-wrap"><table><thead><tr><th>排名</th><th>数据源</th><th>分组</th><th>口径</th><th>当前倍率</th><th>采集时间</th></tr></thead><tbody><tr v-for="(row,index) in paged(data.market)" :key="row.id"><td class="rank">{{ String(ranking(index)).padStart(2,'0') }}</td><td>{{ row.sourceName }}</td><td><strong>{{ row.name }}</strong></td><td>{{ row.groupType }}</td><td class="ratio">{{ ratio(row.multiplier) }}</td><td>{{ date(row.capturedAt) }}</td></tr></tbody></table></div>
-          <PaginationBar v-model:page="page" v-model:page-size="pageSize" :total="filteredCount(data.market)"/>
+          <div class="page-head market-head"><div><h1>渠道倍率趋势</h1><span>仅统计已绑定并由本系统托管的渠道</span></div><label class="market-group-select"><span>查看范围</span><select v-model="marketGroup"><option value="all">全部分组总览</option><option v-for="group in data.market.groups" :key="group.id" :value="group.id">{{ group.targetName }} / {{ group.name }}</option></select></label></div>
+          <section class="market-ticker"><article><span>已对接分组</span><strong>{{ data.market.groups.length }}</strong></article><article><span>当前渠道</span><strong>{{ marketUniqueChannels }}</strong></article><article><span>当前{{ {average:'平均',median:'中位',minimum:'最低'}[marketMetric] }}倍率</span><strong>{{ ratio(marketLatestValue) }}</strong></article><article><span>趋势样本</span><strong>{{ data.market.trend.length }}</strong></article></section>
+          <section class="market-trend-panel">
+            <header><div><h2>30 天倍率变化</h2><small>每小时取每个源分组最后一次采样，再按目标分组聚合</small></div><div class="segmented" aria-label="统计口径"><button :class="{active:marketMetric==='average'}" @click="marketMetric='average'">平均值</button><button :class="{active:marketMetric==='median'}" @click="marketMetric='median'">中位数</button><button :class="{active:marketMetric==='minimum'}" @click="marketMetric='minimum'">最低值</button></div></header>
+            <StateBlock v-if="!loading&&!data.market.trend.length" title="暂无托管渠道倍率历史"/><MarketTrendChart v-else :groups="data.market.groups" :points="data.market.trend" :metric="marketMetric" :selected-group="marketGroup"/>
+          </section>
+          <section class="market-channel-panel">
+            <header class="market-tabs"><div role="tablist" aria-label="渠道榜单"><button role="tab" :aria-selected="marketTab==='low'" :class="{active:marketTab==='low'}" @click="marketTab='low'">低分渠道</button><button role="tab" :aria-selected="marketTab==='stable'" :class="{active:marketTab==='stable'}" @click="marketTab='stable'">稳定渠道</button></div><span>{{ marketGroup==='all'?'全部分组总览':data.market.groups.find(group=>group.id===marketGroup)?.name }}</span></header>
+            <StateBlock v-if="!loading&&!marketRankedChannels.length" title="该范围暂无托管渠道"/>
+            <div v-else class="market-channel-list"><article v-for="(row,index) in marketRankedChannels" :key="`${row.targetGroupId}:${row.id}`"><span class="channel-rank">{{ String(index+1).padStart(2,'0') }}</span><div class="channel-identity"><strong>{{ row.sourceName }}</strong><small>{{ row.sourceGroupName }}</small></div><div><span>倍率</span><strong>{{ ratio(row.multiplier) }}</strong></div><div><span>质量分</span><strong>{{ Number(row.qualityScore).toFixed(1) }}</strong></div><div><span>7 天探测</span><strong>{{ row.probeSuccessRate7d==null?'--':`${Number(row.probeSuccessRate7d).toFixed(1)}%` }}</strong><small>{{ row.probeSamples7d }} 个样本</small></div><div><span>7 天业务</span><strong>{{ row.businessSuccessRate7d==null?'--':`${Number(row.businessSuccessRate7d).toFixed(1)}%` }}</strong><small>{{ row.businessSamples7d }} 个请求</small></div><span :class="['badge',statusTone(row.lifecycleState)]">{{ statusText(row.lifecycleState) }}</span></article></div>
+          </section>
         </template>
 
         <template v-else-if="route==='/targets'">
