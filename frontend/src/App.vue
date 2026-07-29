@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   Activity, AlertTriangle, ArrowRight, BarChart3, Bot, Check, ChevronDown, ChevronRight, CircleDollarSign, ClipboardList,
-  Database, Download, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
+  Database, Download, Eye, EyeOff, FileClock, Gauge, History, KeyRound, LogOut, Menu, Network, Pause, Pencil, Play, Plus,
   RefreshCw, Search, Settings, ShieldCheck, SlidersHorizontal, Trash2, UserCog, Workflow, X,
 } from '@lucide/vue'
 import ModalShell from './components/ModalShell.vue'
@@ -41,6 +41,8 @@ const sourceSort = ref('created')
 const schedulingTab = ref('status')
 const schedulingGroup = ref('all')
 const expandedSchedulingGroups = ref(new Set())
+const hiddenSchedulingGroups = ref(readHiddenSchedulingGroups())
+const showHiddenSchedulingGroups = ref(false)
 const simulationResult = ref(null)
 const systemVersion = reactive({currentVersion:'',buildType:'',repository:'',updateSupported:false,restartSupported:false,rollbackAvailable:false,restartPending:false,pendingVersion:''})
 const updateInfo = reactive({latestVersion:'',hasUpdate:false,name:'',body:'',htmlUrl:'',publishedAt:''})
@@ -85,10 +87,9 @@ const sourceRows = computed(() => {
   return result
 })
 const sourcePagedRows = computed(() => sourceRows.value.slice((page.value-1)*pageSize.value,page.value*pageSize.value))
-const schedulingGroups = computed(() => [...new Map(data.scheduling.map(item=>[item.targetGroupId,{id:item.targetGroupId,name:item.targetGroup}])).values()].sort((a,b)=>a.name.localeCompare(b.name,'zh-CN')))
-const schedulingSections = computed(() => {
+function groupSchedulingItems(items){
   const groups=new Map()
-  for(const item of filtered(data.scheduling).filter(item=>schedulingGroup.value==='all'||item.targetGroupId===schedulingGroup.value)){
+  for(const item of items){
     if(!groups.has(item.targetGroupId))groups.set(item.targetGroupId,{id:item.targetGroupId,name:item.targetGroup,targetName:item.targetName,policyName:item.policyName,running:[],stopped:[]})
     groups.get(item.targetGroupId)[item.schedulable?'running':'stopped'].push(item)
   }
@@ -98,7 +99,13 @@ const schedulingSections = computed(() => {
     group.recovering=group.stopped.filter(item=>item.fastValidation).length
     return group
   }).sort((left,right)=>left.targetName.localeCompare(right.targetName,'zh-CN')||left.name.localeCompare(right.name,'zh-CN'))
-})
+}
+const schedulingGroups = computed(() => [...new Map(data.scheduling.map(item=>[item.targetGroupId,{id:item.targetGroupId,name:item.targetGroup}])).values()].sort((a,b)=>a.name.localeCompare(b.name,'zh-CN')))
+const visibleSchedulingGroups = computed(() => schedulingGroups.value.filter(group=>!hiddenSchedulingGroups.value.has(group.id)))
+const allSchedulingSections = computed(() => groupSchedulingItems(data.scheduling))
+const visibleSchedulingSections = computed(() => allSchedulingSections.value.filter(group=>!hiddenSchedulingGroups.value.has(group.id)))
+const hiddenSchedulingSections = computed(() => allSchedulingSections.value.filter(group=>hiddenSchedulingGroups.value.has(group.id)))
+const schedulingSections = computed(() => groupSchedulingItems(filtered(data.scheduling).filter(item=>!hiddenSchedulingGroups.value.has(item.targetGroupId)&&(schedulingGroup.value==='all'||item.targetGroupId===schedulingGroup.value))))
 const schedulingPagedSections = computed(() => schedulingSections.value.slice((page.value-1)*pageSize.value,page.value*pageSize.value))
 const schedulingRunningCount = computed(() => data.scheduling.filter(item=>item.schedulable).length)
 const schedulingRecoveringCount = computed(() => data.scheduling.filter(item=>!item.schedulable&&item.fastValidation).length)
@@ -284,6 +291,31 @@ function multiplierLabel(value){return value==null?'倍率未提供':`倍率 ×$
 function valueRatio(value){return `1 : ${Number(value||1).toLocaleString('zh-CN',{maximumFractionDigits:8,useGrouping:false})}`}
 function coveragePercent(bound,total){return total?`${Math.round(Number(bound||0)*100/Number(total))}%`:'--'}
 function sourceBindingText(row){if(!Number(row.managedAccountCount||0))return'未绑定';if(Number(row.boundGroupCount||0)>=Number(row.groupCount||0))return'已全部绑定';return'部分绑定'}
+function readHiddenSchedulingGroups(){
+  try{return new Set(JSON.parse(localStorage.getItem('channel_manage_hidden_scheduling_groups')||'[]'))}catch{return new Set()}
+}
+function persistHiddenSchedulingGroups(next){
+  hiddenSchedulingGroups.value=next
+  try{localStorage.setItem('channel_manage_hidden_scheduling_groups',JSON.stringify([...next]))}catch{}
+}
+function hideSchedulingGroup(id){
+  const next=new Set(hiddenSchedulingGroups.value)
+  next.add(id)
+  persistHiddenSchedulingGroups(next)
+  if(schedulingGroup.value===id)schedulingGroup.value='all'
+  const expanded=new Set(expandedSchedulingGroups.value)
+  expanded.delete(id)
+  expandedSchedulingGroups.value=expanded
+  page.value=1
+}
+function restoreSchedulingGroup(id){
+  const next=new Set(hiddenSchedulingGroups.value)
+  next.delete(id)
+  persistHiddenSchedulingGroups(next)
+  if(!hiddenSchedulingSections.value.length)showHiddenSchedulingGroups.value=false
+  page.value=1
+}
+function restoreAllSchedulingGroups(){persistHiddenSchedulingGroups(new Set());showHiddenSchedulingGroups.value=false;page.value=1}
 function toggleSchedulingGroup(id){const next=new Set(expandedSchedulingGroups.value);next.has(id)?next.delete(id):next.add(id);expandedSchedulingGroups.value=next}
 function schedulingOutageText(group){if(!group.policyName)return'未配置启用策略';if(group.recovering)return`暂无可用账号，${group.recovering} 个正在快速恢复`;return'暂无可用账号，候选均被策略阻断'}
 function validationEta(row){if(!row.fastValidation)return'';const seconds=Number(row.estimatedValidationSeconds||0);if(seconds<=0)return'下一轮评估';if(seconds<60)return`约 ${seconds} 秒`;return`约 ${Math.ceil(seconds/60)} 分钟`}
@@ -387,11 +419,15 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
           <div class="page-head"><div><h1>调度运行</h1><span>按目标分组查看实际参与账号与优先级</span></div><button class="btn" @click="runAutomation"><Play :size="16"/>立即评估</button></div>
           <div class="scheduling-tabs" role="tablist"><button :class="{active:schedulingTab==='status'}" @click="schedulingTab='status'">分组调度队列</button><button :class="{active:schedulingTab==='history'}" @click="schedulingTab='history'">执行记录</button></div>
           <template v-if="schedulingTab==='status'">
-            <section class="schedule-overview"><div><span>参与调度</span><strong>{{ schedulingRunningCount }}</strong><small>共 {{ data.scheduling.length }} 个托管账号</small></div><div><span>目标分组</span><strong>{{ schedulingGroups.length }}</strong><small>{{ schedulingSections.filter(group=>!group.running.length).length }} 个暂无可用账号</small></div><div><span>快速恢复</span><strong>{{ schedulingRecoveringCount }}</strong><small>最快每 15 秒复检</small></div><label><span>查看目标分组</span><select v-model="schedulingGroup"><option value="all">全部目标分组</option><option v-for="group in schedulingGroups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label></section>
-            <StateBlock v-if="!loading&&!schedulingSections.length" title="没有符合条件的目标分组"/>
+            <section class="schedule-overview"><div><span>参与调度</span><strong>{{ schedulingRunningCount }}</strong><small>共 {{ data.scheduling.length }} 个托管账号</small></div><div><span>当前展示分组</span><strong>{{ visibleSchedulingGroups.length }}</strong><small>{{ visibleSchedulingSections.filter(group=>!group.running.length).length }} 个暂无可用账号</small></div><div><span>快速恢复</span><strong>{{ schedulingRecoveringCount }}</strong><small>最快每 15 秒复检</small></div><label><span>查看目标分组</span><select v-model="schedulingGroup"><option value="all">全部展示分组</option><option v-for="group in visibleSchedulingGroups" :key="group.id" :value="group.id">{{ group.name }}</option></select></label></section>
+            <section v-if="hiddenSchedulingSections.length" class="schedule-hidden-panel">
+              <header><button class="schedule-hidden-toggle" :aria-expanded="showHiddenSchedulingGroups" @click="showHiddenSchedulingGroups=!showHiddenSchedulingGroups"><EyeOff :size="17"/><span><strong>已隐藏 {{ hiddenSchedulingSections.length }} 个分组</strong><small>不在调度主页面展示，不影响实际调度</small></span><component :is="showHiddenSchedulingGroups?ChevronDown:ChevronRight" :size="17"/></button><button class="btn small" @click="restoreAllSchedulingGroups"><Eye :size="14"/>全部恢复</button></header>
+              <div v-if="showHiddenSchedulingGroups" class="schedule-hidden-list"><article v-for="group in hiddenSchedulingSections" :key="group.id"><div><strong>{{ group.name }}</strong><small>{{ group.targetName }} · {{ group.running.length }} / {{ group.running.length+group.stopped.length }} 参与</small></div><button class="btn small" @click="restoreSchedulingGroup(group.id)"><Eye :size="14"/>恢复显示</button></article></div>
+            </section>
+            <StateBlock v-if="!loading&&!schedulingSections.length" :title="hiddenSchedulingSections.length&&!visibleSchedulingGroups.length?'所有分组都已隐藏':'没有符合条件的目标分组'"/>
             <div v-else class="schedule-groups">
               <section v-for="group in schedulingPagedSections" :key="group.id" :class="['schedule-group',{'is-empty':!group.running.length}]">
-                <header class="schedule-group-head"><div class="schedule-group-title"><span class="schedule-group-status"><span :class="['status-dot',group.running.length?'online':'offline']"/></span><div><h2>{{ group.name }}</h2><small>{{ group.targetName }} · {{ group.policyName||'未配置启用策略' }}</small></div></div><div class="schedule-group-count"><strong>{{ group.running.length }}</strong><span>/ {{ group.running.length+group.stopped.length }} 参与</span></div><span v-if="!group.running.length" class="schedule-outage"><AlertTriangle :size="15"/>{{ schedulingOutageText(group) }}</span></header>
+                <header class="schedule-group-head"><div class="schedule-group-title"><span class="schedule-group-status"><span :class="['status-dot',group.running.length?'online':'offline']"/></span><div><h2>{{ group.name }}</h2><small>{{ group.targetName }} · {{ group.policyName||'未配置启用策略' }}</small></div></div><div class="schedule-group-count"><strong>{{ group.running.length }}</strong><span>/ {{ group.running.length+group.stopped.length }} 参与</span></div><span v-if="!group.running.length" class="schedule-outage"><AlertTriangle :size="15"/>{{ schedulingOutageText(group) }}</span><button class="icon-btn schedule-hide-button" title="从主页面隐藏该分组" :aria-label="`隐藏分组 ${group.name}`" @click="hideSchedulingGroup(group.id)"><EyeOff :size="16"/></button></header>
                 <div v-if="group.running.length" class="schedule-running"><div class="schedule-columns"><span>优先级</span><span>参与账号</span><span>来源渠道</span><span>倍率</span><span>验证状态</span></div><div v-for="row in group.running" :key="row.managedAccountId" class="schedule-account"><strong class="priority-rank">#{{ row.priority }}</strong><div class="schedule-account-name"><strong>{{ row.remoteName }}</strong><small>{{ row.syncStatus==='SYNCED'?'已同步到目标节点':statusText(row.syncStatus) }}</small></div><div><strong>{{ row.sourceName }}</strong><small>{{ row.sourceGroup }}</small></div><div><strong>{{ ratio(row.sourceMultiplier) }}</strong><small>上限 {{ ratio(row.targetMultiplier) }}</small></div><div><span :class="['badge',row.eligible?'success':'warning']">{{ row.eligible?'参与中':'等待停止' }}</span><small>{{ row.samples }} 个样本 · {{ row.successRate==null?'--':`${Number(row.successRate).toFixed(1)}%` }}</small></div></div></div>
                 <div v-else class="schedule-empty-running"><strong>当前没有账号参与这个分组的调度</strong><small>系统会优先复检可恢复候选；明确故障、人工暂停或倍率越界的账号不会强制加入。</small></div>
                 <button v-if="group.stopped.length" class="schedule-stopped-toggle" :aria-expanded="expandedSchedulingGroups.has(group.id)" @click="toggleSchedulingGroup(group.id)"><span>{{ expandedSchedulingGroups.has(group.id)?'收起':'查看' }} {{ group.stopped.length }} 个未参与账号</span><small v-if="group.stopped.some(row=>row.fastValidation)">{{ group.stopped.filter(row=>row.fastValidation).length }} 个正在快速验证</small><component :is="expandedSchedulingGroups.has(group.id)?ChevronDown:ChevronRight" :size="17"/></button>
