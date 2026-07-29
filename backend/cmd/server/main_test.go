@@ -135,6 +135,26 @@ func TestSourceValueDivisor(t *testing.T) {
 	}
 }
 
+func TestSub2APIGroupMultiplierPrefersAvailableGroupRate(t *testing.T) {
+	record := map[string]any{"rate_multiplier": float64(.12)}
+	rates := map[string]any{"43": float64(.5)}
+	value := sub2APIGroupMultiplier(record, rates, "43")
+	if value == nil || *value != .12 {
+		t.Fatalf("unexpected available group multiplier: %v", value)
+	}
+	delete(record, "rate_multiplier")
+	value = sub2APIGroupMultiplier(record, rates, "43")
+	if value == nil || *value != .5 {
+		t.Fatalf("unexpected legacy rate multiplier: %v", value)
+	}
+	for _, field := range []string{"rate", "ratio", "multiplier", "group_ratio"} {
+		value = sub2APIGroupMultiplier(map[string]any{field: ".25"}, map[string]any{}, "43")
+		if value == nil || *value != .25 {
+			t.Fatalf("unexpected %s multiplier: %v", field, value)
+		}
+	}
+}
+
 func TestLoginRemoteSupportsModernNewAPI(t *testing.T) {
 	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

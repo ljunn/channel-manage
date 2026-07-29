@@ -150,6 +150,7 @@ function statusText(value){return {UNKNOWN:'待同步',ACTIVE:'启用',ONLINE:'�
 function date(value){return value?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)):'--'}
 function money(value){return value==null?'--':`$${Number(value).toFixed(2)}`}
 function ratio(value){return value==null?'--':`${Number(value).toFixed(4)}x`}
+function multiplierLabel(value){return value==null?'倍率未提供':`倍率 ×${Number(value).toFixed(4)}`}
 function valueRatio(value){return `1 : ${Number(value||1).toLocaleString('zh-CN',{maximumFractionDigits:8,useGrouping:false})}`}
 function minimumRatio(items){const values=items.map(item=>Number(item.multiplier)).filter(value=>Number.isFinite(value));return values.length?Math.min(...values):null}
 </script>
@@ -263,7 +264,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
             <label v-for="group in sourceDetail.groups" :key="group.id" class="source-option" :class="{selected:form.sourceGroupIDs?.includes(group.id),mapped:isGroupMapped(group)}">
               <input v-model="form.sourceGroupIDs" type="checkbox" :value="group.id" :disabled="isGroupMapped(group)" :aria-label="`选择 ${group.name}`"/>
               <span class="source-option-copy"><strong>{{ group.name }}</strong><small>{{ group.description||`远端 ID ${group.remoteId}` }}</small></span>
-              <span class="source-option-meta"><b>{{ ratio(group.multiplier) }}</b><small v-if="isGroupMapped(group)">已映射到 {{ selectedTarget?.name }}</small><small v-else-if="group.deployments?.length">另有 {{ mappedTargets(group) }}</small></span>
+              <span class="source-option-meta"><b :class="{missing:group.multiplier==null}">{{ multiplierLabel(group.multiplier) }}</b><small v-if="isGroupMapped(group)">已映射到 {{ selectedTarget?.name }}</small><small v-else-if="group.deployments?.length">另有 {{ mappedTargets(group) }}</small></span>
             </label>
           </div>
         </section>
@@ -281,7 +282,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <header><span class="step-index">3</span><div><h3>映射预览</h3><small>每一行都是一个源分组到多个目标分组的一对多关系</small></div></header>
         <div v-if="!selectedSourceGroups.length||!selectedTargetGroups.length" class="mapping-preview-empty">选择两侧分组后，这里会显示最终映射关系</div>
         <div v-else class="mapping-preview-list">
-          <div v-for="group in selectedSourceGroups" :key="group.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ group.name }}</strong><small>源分组</small></span><ArrowRight :size="18"/><span class="preview-targets"><span v-for="targetGroup in selectedTargetGroups" :key="targetGroup.id">{{ targetGroup.name }}</span></span></div>
+          <div v-for="group in selectedSourceGroups" :key="group.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ group.name }}</strong><small>{{ multiplierLabel(group.multiplier) }}</small></span><ArrowRight :size="18"/><span class="preview-targets"><span v-for="targetGroup in selectedTargetGroups" :key="targetGroup.id">{{ targetGroup.name }}</span></span></div>
         </div>
       </section>
       <footer class="mapping-submit">

@@ -405,10 +405,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 				continue
 			}
 			remoteID := fmt.Sprintf("%.0f", idNumber)
-			var multiplier *float64
-			if v, ok := number(rates[remoteID]); ok {
-				multiplier = &v
-			}
+			multiplier := sub2APIGroupMultiplier(record, rates, remoteID)
 			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["description"], ""), text(record["platform"], "default"), multiplier, []string{}})
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/user/profile", session, nil)
@@ -491,6 +488,18 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 		return err
 	}
 	return tx.Commit()
+}
+
+func sub2APIGroupMultiplier(record, rates map[string]any, remoteID string) *float64 {
+	for _, field := range []string{"rate_multiplier", "rate", "ratio", "multiplier", "group_ratio"} {
+		if value, ok := number(record[field]); ok {
+			return &value
+		}
+	}
+	if value, ok := number(rates[remoteID]); ok {
+		return &value
+	}
+	return nil
 }
 
 func truncate(value string, max int) string {
