@@ -15,9 +15,14 @@ import (
 )
 
 func (a *App) openEvent(ctx context.Context, severity, category, title, detail, dedupeKey string) {
-	var existing string
-	err := a.db.QueryRowContext(ctx, `UPDATE events SET severity=$2,category=$3,title=$4,detail=$5,status='OPEN',acknowledged_at=NULL,created_at=now() WHERE id=(SELECT id FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' ORDER BY created_at DESC LIMIT 1) RETURNING id`, dedupeKey, severity, category, title, truncate(detail, 1000)).Scan(&existing)
+	var existingID, existingSeverity string
+	err := a.db.QueryRowContext(ctx, `SELECT id,severity FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' ORDER BY created_at DESC LIMIT 1`, dedupeKey).Scan(&existingID, &existingSeverity)
 	if err == nil {
+		_, updateErr := a.db.ExecContext(ctx, `UPDATE events SET severity=$2,category=$3,title=$4,detail=$5,status='OPEN',acknowledged_at=NULL WHERE id=$1`, existingID, severity, category, title, truncate(detail, 1000))
+		logDatabaseError("更新事件", updateErr)
+		if updateErr == nil && severityRank(severity) < severityRank(existingSeverity) && (severity == "P0" || severity == "P1") {
+			go a.notifyEvent(context.Background(), existingID, severity, "告警升级："+title, detail)
+		}
 		return
 	}
 	var eventID string
@@ -29,8 +34,28 @@ func (a *App) openEvent(ctx context.Context, severity, category, title, detail, 
 }
 
 func (a *App) resolveEvent(ctx context.Context, dedupeKey string) {
-	_, err := a.db.ExecContext(ctx, `UPDATE events SET status='RESOLVED',resolved_at=now() WHERE dedupe_key=$1 AND status<>'RESOLVED'`, dedupeKey)
+	var eventID, severity, title, detail string
+	err := a.db.QueryRowContext(ctx, `UPDATE events SET status='RESOLVED',resolved_at=now() WHERE id=(SELECT id FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' ORDER BY created_at DESC LIMIT 1) RETURNING id,severity,title,detail`, dedupeKey).Scan(&eventID, &severity, &title, &detail)
+	if err == sql.ErrNoRows {
+		return
+	}
 	logDatabaseError("恢复事件", err)
+	if err == nil && (severity == "P0" || severity == "P1") {
+		go a.notifyEvent(context.Background(), eventID, "恢复", title+"已恢复", detail+"\n\n系统已确认恢复，相关告警自动关闭。")
+	}
+}
+
+func severityRank(value string) int {
+	if value == "P0" {
+		return 0
+	}
+	if value == "P1" {
+		return 1
+	}
+	if value == "P2" {
+		return 2
+	}
+	return 3
 }
 
 func (a *App) listEvents(ctx context.Context) ([]map[string]any, error) {
@@ -546,7 +571,16 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 	if err := decodeJSON(r, &input); err != nil {
 		return err
 	}
-	allowed := map[string]bool{"shadow_mode": true, "emergency_freeze": true, "auto_approve": true, "probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true, "min_healthy_channels": true, "confirmation_failures": true, "metric_window_minutes": true, "min_error_samples": true, "error_rate_threshold": true}
+	allowed := map[string]bool{
+		"shadow_mode": true, "emergency_freeze": true, "auto_approve": true,
+		"probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true,
+		"min_healthy_channels": true, "confirmation_failures": true, "metric_window_minutes": true,
+		"min_error_samples": true, "error_rate_threshold": true,
+		"balance_alert_work_hours": true, "balance_alert_night_hours": true, "balance_alert_weekend_hours": true,
+		"email_alert_source_balance": true, "email_alert_source_scan": true, "email_alert_target_sync": true,
+		"email_alert_group_availability": true, "email_alert_action_execution": true, "email_alert_platform_sync": true,
+		"email_alert_recovery": true,
+	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		return err
@@ -555,6 +589,17 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 	for key, value := range input {
 		if !allowed[key] {
 			return &apiError{400, "INVALID_SETTING", "包含不支持的系统设置"}
+		}
+		if strings.HasPrefix(key, "email_alert_") {
+			if _, ok := value.(bool); !ok {
+				return &apiError{400, "INVALID_EMAIL_ALERT_SETTING", "邮件场景开关必须是布尔值"}
+			}
+		}
+		if strings.HasPrefix(key, "balance_alert_") {
+			hours, ok := number(value)
+			if !ok || hours < 1 || hours > 168 || hours != float64(int(hours)) {
+				return &apiError{400, "INVALID_BALANCE_ALERT_WINDOW", "余额预警提前量必须是 1 到 168 之间的整数小时"}
+			}
 		}
 		if _, err = tx.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()`, key, jsonValue(value)); err != nil {
 			return err

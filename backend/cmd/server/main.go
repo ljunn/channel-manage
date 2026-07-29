@@ -43,6 +43,8 @@ type App struct {
 	targetAuthMu              sync.Mutex
 	targetMultiplierMu        sync.Mutex
 	targetMultiplierRefreshes map[string]struct{}
+	targetPlatformMu          sync.Mutex
+	targetPlatformSyncs       map[string]struct{}
 }
 
 type apiError struct {

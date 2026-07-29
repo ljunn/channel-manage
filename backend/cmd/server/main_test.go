@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -122,10 +123,10 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 
 	app := &App{httpClient: server.Client()}
 	targetGroups := []deploymentTargetGroup{
-		{ID: "local-1", Name: "低倍率", RemoteID: 11},
-		{ID: "local-2", Name: "高质量", RemoteID: 22},
+		{ID: "local-1", Name: "低倍率", Platform: "anthropic", RemoteID: 11},
+		{ID: "local-2", Name: "高质量", Platform: "grok", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +158,9 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if int(request["concurrency"].(float64)) != 1000 {
 			t.Fatalf("account %d concurrency=%v, want 1000", index, request["concurrency"])
 		}
+		if request["platform"] != targetGroup.Platform {
+			t.Fatalf("account %d platform=%v, want target group platform %s", index, request["platform"], targetGroup.Platform)
+		}
 		credentials := request["credentials"].(map[string]any)
 		if credentials["base_url"] != "https://source.example/v1" {
 			t.Fatalf("account %d base_url=%v, want published source API endpoint", index, credentials["base_url"])
@@ -182,7 +186,7 @@ func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testin
 	defer server.Close()
 
 	app := &App{httpClient: server.Client()}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, []deploymentTargetGroup{{ID: "local-1", Name: "成功", RemoteID: 11}, {ID: "local-2", Name: "失败", RemoteID: 22}}, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"gpt-test"}, []deploymentTargetGroup{{ID: "local-1", Name: "成功", Platform: "openai", RemoteID: 11}, {ID: "local-2", Name: "失败", Platform: "openai", RemoteID: 22}}, 1000, 1000)
 	if err == nil || !strings.Contains(err.Error(), "失败") {
 		t.Fatalf("expected target-specific failure, got %v", err)
 	}
@@ -191,11 +195,156 @@ func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testin
 	}
 }
 
+func TestManagedPlatformUsesTargetGroupType(t *testing.T) {
+	tests := map[string]string{
+		"openai":    "openai",
+		"anthropic": "anthropic",
+		"claude":    "anthropic",
+		"grok":      "grok",
+		"gork":      "grok",
+		"gemini":    "gemini",
+		"":          "openai",
+	}
+	for input, expected := range tests {
+		if actual := managedPlatform(input); actual != expected {
+			t.Fatalf("managedPlatform(%q)=%q, want %q", input, actual, expected)
+		}
+	}
+}
+
+func TestBalanceForecastUsesMedianConsumptionAndIgnoresRecharge(t *testing.T) {
+	start := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	samples := []balanceSample{
+		{Balance: 100, CapturedAt: start},
+		{Balance: 90, CapturedAt: start.Add(time.Hour)},
+		{Balance: 70, CapturedAt: start.Add(2 * time.Hour)},
+		{Balance: 170, CapturedAt: start.Add(3 * time.Hour)},
+		{Balance: 160, CapturedAt: start.Add(4 * time.Hour)},
+		{Balance: 150, CapturedAt: start.Add(5 * time.Hour)},
+		{Balance: 140, CapturedAt: start.Add(6 * time.Hour)},
+	}
+	forecast := calculateBalanceForecast(samples)
+	if !forecast.Known || forecast.BurnRate != 10 || forecast.EtaHours != 14 {
+		t.Fatalf("unexpected balance forecast: %#v", forecast)
+	}
+}
+
+func TestBalanceForecastNeedsThreeConsumptionIntervals(t *testing.T) {
+	start := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	forecast := calculateBalanceForecast([]balanceSample{
+		{Balance: 100, CapturedAt: start},
+		{Balance: 90, CapturedAt: start.Add(time.Hour)},
+		{Balance: 80, CapturedAt: start.Add(2 * time.Hour)},
+	})
+	if forecast.Known {
+		t.Fatalf("forecast should wait for three consumption intervals: %#v", forecast)
+	}
+}
+
+func TestBalanceForecastRequiresConsecutiveThresholdBreaches(t *testing.T) {
+	start := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	samples := []balanceSample{
+		{Balance: 100, CapturedAt: start},
+		{Balance: 99, CapturedAt: start.Add(time.Hour)},
+		{Balance: 98, CapturedAt: start.Add(2 * time.Hour)},
+		{Balance: 97, CapturedAt: start.Add(3 * time.Hour)},
+		{Balance: 77, CapturedAt: start.Add(4 * time.Hour)},
+	}
+	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
+		t.Fatal("a single short spike must not trigger a forecast alert")
+	}
+	samples = append(samples, balanceSample{Balance: 57, CapturedAt: start.Add(5 * time.Hour)})
+	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
+		t.Fatal("the first low-runway forecast must wait for confirmation")
+	}
+	samples = append(samples, balanceSample{Balance: 37, CapturedAt: start.Add(6 * time.Hour)})
+	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
+		t.Fatal("the previous forecast was still above the threshold")
+	}
+	samples = append(samples, balanceSample{Balance: 17, CapturedAt: start.Add(7 * time.Hour)})
+	if !consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
+		t.Fatal("two consecutive threshold breaches should trigger the alert")
+	}
+}
+
+func TestRecommendedRechargeRoundsUpWithCoverageBuffer(t *testing.T) {
+	if got := recommendedRecharge(12, 2, 14); got != 20 {
+		t.Fatalf("recommended recharge = %.2f, want 20", got)
+	}
+}
+
+func TestBalanceAlertLeadUsesNightAndWeekendWindows(t *testing.T) {
+	if hours, period := balanceAlertLead(time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC), 4, 12, 36); hours != 4 || period != "工作时段" {
+		t.Fatalf("unexpected work period: %d %s", hours, period)
+	}
+	if hours, period := balanceAlertLead(time.Date(2026, 7, 29, 22, 0, 0, 0, time.UTC), 4, 12, 36); hours != 12 || period != "夜间" {
+		t.Fatalf("unexpected night period: %d %s", hours, period)
+	}
+	if hours, period := balanceAlertLead(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC), 4, 12, 36); hours != 36 || period != "周末" {
+		t.Fatalf("unexpected weekend period: %d %s", hours, period)
+	}
+}
+
 func TestDeploymentErrorExplainsInsufficientBalance(t *testing.T) {
 	err := deploymentError("UPSTREAM_MODEL_READ_FAILED", "Pro分组", &apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "INSUFFICIENT_BALANCE: Insufficient account balance"})
 	apiErr, ok := err.(*apiError)
 	if !ok || apiErr.Status != http.StatusConflict || !strings.Contains(apiErr.Message, "源站账户余额不足") || !strings.Contains(apiErr.Message, "Pro分组") {
 		t.Fatalf("unexpected deployment error: %#v", err)
+	}
+}
+
+func TestClassifyProbeFailureNamesBalanceExhaustionDirectly(t *testing.T) {
+	errorType, summary := classifyProbeFailure(&apiError{Status: 502, Code: "REMOTE_REJECTED", Message: "INSUFFICIENT_BALANCE: Insufficient account balance"})
+	if errorType != "BALANCE_EXHAUSTED" || summary != "源站账户余额不足" {
+		t.Fatalf("balance error was not classified clearly: %q %q", errorType, summary)
+	}
+	for _, message := range []string{"quota exhausted", "账户余额不足", "balance not enough"} {
+		if !insufficientBalanceError(fmt.Errorf("%s", message)) {
+			t.Fatalf("balance marker %q was not recognized", message)
+		}
+	}
+}
+
+func TestEventEmailGuidanceIsActionable(t *testing.T) {
+	guidance := eventEmailGuidanceFor("SOURCE_BALANCE", false)
+	content := formatEventEmail("event-1", "P0", "源站账户余额不足", "数据源：vincent", time.Date(2026, 7, 29, 4, 5, 6, 0, time.UTC), guidance)
+	for _, expected := range []string{"发生了什么", "影响", "你需要做什么", "系统会自动做什么", "请登录", "自动恢复", "vincent"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("email is missing %q:\n%s", expected, content)
+		}
+	}
+	if eventEmailSetting("GROUP_AVAILABILITY") != "email_alert_group_availability" {
+		t.Fatal("group availability setting was not mapped")
+	}
+	if emailDeliveryKind("恢复") != "recovery" || emailDeliveryKind("P0") != "p0" {
+		t.Fatal("email delivery idempotency keys must use stable ASCII kinds")
+	}
+}
+
+func TestSendEmailRetriesTemporaryProviderFailureWithStableIdempotencyKey(t *testing.T) {
+	requests := 0
+	keys := []string{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		keys = append(keys, r.Header.Get("Idempotency-Key"))
+		if requests == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"mail-id"}`))
+	}))
+	defer server.Close()
+	transport := server.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // Test server certificate.
+	serverAddress := server.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, serverAddress)
+	}
+	app := &App{httpClient: &http.Client{Transport: transport}}
+	err := app.sendEmail(context.Background(), emailNotificationConfig{APIKey: "key", FromEmail: "from@example.com", ToEmail: "to@example.com"}, "subject", "content", "event/id/p0")
+	if err != nil || requests != 2 || !reflect.DeepEqual(keys, []string{"event/id/p0", "event/id/p0"}) {
+		t.Fatalf("unexpected email retry result: err=%v requests=%d keys=%v", err, requests, keys)
 	}
 }
 
@@ -348,6 +497,29 @@ func TestSyncTargetAccountConcurrency(t *testing.T) {
 	}
 }
 
+func TestSyncTargetAccountSchedulableUsesDedicatedEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/42/schedulable" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]bool
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if !payload["schedulable"] {
+			t.Fatal("schedulable state was not sent")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	if err := app.syncTargetAccountSchedulable(context.Background(), server.URL, "42", remoteSession{}, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5})
 	eligible := managedPolicyCandidate{
@@ -424,7 +596,7 @@ func TestRankManagedAccountsByPriceFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 120),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["cheap"] != 1000 || priorities["middle"] != 1001 || priorities["expensive"] != 1002 {
+	if priorities["cheap"] != 1000 || priorities["middle"] != 1100 || priorities["expensive"] != 1200 {
 		t.Fatalf("unexpected price ranking: %#v", priorities)
 	}
 }
@@ -436,7 +608,7 @@ func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 240),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["fast"] != 1000 || priorities["middle"] != 1001 || priorities["slow"] != 1002 {
+	if priorities["fast"] != 1000 || priorities["middle"] != 1100 || priorities["slow"] != 1200 {
 		t.Fatalf("unexpected speed ranking: %#v", priorities)
 	}
 }
@@ -451,6 +623,36 @@ func TestRankManagedAccountsExcludesIneligibleChannels(t *testing.T) {
 	}
 	if _, exists := priorities["unhealthy"]; exists {
 		t.Fatalf("ineligible account was ranked: %#v", priorities)
+	}
+}
+
+func TestGroupAvailabilityAlertSuppressesOnlyColdStart(t *testing.T) {
+	config := policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5}
+	warming := eligiblePolicyCandidate("warming", .2, 120)
+	warming.Samples = 2
+	warming.RecentSuccesses = 0
+	warming.SuccessRate = sql.NullFloat64{}
+	if groupNeedsAvailabilityAlert([]managedPolicyCandidate{warming}, config) {
+		t.Fatal("sample-only cold start should not alert")
+	}
+
+	unhealthy := warming
+	unhealthy.State = "OFFLINE"
+	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{unhealthy}, config) {
+		t.Fatal("offline group with no eligible account should alert")
+	}
+
+	overMultiplier := warming
+	overMultiplier.SourceMultiplier.Float64 = 1.1
+	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{overMultiplier}, config) {
+		t.Fatal("multiplier violation with no eligible account should alert")
+	}
+
+	failedValidation := warming
+	failedValidation.Samples = 5
+	failedValidation.SuccessRate = sql.NullFloat64{Float64: 40, Valid: true}
+	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{failedValidation}, config) {
+		t.Fatal("qualified sample window with low success rate should alert")
 	}
 }
 

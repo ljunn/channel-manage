@@ -57,6 +57,17 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			balance NUMERIC(18,6), captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_group_samples_group_time ON group_samples(group_id, captured_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS source_balance_samples (
+			id BIGSERIAL PRIMARY KEY, source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+			balance NUMERIC(18,6) NOT NULL, value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1,
+			captured_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(source_id,captured_at)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_source_balance_time ON source_balance_samples(source_id,captured_at DESC)`,
+		`INSERT INTO source_balance_samples(source_id,balance,value_divisor,captured_at)
+		SELECT gs.source_id,max(gs.balance),s.value_divisor,min(gs.captured_at)
+		FROM group_samples gs JOIN sources s ON s.id=gs.source_id WHERE gs.balance IS NOT NULL
+		AND NOT EXISTS (SELECT 1 FROM source_balance_samples LIMIT 1)
+		GROUP BY gs.source_id,s.value_divisor,date_trunc('minute',gs.captured_at) ON CONFLICT DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS targets (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, base_url TEXT NOT NULL UNIQUE,
 			api_key_cipher BYTEA NOT NULL, key_hint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'UNKNOWN', version TEXT NOT NULL DEFAULT '',
@@ -71,6 +82,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)`,
 		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier NUMERIC(14,6)`,
 		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS multiplier_captured_at TIMESTAMPTZ`,
+		`ALTER TABLE target_groups ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
 		`ALTER TABLE target_groups DROP COLUMN IF EXISTS protected_best_priority`,
 		`DROP TABLE IF EXISTS protected_accounts`,
 		`CREATE TABLE IF NOT EXISTS channels (
@@ -103,6 +115,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, channel_id)
 		)`,
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
+		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
 		`ALTER TABLE managed_accounts ALTER COLUMN concurrency SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts DROP CONSTRAINT IF EXISTS managed_accounts_target_id_channel_id_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_accounts_target_remote ON managed_accounts(target_id,remote_id) WHERE remote_id<>''`,
@@ -146,6 +159,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_status_time ON events(status, created_at DESC)`,
+		`UPDATE events SET status='RESOLVED',resolved_at=COALESCE(resolved_at,now()) WHERE status<>'RESOLVED' AND category='CHANNEL_PROBE'`,
+		`UPDATE channels SET state_reason='源站账户余额不足' WHERE upper(state_reason) LIKE '%INSUFFICIENT_BALANCE%' OR upper(state_reason) LIKE '%INSUFFICIENT ACCOUNT BALANCE%' OR upper(state_reason) LIKE '%BALANCE NOT ENOUGH%' OR upper(state_reason) LIKE '%QUOTA EXHAUSTED%' OR state_reason LIKE '%余额不足%'`,
+		`UPDATE probe_runs SET error_type='BALANCE_EXHAUSTED',response_summary='源站账户余额不足' WHERE upper(error_type) LIKE '%INSUFFICIENT_BALANCE%' OR upper(error_type) LIKE '%INSUFFICIENT ACCOUNT BALANCE%' OR upper(error_type) LIKE '%BALANCE NOT ENOUGH%' OR upper(error_type) LIKE '%QUOTA EXHAUSTED%' OR error_type LIKE '%余额不足%'`,
 		`UPDATE events SET status='RESOLVED',resolved_at=COALESCE(resolved_at,now()) WHERE status='ACKNOWLEDGED'`,
 		`UPDATE events e SET status='RESOLVED',resolved_at=COALESCE(e.resolved_at,now())
 		WHERE e.status<>'RESOLVED' AND (e.dedupe_key LIKE 'target-sync:%' OR e.dedupe_key LIKE 'target-rate-limit:%')
@@ -175,6 +191,10 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"probe_interval_seconds": "900", "scan_interval_seconds": "900", "max_daily_probe_cost_usd": "1",
 		"min_healthy_channels": "1", "confirmation_failures": "3", "metric_window_minutes": "5",
 		"min_error_samples": "5", "error_rate_threshold": "20",
+		"balance_alert_work_hours": "4", "balance_alert_night_hours": "12", "balance_alert_weekend_hours": "36",
+		"email_alert_source_balance": "true", "email_alert_source_scan": "true", "email_alert_target_sync": "true",
+		"email_alert_group_availability": "true", "email_alert_action_execution": "true", "email_alert_platform_sync": "true",
+		"email_alert_recovery": "true",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

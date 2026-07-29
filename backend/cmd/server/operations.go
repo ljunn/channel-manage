@@ -50,8 +50,8 @@ func nullableTime(value sql.NullTime) any {
 }
 
 func (a *App) probeChannel(ctx context.Context, id string) error {
-	var sourceBase, encryptedKey, state string
-	err := a.db.QueryRowContext(ctx, `SELECT s.base_url,k.key_cipher,c.lifecycle_state FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id WHERE c.id=$1`, id).Scan(&sourceBase, &encryptedKey, &state)
+	var sourceID, sourceName, sourceBase, keyName, groupName, encryptedKey, state string
+	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
 	}
@@ -88,8 +88,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 		sort.Strings(models)
 		summary = fmt.Sprintf("读取到 %d 个模型", len(models))
 	} else {
-		errorType = requestErr.Error()
-		summary = "探测失败"
+		errorType, summary = classifyProbeFailure(requestErr)
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -121,30 +120,66 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if !success {
-		a.openEvent(ctx, "P1", "CHANNEL_PROBE", "渠道探测异常", errorType, "channel-probe:"+id)
-	} else {
-		a.resolveEvent(ctx, "channel-probe:"+id)
+	if errorType == "BALANCE_EXHAUSTED" {
+		detail := fmt.Sprintf("数据源：%s\n渠道：%s / %s\n源站明确返回账户可用余额不足。", sourceName, groupName, keyName)
+		a.openEvent(ctx, "P0", "SOURCE_BALANCE", "源站账户余额不足", detail, "source-balance:"+sourceID)
+	} else if success {
+		a.evaluateSourceBalance(ctx, sourceID)
 	}
+	// Individual channel failures remain visible in channel and scheduling views.
+	// Only a whole target group losing all eligible accounts creates an alert.
+	a.resolveEvent(ctx, "channel-probe:"+id)
 	return requestErr
 }
 
+func classifyProbeFailure(err error) (string, string) {
+	if insufficientBalanceError(err) {
+		return "BALANCE_EXHAUSTED", "源站账户余额不足"
+	}
+	if err == nil {
+		return "", ""
+	}
+	return truncate(err.Error(), 100), "渠道连接失败"
+}
+
+func insufficientBalanceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToUpper(err.Error())
+	for _, marker := range []string{
+		"INSUFFICIENT_BALANCE",
+		"INSUFFICIENT ACCOUNT BALANCE",
+		"INSUFFICIENT BALANCE",
+		"BALANCE NOT ENOUGH",
+		"BALANCE EXHAUSTED",
+		"QUOTA EXHAUSTED",
+		"余额不足",
+		"余额已耗尽",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) listManagedAccounts(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name ORDER BY m.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,m.remote_id,m.remote_name,m.platform,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name,'platform',tg.platform)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name ORDER BY m.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, targetID, targetName, channelID, sourceName, keyName, remoteID, remoteName, status, lastError, groups string
+		var id, targetID, targetName, channelID, sourceName, keyName, remoteID, remoteName, platform, status, lastError, groups string
 		var priority, concurrency int
 		var schedulable bool
 		var created time.Time
-		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &remoteID, &remoteName, &priority, &concurrency, &schedulable, &status, &lastError, &created, &groups); err != nil {
+		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &remoteID, &remoteName, &platform, &priority, &concurrency, &schedulable, &status, &lastError, &created, &groups); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "remoteId": remoteID, "remoteName": remoteName, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "targetGroups": json.RawMessage(groups), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "remoteId": remoteID, "remoteName": remoteName, "platform": platform, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "targetGroups": json.RawMessage(groups), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -263,7 +298,20 @@ func (a *App) updateManagedAccountConcurrency(w http.ResponseWriter, r *http.Req
 }
 
 func (a *App) syncTargetAccountNumbers(ctx context.Context, targetBase, remoteID string, session remoteSession, payload map[string]int) error {
+	return a.syncTargetAccountFields(ctx, targetBase, remoteID, session, payload)
+}
+
+func (a *App) syncTargetAccountFields(ctx context.Context, targetBase, remoteID string, session remoteSession, payload any) error {
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPut, "/api/v1/admin/accounts/"+remoteID, session, payload)
+	if err != nil {
+		return err
+	}
+	_, err = unwrapEnvelope(value, "SUB2API")
+	return err
+}
+
+func (a *App) syncTargetAccountSchedulable(ctx context.Context, targetBase, remoteID string, session remoteSession, schedulable bool) error {
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts/"+remoteID+"/schedulable", session, map[string]bool{"schedulable": schedulable})
 	if err != nil {
 		return err
 	}
@@ -296,9 +344,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		input.Name = "渠道"
 	}
 	remoteName := "[托管] " + input.Name
-	var sourceBase, encryptedKey, platform, keyModels, targetBase string
+	var sourceBase, encryptedKey, keyModels, targetBase string
 	var targetWrite bool
-	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,s.platform,k.models,t.base_url,t.write_enabled FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &platform, &keyModels, &targetBase, &targetWrite)
+	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,k.models,t.base_url,t.write_enabled FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &keyModels, &targetBase, &targetWrite)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在或尚未授权生产使用"}
 	}
@@ -326,9 +374,10 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return &apiError{409, "SOURCE_MODELS_UNAVAILABLE", "请先成功探测该渠道以读取模型"}
 	}
 	groupRemoteIDs := []int{}
+	targetPlatform := ""
 	for _, groupID := range input.TargetGroupIDs {
 		var remoteID string
-		if err := a.db.QueryRowContext(r.Context(), `SELECT remote_id FROM target_groups WHERE id=$1 AND target_id=$2`, groupID, input.TargetID).Scan(&remoteID); err != nil {
+		if err := a.db.QueryRowContext(r.Context(), `SELECT remote_id,platform FROM target_groups WHERE id=$1 AND target_id=$2`, groupID, input.TargetID).Scan(&remoteID, &targetPlatform); err != nil {
 			return &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组无效"}
 		}
 		numeric, err := strconv.Atoi(remoteID)
@@ -337,6 +386,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		}
 		groupRemoteIDs = append(groupRemoteIDs, numeric)
 	}
+	targetPlatform = managedPlatform(targetPlatform)
 	requestCtx, cancel := timeoutContext(r.Context())
 	defer cancel()
 	target, _, err := a.targetCredentials(requestCtx, input.TargetID)
@@ -351,7 +401,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	for _, model := range models {
 		modelMap[model] = model
 	}
-	payload := map[string]any{"name": remoteName, "platform": managedPlatform(platform), "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
+	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(requestCtx, targetBase, http.MethodPost, "/api/v1/admin/accounts", session, payload)
 	if err != nil {
 		return err
@@ -372,7 +422,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8,'SYNCED')`, id, input.TargetID, input.ChannelID, remoteID, remoteName, input.Priority, input.Concurrency, "channel-manage:"+id)
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id)
 	if err != nil {
 		return err
 	}
@@ -389,11 +439,18 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
-func managedPlatform(sourcePlatform string) string {
-	if sourcePlatform == "NEW_API" {
+func managedPlatform(targetPlatform string) string {
+	value := strings.ToLower(strings.TrimSpace(targetPlatform))
+	switch value {
+	case "", "default":
 		return "openai"
+	case "claude":
+		return "anthropic"
+	case "gork":
+		return "grok"
+	default:
+		return value
 	}
-	return "openai"
 }
 
 func (a *App) updateChannelState(w http.ResponseWriter, r *http.Request, id, action string) error {

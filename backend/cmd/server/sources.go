@@ -28,6 +28,9 @@ type Source struct {
 	LastError           string     `json:"lastError"`
 	Balance             *float64   `json:"balance"`
 	BalanceCurrency     string     `json:"balanceCurrency"`
+	BalanceBurnRate     *float64   `json:"balanceBurnRate"`
+	BalanceEtaHours     *float64   `json:"balanceEtaHours"`
+	BalanceSampleCount  int        `json:"balanceSampleCount"`
 	KeyCount            int        `json:"keyCount"`
 	GroupCount          int        `json:"groupCount"`
 	BoundGroupCount     int        `json:"boundGroupCount"`
@@ -73,7 +76,22 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		}
 		result = append(result, item)
 	}
-	return result, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range result {
+		forecast, forecastErr := a.sourceBalanceForecast(ctx, result[index].ID)
+		if forecastErr != nil || !forecast.Known {
+			continue
+		}
+		result[index].BalanceBurnRate = &forecast.BurnRate
+		result[index].BalanceEtaHours = &forecast.EtaHours
+		result[index].BalanceSampleCount = forecast.Samples
+	}
+	return result, nil
 }
 
 func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
@@ -205,6 +223,9 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 		if _, err = tx.ExecContext(r.Context(), `UPDATE group_samples SET multiplier=multiplier*$2,balance=balance*$2 WHERE source_id=$1`, id, scale); err != nil {
 			return err
 		}
+		if _, err = tx.ExecContext(r.Context(), `DELETE FROM source_balance_samples WHERE source_id=$1`, id); err != nil {
+			return err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return err
@@ -291,6 +312,7 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
 	if err == nil {
 		a.resolveEvent(ctx, "source-scan:"+id)
+		a.evaluateSourceBalance(ctx, id)
 	}
 	return err
 }
@@ -473,6 +495,9 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 	if balance != nil {
 		value := *balance / source.ValueDivisor
 		balance = &value
+		if _, err = tx.ExecContext(ctx, `INSERT INTO source_balance_samples(source_id,balance,value_divisor,captured_at) VALUES($1,$2,$3,now())`, source.ID, value, source.ValueDivisor); err != nil {
+			return err
+		}
 	}
 	for _, item := range groups {
 		var groupID string

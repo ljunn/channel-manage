@@ -133,7 +133,8 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		}
 		remoteID := strconv.Itoa(int(idNumber))
 		multiplier := sub2APIGroupMultiplier(record, nil, remoteID)
-		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,multiplier,multiplier_captured_at,updated_at) VALUES($1,$2,$3,$4,now(),now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,multiplier=excluded.multiplier,multiplier_captured_at=now(),updated_at=now()`, id, remoteID, text(record["name"], remoteID), multiplier)
+		platform := managedPlatform(text(record["platform"], "openai"))
+		_, err = tx.ExecContext(ctx, `INSERT INTO target_groups(target_id,remote_id,name,platform,multiplier,multiplier_captured_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,platform=excluded.platform,multiplier=excluded.multiplier,multiplier_captured_at=now(),updated_at=now()`, id, remoteID, text(record["name"], remoteID), platform, multiplier)
 		if err != nil {
 			return err
 		}
@@ -147,6 +148,137 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	}
 	a.resolveEvent(ctx, "target-sync:"+id)
 	a.resolveEvent(ctx, "target-rate-limit:"+id)
+	go func() {
+		platformCtx, platformCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer platformCancel()
+		a.syncManagedAccountPlatforms(platformCtx, target, session)
+	}()
+	return nil
+}
+
+func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, session remoteSession) {
+	if !target.WriteEnabled {
+		return
+	}
+	a.targetPlatformMu.Lock()
+	if a.targetPlatformSyncs == nil {
+		a.targetPlatformSyncs = make(map[string]struct{})
+	}
+	if _, running := a.targetPlatformSyncs[target.ID]; running {
+		a.targetPlatformMu.Unlock()
+		return
+	}
+	a.targetPlatformSyncs[target.ID] = struct{}{}
+	a.targetPlatformMu.Unlock()
+	defer func() {
+		a.targetPlatformMu.Lock()
+		delete(a.targetPlatformSyncs, target.ID)
+		a.targetPlatformMu.Unlock()
+	}()
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,
+		tg.platform,tg.remote_id,s.id,s.name,s.platform,s.base_url,k.key_cipher,k.models
+		FROM managed_accounts m
+		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
+		JOIN target_groups tg ON tg.id=mg.target_group_id
+		JOIN channels c ON c.id=m.channel_id
+		JOIN sources s ON s.id=c.source_id
+		JOIN source_keys k ON k.id=c.source_key_id
+		WHERE m.target_id=$1 AND m.platform<>tg.platform AND m.remote_id<>''`, target.ID)
+	if err != nil {
+		log.Printf("读取托管账号平台失败 [%s]: %v", target.ID, err)
+		return
+	}
+	type accountPlatform struct {
+		id, remoteID, remoteName, platform, targetGroupRemoteID string
+		priority, concurrency                                   int
+		schedulable                                             bool
+		source                                                  Source
+		encryptedKey                                            []byte
+		modelsJSON                                              string
+	}
+	items := []accountPlatform{}
+	for rows.Next() {
+		var item accountPlatform
+		if err = rows.Scan(&item.id, &item.remoteID, &item.remoteName, &item.priority, &item.concurrency, &item.schedulable,
+			&item.platform, &item.targetGroupRemoteID, &item.source.ID, &item.source.Name, &item.source.Platform, &item.source.BaseURL,
+			&item.encryptedKey, &item.modelsJSON); err != nil {
+			break
+		}
+		item.platform = managedPlatform(item.platform)
+		items = append(items, item)
+	}
+	_ = rows.Close()
+	if err != nil {
+		log.Printf("读取托管账号平台失败 [%s]: %v", target.ID, err)
+		return
+	}
+	failed := 0
+	for _, item := range items {
+		if err = a.replaceManagedAccountPlatform(ctx, target, session, item.id, item.remoteID, item.remoteName, item.platform, item.targetGroupRemoteID, item.priority, item.concurrency, item.schedulable, item.source, item.encryptedKey, item.modelsJSON); err != nil {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate(err.Error(), 500))
+		}
+	}
+	if failed > 0 {
+		detail := fmt.Sprintf("%s 有 %d 个托管账号的平台类型未能按目标分组同步，系统会在下一轮目标同步时重试。", target.Name, failed)
+		a.openEvent(context.Background(), "P1", "ACCOUNT_PLATFORM_SYNC", "账号平台同步失败", detail, "target-platform-sync:"+target.ID)
+	} else {
+		a.resolveEvent(context.Background(), "target-platform-sync:"+target.ID)
+	}
+}
+
+func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string) error {
+	groupID, err := strconv.Atoi(targetGroupRemoteID)
+	if err != nil {
+		return fmt.Errorf("目标分组 ID 不兼容: %w", err)
+	}
+	key, err := a.decryptSecret(encryptedKey)
+	if err != nil {
+		return fmt.Errorf("读取托管 Key 失败: %w", err)
+	}
+	models := []string{}
+	if err = json.Unmarshal([]byte(modelsJSON), &models); err != nil || len(models) == 0 {
+		return fmt.Errorf("托管账号没有可用于重建的模型列表")
+	}
+	sourceAPIBase, err := a.discoverSourceAPIBaseURL(ctx, source)
+	if err != nil {
+		return fmt.Errorf("读取源站 API 地址失败: %w", err)
+	}
+	newRemoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, platform, string(key), models, []int{groupID}, remoteName, priority, concurrency)
+	if err != nil {
+		return fmt.Errorf("创建正确类型账号失败: %w", err)
+	}
+	rollbackNew := true
+	restoreOldScheduling := false
+	defer func() {
+		if restoreOldScheduling {
+			_ = a.syncTargetAccountSchedulable(context.Background(), target.BaseURL, oldRemoteID, session, true)
+		}
+		if rollbackNew {
+			a.deleteRemoteManagedAccount(context.Background(), target.BaseURL, session, newRemoteID)
+		}
+	}()
+	if schedulable {
+		if err = a.syncTargetAccountSchedulable(ctx, target.BaseURL, oldRemoteID, session, false); err != nil {
+			return fmt.Errorf("暂停旧账号失败: %w", err)
+		}
+		restoreOldScheduling = true
+		if err = a.syncTargetAccountSchedulable(ctx, target.BaseURL, newRemoteID, session, true); err != nil {
+			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
+		}
+	}
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID)
+	if err != nil {
+		return fmt.Errorf("保存新账号关联失败: %w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return fmt.Errorf("账号关联已变化，取消平台替换")
+	}
+	restoreOldScheduling = false
+	rollbackNew = false
+	a.deleteRemoteManagedAccount(context.Background(), target.BaseURL, session, oldRemoteID)
+	a.audit(context.Background(), "REPLACE_PLATFORM", "managed_account", managedID, map[string]any{"old_remote_id": oldRemoteID, "new_remote_id": newRemoteID, "platform": platform})
 	return nil
 }
 
@@ -269,21 +401,21 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 		if err := a.ensureTargetMultiplierCacheForRead(r.Context(), id); err != nil {
 			return err
 		}
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,multiplier,multiplier_captured_at,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,platform,multiplier,multiplier_captured_at,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		items := []map[string]any{}
 		for rows.Next() {
-			var groupID, remoteID, name string
+			var groupID, remoteID, name, platform string
 			var multiplier sql.NullFloat64
 			var multiplierCaptured sql.NullTime
 			var updated time.Time
-			if err := rows.Scan(&groupID, &remoteID, &name, &multiplier, &multiplierCaptured, &updated); err != nil {
+			if err := rows.Scan(&groupID, &remoteID, &name, &platform, &multiplier, &multiplierCaptured, &updated); err != nil {
 				return err
 			}
-			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "multiplier": nullableFloat(multiplier), "multiplierCapturedAt": nullableTime(multiplierCaptured), "updatedAt": updated})
+			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "platform": platform, "multiplier": nullableFloat(multiplier), "multiplierCapturedAt": nullableTime(multiplierCaptured), "updatedAt": updated})
 		}
 		writeData(w, items)
 		return nil

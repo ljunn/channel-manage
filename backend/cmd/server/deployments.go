@@ -29,8 +29,8 @@ type deploymentSourceGroup struct {
 }
 
 type deploymentTargetGroup struct {
-	ID, Name string
-	RemoteID int
+	ID, Name, Platform string
+	RemoteID           int
 }
 
 type generatedRemoteKey struct {
@@ -141,7 +141,7 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		if len(models) == 0 {
 			return &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
 		}
-		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Platform, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
+		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
 		created[len(created)-1].Models = models
 		created[len(created)-1].Accounts = accounts
 		if accountErr != nil {
@@ -172,7 +172,7 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		}
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
-			_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, input.Priority, input.Concurrency, "channel-manage:"+managedID)
+			_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID)
 			if err != nil {
 				return err
 			}
@@ -243,7 +243,7 @@ func (a *App) validateDeploymentTargetGroups(ctx context.Context, targetID strin
 		seen[id] = true
 		var group deploymentTargetGroup
 		var remoteID string
-		if err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name FROM target_groups WHERE id=$1 AND target_id=$2`, id, targetID).Scan(&group.ID, &remoteID, &group.Name); err != nil {
+		if err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name,platform FROM target_groups WHERE id=$1 AND target_id=$2`, id, targetID).Scan(&group.ID, &remoteID, &group.Name, &group.Platform); err != nil {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组不存在或不属于该节点"}
 		}
 		numeric, err := strconv.Atoi(remoteID)
@@ -251,6 +251,7 @@ func (a *App) validateDeploymentTargetGroups(ctx context.Context, targetID strin
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组 ID 不兼容"}
 		}
 		group.RemoteID = numeric
+		group.Platform = managedPlatform(group.Platform)
 		groups = append(groups, group)
 	}
 	return groups, nil
@@ -386,12 +387,12 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 	return normalized, nil
 }
 
-func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourcePlatform, key string, models []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
+func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
 	modelMap := map[string]string{}
 	for _, model := range models {
 		modelMap[model] = model
 	}
-	payload := map[string]any{"name": name, "platform": managedPlatform(sourcePlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
+	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)
 	if err != nil {
 		return "", err
@@ -408,7 +409,7 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 	return strconv.Itoa(int(remoteID)), nil
 }
 
-func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourcePlatform, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {
+func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {
 	type accountResult struct {
 		index   int
 		account createdRemoteAccount
@@ -425,7 +426,7 @@ func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string
 			for index := range jobs {
 				targetGroup := targetGroups[index]
 				remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
-				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, sourcePlatform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
+				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, targetGroup.Platform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
 				results <- accountResult{index: index, account: createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup}, err: err}
 			}
 		}()
@@ -525,7 +526,7 @@ func deploymentError(code, groupName string, err error) error {
 		} else if strings.Contains(upperMessage, "API ENDPOINT IS NOT SERVED FROM THE PANEL DOMAIN") {
 			status = http.StatusUnprocessableEntity
 			message = "源站面板域名不提供 API，且未能读取有效的发布 API 地址"
-		} else if strings.Contains(upperMessage, "INSUFFICIENT_BALANCE") {
+		} else if insufficientBalanceError(apiErr) {
 			status = http.StatusConflict
 			message = "源站账户余额不足，无法验证新建专用 Key 的可用模型"
 		}
