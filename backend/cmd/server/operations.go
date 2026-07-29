@@ -160,14 +160,19 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	} else if success {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason='最近流式抽样成功',score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END WHERE id=$1`, id)
 	} else {
-		windowMinutes := a.settingInt(ctx, "metric_window_minutes", 5)
-		minSamples := a.settingInt(ctx, "min_error_samples", 5)
-		errorThreshold := a.settingInt(ctx, "error_rate_threshold", 20)
-		confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
-		var businessRequests, businessErrors int
-		_ = tx.QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0),COALESCE(sum(errors),0) FROM metric_buckets WHERE channel_id=$1 AND window_start>now()-$2*interval '1 minute'`, id, windowMinutes).Scan(&businessRequests, &businessErrors)
-		businessConfirmed := businessRequests >= minSamples && businessErrors*100 >= businessRequests*errorThreshold
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN ((NOT $5) AND $3) OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' WHEN $5 THEN 'HEALTHY' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN ((NOT $5) AND $3) OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN ((NOT $5) AND $3) OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures, managed)
+		if managed {
+			// Active samples are advisory for managed channels; ordinary upstream errors must not remove them from service.
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=0,lifecycle_state='HEALTHY',state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END,score=CASE WHEN lifecycle_state='QUARANTINED' THEN 100 ELSE score END WHERE id=$1`, id, truncate(errorType, 200))
+		} else {
+			windowMinutes := a.settingInt(ctx, "metric_window_minutes", 5)
+			minSamples := a.settingInt(ctx, "min_error_samples", 5)
+			errorThreshold := a.settingInt(ctx, "error_rate_threshold", 20)
+			confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
+			var businessRequests, businessErrors int
+			_ = tx.QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0),COALESCE(sum(errors),0) FROM metric_buckets WHERE channel_id=$1 AND window_start>now()-$2*interval '1 minute'`, id, windowMinutes).Scan(&businessRequests, &businessErrors)
+			businessConfirmed := businessRequests >= minSamples && businessErrors*100 >= businessRequests*errorThreshold
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures)
+		}
 	}
 	if err != nil {
 		return err
