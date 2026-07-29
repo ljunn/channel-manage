@@ -121,7 +121,11 @@ func (a *App) measureFirstToken(ctx context.Context, baseURL, key, model string)
 func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sourceName, sourceBase, keyName, groupName, key, modelsJSON string) error {
 	models := []string{}
 	_ = json.Unmarshal([]byte(modelsJSON), &models)
-	firstTokenMs, probeModels, requestErr := a.measureProbeModels(ctx, id, sourceBase, key, models)
+	firstTokenMs, probeModels, unavailableModels, requestErr := a.measureProbeModels(ctx, id, sourceBase, key, models)
+	if requestErr == nil && len(probeModels) == 0 && len(unavailableModels) > 0 {
+		_, err := a.db.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+		return err
+	}
 	modelLabel := strings.Join(probeModels, "、")
 	success := requestErr == nil && firstTokenMs <= maxFirstTokenMs
 	errorType, summary := classifyProbeFailure(requestErr)

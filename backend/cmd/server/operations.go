@@ -99,10 +99,18 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	probeKind := "LIGHT"
 	var firstTokenValue any
 	slowFirstToken := false
+	skippedActiveProbe := false
 	if managed {
-		probeKind = "ACTIVE"
-		firstTokenMs, probeModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
-		if len(probeModels) == 0 {
+		firstTokenMs, probeModels, unavailableModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
+		unavailableNote := ""
+		if len(unavailableModels) > 0 {
+			unavailableNote = fmt.Sprintf("；已跳过不支持的分组测试模型 %s", strings.Join(unavailableModels, "、"))
+		}
+		if len(probeModels) == 0 && len(unavailableModels) > 0 && sampleErr == nil {
+			skippedActiveProbe = true
+			summary = truncate(summary+unavailableNote, 200)
+		} else if len(probeModels) == 0 {
+			probeKind = "ACTIVE"
 			requestErr = sampleErr
 			errorType = "PROBE_MODEL_UNAVAILABLE"
 			if requestErr == nil {
@@ -111,6 +119,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 			summary = truncate(requestErr.Error(), 200)
 			latency = 0
 		} else {
+			probeKind = "ACTIVE"
 			latency = firstTokenMs
 			firstTokenValue = firstTokenMs
 			requestErr = sampleErr
@@ -128,6 +137,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				errorType = ""
 				summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
 			}
+			summary = truncate(summary+unavailableNote, 200)
 		}
 	}
 	success := requestErr == nil && !slowFirstToken
@@ -145,6 +155,8 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	}
 	if slowFirstToken {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,score=0,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, slowFirstTokenReason(latency))
+	} else if success && skippedActiveProbe {
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
 	} else if success {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason='最近流式抽样成功',score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END WHERE id=$1`, id)
 	} else {

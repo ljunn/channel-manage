@@ -70,7 +70,7 @@ func intersectModels(left, right []string) []string {
 
 func preferredProbeModel(platform string, models []string) string {
 	preferences := map[string][]string{
-		"openai":    {"gpt-5.4", "gpt-5.5", "gpt-5.4-mini"},
+		"openai":    {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"},
 		"anthropic": {"claude-sonnet-4-6", "claude-sonnet-4-5-20250929"},
 		"gemini":    {"gemini-2.5-pro", "gemini-2.5-flash"},
 		"grok":      {"grok-4.3"},
@@ -136,10 +136,10 @@ func (a *App) ensureTargetProbeModels(ctx context.Context, targetID string) erro
 	return nil
 }
 
-func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string, sourceModels []string) ([]string, error) {
+func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string, sourceModels []string) ([]string, []string, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT tg.name,tg.probe_model FROM managed_accounts m JOIN managed_account_groups mg ON mg.managed_account_id=m.id JOIN target_groups tg ON tg.id=mg.target_group_id WHERE m.channel_id=$1 ORDER BY tg.name`, channelID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	available := map[string]bool{}
@@ -147,17 +147,19 @@ func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string
 		available[model] = true
 	}
 	models := []string{}
+	unavailable := []string{}
 	seen := map[string]bool{}
 	for rows.Next() {
 		var groupName, model string
 		if err = rows.Scan(&groupName, &model); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if model == "" {
-			return nil, fmt.Errorf("目标分组 %s 尚未指定测试模型", groupName)
+			return nil, nil, fmt.Errorf("目标分组 %s 尚未指定测试模型", groupName)
 		}
 		if !available[model] {
-			return nil, fmt.Errorf("目标分组 %s 指定的测试模型 %s 不在该渠道模型中", groupName, model)
+			unavailable = append(unavailable, fmt.Sprintf("%s：%s", groupName, model))
+			continue
 		}
 		if !seen[model] {
 			seen[model] = true
@@ -165,16 +167,20 @@ func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string
 		}
 	}
 	if len(models) == 0 {
-		return nil, fmt.Errorf("渠道没有关联可测试的目标分组")
+		if len(unavailable) > 0 {
+			return models, unavailable, rows.Err()
+		}
+		return nil, nil, fmt.Errorf("渠道没有关联可测试的目标分组")
 	}
 	sort.Strings(models)
-	return models, rows.Err()
+	sort.Strings(unavailable)
+	return models, unavailable, rows.Err()
 }
 
-func (a *App) measureProbeModels(ctx context.Context, channelID, baseURL, key string, sourceModels []string) (int, []string, error) {
-	models, err := a.configuredChannelProbeModels(ctx, channelID, sourceModels)
+func (a *App) measureProbeModels(ctx context.Context, channelID, baseURL, key string, sourceModels []string) (int, []string, []string, error) {
+	models, unavailable, err := a.configuredChannelProbeModels(ctx, channelID, sourceModels)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	maximum := 0
 	for _, model := range models {
@@ -183,11 +189,11 @@ func (a *App) measureProbeModels(ctx context.Context, channelID, baseURL, key st
 			maximum = firstTokenMs
 		}
 		if sampleErr != nil {
-			return maximum, models, fmt.Errorf("测试模型 %s：%w", model, sampleErr)
+			return maximum, models, unavailable, fmt.Errorf("测试模型 %s：%w", model, sampleErr)
 		}
 		if firstTokenMs > maxFirstTokenMs {
-			return maximum, models, nil
+			return maximum, models, unavailable, nil
 		}
 	}
-	return maximum, models, nil
+	return maximum, models, unavailable, nil
 }

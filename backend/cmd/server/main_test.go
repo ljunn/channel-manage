@@ -709,7 +709,7 @@ func TestTargetGroupProbeModelsKeepsOnlyPlatformTextModels(t *testing.T) {
 	if !reflect.DeepEqual(models, []string{"gpt-5.5", "gpt-5.4"}) {
 		t.Fatalf("probe models=%#v", models)
 	}
-	if got := preferredProbeModel("openai", models); got != "gpt-5.4" {
+	if got := preferredProbeModel("openai", models); got != "gpt-5.5" {
 		t.Fatalf("preferred probe model=%q", got)
 	}
 }
