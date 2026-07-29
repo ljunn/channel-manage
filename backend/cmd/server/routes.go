@@ -318,6 +318,8 @@ func (a *App) deleteSource(w http.ResponseWriter, r *http.Request, id string) er
 	if affected == 0 {
 		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 	}
+	a.resolveEvent(r.Context(), "source-scan:"+id)
+	a.resolveEvent(r.Context(), "source-balance:"+id)
 	a.audit(r.Context(), "DELETE", "source", id, nil)
 	writeData(w, map[string]bool{"deleted": true})
 	return nil
