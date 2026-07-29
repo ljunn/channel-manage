@@ -39,7 +39,7 @@ func slowRecoveryIntervalSeconds(failures, recoverySuccesses int) int {
 }
 
 func selectFirstTokenProbeModel(models []string) string {
-	excluded := []string{"embedding", "rerank", "moderation", "whisper", "audio", "tts", "image", "dall-e", "video"}
+	excluded := []string{"auto-review", "embedding", "rerank", "moderation", "whisper", "audio", "realtime", "tts", "image", "dall-e", "video"}
 	for _, model := range models {
 		value := strings.ToLower(strings.TrimSpace(model))
 		if value == "" {

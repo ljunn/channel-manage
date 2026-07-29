@@ -697,7 +697,7 @@ func TestSlowRecoveryIntervalBacksOff(t *testing.T) {
 }
 
 func TestSelectFirstTokenProbeModelSkipsNonTextModels(t *testing.T) {
-	models := []string{"text-embedding-3-small", "whisper-1", "gpt-4.1-mini"}
+	models := []string{"codex-auto-review", "text-embedding-3-small", "whisper-1", "gpt-4.1-mini"}
 	if got := selectFirstTokenProbeModel(models); got != "gpt-4.1-mini" {
 		t.Fatalf("selected model=%q", got)
 	}
