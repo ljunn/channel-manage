@@ -32,6 +32,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1`,
 		`ALTER TABLE sources DROP COLUMN IF EXISTS asset_mode`,
+		`UPDATE sources SET scan_status='IDLE',last_error='',updated_at=now() WHERE scan_status='RUNNING'`,
 		`CREATE TABLE IF NOT EXISTS source_keys (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 			name TEXT NOT NULL, key_cipher BYTEA NOT NULL, key_hint TEXT NOT NULL, production_authorized BOOLEAN NOT NULL DEFAULT false,
