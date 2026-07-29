@@ -26,16 +26,26 @@ type deploymentSourceGroup struct {
 	ID, RemoteID, Name string
 }
 
+type deploymentTargetGroup struct {
+	ID, Name string
+	RemoteID int
+}
+
 type generatedRemoteKey struct {
 	ID, Name, Key string
 }
 
 type createdDeployment struct {
-	SourceGroup   deploymentSourceGroup
-	Key           generatedRemoteKey
-	Models        []string
-	RemoteAccount string
-	RemoteName    string
+	SourceGroup deploymentSourceGroup
+	Key         generatedRemoteKey
+	Models      []string
+	Accounts    []createdRemoteAccount
+}
+
+type createdRemoteAccount struct {
+	RemoteID    string
+	RemoteName  string
+	TargetGroup deploymentTargetGroup
 }
 
 func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceID string) error {
@@ -48,6 +58,9 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	}
 	if len(input.SourceGroupIDs) > 50 {
 		return &apiError{400, "TOO_MANY_GROUPS", "每次最多映射 50 个源分组"}
+	}
+	if len(input.SourceGroupIDs)*len(input.TargetGroupIDs) > 100 {
+		return &apiError{400, "TOO_MANY_MAPPINGS", "每次最多创建 100 个独立托管账号"}
 	}
 	if input.Priority < 101 {
 		input.Priority = 101
@@ -80,12 +93,13 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if err != nil {
 		return err
 	}
-	targetRemoteIDs, err := a.validateDeploymentTargetGroups(r.Context(), input.TargetID, input.TargetGroupIDs)
+	targetGroups, err := a.validateDeploymentTargetGroups(r.Context(), input.TargetID, input.TargetGroupIDs)
 	if err != nil {
 		return err
 	}
 
-	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(len(sourceGroups)+1)*30*time.Second)
+	operationCount := len(sourceGroups) + len(sourceGroups)*len(targetGroups)
+	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(operationCount+1)*30*time.Second)
 	defer cancel()
 	sourceSession, err := a.authenticateSource(requestCtx, source, sourceCredential, true)
 	if err != nil {
@@ -105,8 +119,8 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
 		for index := len(created) - 1; index >= 0; index-- {
-			if created[index].RemoteAccount != "" {
-				a.deleteRemoteManagedAccount(cleanupCtx, target.BaseURL, targetSession, created[index].RemoteAccount)
+			for accountIndex := len(created[index].Accounts) - 1; accountIndex >= 0; accountIndex-- {
+				a.deleteRemoteManagedAccount(cleanupCtx, target.BaseURL, targetSession, created[index].Accounts[accountIndex].RemoteID)
 			}
 			a.deleteGeneratedRemoteKey(cleanupCtx, source.BaseURL, source.Platform, sourceSession, created[index].Key.ID)
 		}
@@ -127,14 +141,12 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		if len(models) == 0 {
 			return &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
 		}
-		remoteName := "[托管] " + source.Name + " / " + group.Name
-		remoteAccount, accountErr := a.createRemoteManagedAccount(requestCtx, target.BaseURL, targetSession, source.BaseURL, source.Platform, remoteKey.Key, models, targetRemoteIDs, remoteName, input.Priority, input.Concurrency)
+		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, source.BaseURL, source.Platform, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
+		created[len(created)-1].Models = models
+		created[len(created)-1].Accounts = accounts
 		if accountErr != nil {
 			return deploymentError("TARGET_ACCOUNT_CREATE_FAILED", group.Name, accountErr)
 		}
-		created[len(created)-1].Models = models
-		created[len(created)-1].RemoteAccount = remoteAccount
-		created[len(created)-1].RemoteName = remoteName
 	}
 
 	tx, err := a.db.BeginTx(r.Context(), nil)
@@ -142,7 +154,7 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		return err
 	}
 	defer tx.Rollback()
-	result := make([]map[string]any, 0, len(created))
+	result := make([]map[string]any, 0, len(sourceGroups)*len(targetGroups))
 	for _, item := range created {
 		keyID := uuid.NewString()
 		encryptedKey, encryptErr := a.encryptSecret([]byte(item.Key.Key))
@@ -158,26 +170,26 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		if err != nil {
 			return err
 		}
-		managedID := uuid.NewString()
-		_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8,'SYNCED')`, managedID, input.TargetID, channelID, item.RemoteAccount, item.RemoteName, input.Priority, input.Concurrency, "channel-manage:"+managedID)
-		if err != nil {
-			return err
-		}
-		for _, targetGroupID := range input.TargetGroupIDs {
-			if _, err = tx.ExecContext(r.Context(), `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, targetGroupID); err != nil {
+		for _, account := range item.Accounts {
+			managedID := uuid.NewString()
+			_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,priority,concurrency,schedulable,ownership_marker,sync_status) VALUES($1,$2,$3,$4,$5,$6,$7,false,$8,'SYNCED')`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, input.Priority, input.Concurrency, "channel-manage:"+managedID)
+			if err != nil {
 				return err
 			}
+			if _, err = tx.ExecContext(r.Context(), `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, account.TargetGroup.ID); err != nil {
+				return err
+			}
+			result = append(result, map[string]any{"sourceGroupId": item.SourceGroup.ID, "sourceGroupName": item.SourceGroup.Name, "targetGroupId": account.TargetGroup.ID, "targetGroupName": account.TargetGroup.Name, "managedAccountId": managedID, "remoteAccountId": account.RemoteID})
 		}
-		result = append(result, map[string]any{"sourceGroupId": item.SourceGroup.ID, "sourceGroupName": item.SourceGroup.Name, "managedAccountId": managedID, "remoteAccountId": item.RemoteAccount})
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
 	committed = true
 	for _, item := range result {
-		a.audit(r.Context(), "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_ids": input.TargetGroupIDs})
+		a.audit(r.Context(), "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_id": item["targetGroupId"]})
 	}
-	writeData(w, map[string]any{"created": len(result), "items": result, "schedulable": false})
+	writeData(w, map[string]any{"created": len(result), "sourceKeysCreated": len(created), "items": result, "schedulable": false})
 	return nil
 }
 
@@ -209,25 +221,27 @@ func (a *App) validateDeploymentSourceGroups(ctx context.Context, sourceID, targ
 	return groups, nil
 }
 
-func (a *App) validateDeploymentTargetGroups(ctx context.Context, targetID string, ids []string) ([]int, error) {
+func (a *App) validateDeploymentTargetGroups(ctx context.Context, targetID string, ids []string) ([]deploymentTargetGroup, error) {
 	seen := map[string]bool{}
-	remoteIDs := make([]int, 0, len(ids))
+	groups := make([]deploymentTargetGroup, 0, len(ids))
 	for _, id := range ids {
 		if id == "" || seen[id] {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组选择无效"}
 		}
 		seen[id] = true
+		var group deploymentTargetGroup
 		var remoteID string
-		if err := a.db.QueryRowContext(ctx, `SELECT remote_id FROM target_groups WHERE id=$1 AND target_id=$2`, id, targetID).Scan(&remoteID); err != nil {
+		if err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name FROM target_groups WHERE id=$1 AND target_id=$2`, id, targetID).Scan(&group.ID, &remoteID, &group.Name); err != nil {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组不存在或不属于该节点"}
 		}
 		numeric, err := strconv.Atoi(remoteID)
 		if err != nil {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组 ID 不兼容"}
 		}
-		remoteIDs = append(remoteIDs, numeric)
+		group.RemoteID = numeric
+		groups = append(groups, group)
 	}
-	return remoteIDs, nil
+	return groups, nil
 }
 
 func (a *App) createGeneratedRemoteKey(ctx context.Context, baseURL, platform string, session remoteSession, groupRemoteID, name string) (generatedRemoteKey, error) {
@@ -355,6 +369,19 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 	return strconv.Itoa(int(remoteID)), nil
 }
 
+func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourcePlatform, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {
+	accounts := make([]createdRemoteAccount, 0, len(targetGroups))
+	for _, targetGroup := range targetGroups {
+		remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
+		remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, sourcePlatform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
+		if err != nil {
+			return accounts, fmt.Errorf("目标分组 %s：%w", targetGroup.Name, err)
+		}
+		accounts = append(accounts, createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup})
+	}
+	return accounts, nil
+}
+
 func (a *App) deleteGeneratedRemoteKey(ctx context.Context, baseURL, platform string, session remoteSession, id string) {
 	if id == "" {
 		return
@@ -377,6 +404,21 @@ func managedObjectName(sourceName, groupName, suffix string) string {
 		value = string(runes[:50])
 	}
 	return value
+}
+
+func managedAccountName(sourceName, sourceGroupName, targetGroupName string, targetGroupRemoteID int) string {
+	suffix := fmt.Sprintf(" / %s #%d", strings.TrimSpace(targetGroupName), targetGroupRemoteID)
+	prefix := "[托管] " + strings.TrimSpace(sourceName) + " / " + strings.TrimSpace(sourceGroupName)
+	value := prefix + suffix
+	runes := []rune(value)
+	if len(runes) <= 80 {
+		return value
+	}
+	suffixRunes := []rune(suffix)
+	if len(suffixRunes) >= 80 {
+		return string(suffixRunes[:80])
+	}
+	return string([]rune(prefix)[:80-len(suffixRunes)]) + suffix
 }
 
 func deploymentError(code, groupName string, err error) error {

@@ -330,8 +330,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .preview-source { min-width: 0; display: grid; gap: 2px; }
 .preview-source strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .preview-source small { color: var(--teal-700); font-size: 11px; font-weight: 600; }
-.preview-targets { min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; }
-.preview-targets > span { max-width: 100%; padding: 4px 7px; border-radius: 5px; background: var(--teal-50); color: var(--teal-700); font-size: 11px; overflow-wrap: anywhere; }
+.preview-target { min-width: 0; display: grid; gap: 2px; }
+.preview-target strong { overflow-wrap: anywhere; font-size: 12px; }
+.preview-target small { color: var(--muted); font-size: 10px; }
 .mapping-submit { display: flex; align-items: end; justify-content: space-between; gap: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .mapping-options { width: min(260px,100%); display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .mapping-submit-action { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 12px; }

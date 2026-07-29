@@ -38,6 +38,7 @@ const showSearch = computed(() => searchableRoutes.has(route.value))
 const writableTargets = computed(() => data.targets.filter(item => item.writeEnabled))
 const selectedSourceGroups = computed(() => (sourceDetail.value?.groups||[]).filter(group => form.sourceGroupIDs?.includes(group.id)))
 const selectedTargetGroups = computed(() => targetGroups.value.filter(group => form.targetGroupIDs?.includes(group.id)))
+const mappingPairs = computed(() => selectedSourceGroups.value.flatMap(sourceGroup => selectedTargetGroups.value.map(targetGroup => ({ id:`${sourceGroup.id}:${targetGroup.id}`, sourceGroup, targetGroup }))))
 const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
 
@@ -50,12 +51,15 @@ async function loadVersion(){
 }
 
 async function api(path, init={}) {
+	const timeout=init.timeout||30000
+	const requestInit={...init}
+	delete requestInit.timeout
   const headers = new Headers(init.headers || {})
   headers.set('accept','application/json')
   if (init.body) headers.set('content-type','application/json')
   if (token.value) headers.set('authorization',`Bearer ${token.value}`)
   let response
-  try { response = await fetch(`/api${path}`, { ...init, headers, signal: AbortSignal.timeout(30000) }) }
+  try { response = await fetch(`/api${path}`, { ...requestInit, headers, signal: AbortSignal.timeout(timeout) }) }
   catch (reason) { throw new Error(reason?.name === 'TimeoutError' ? '请求超时' : '无法连接服务') }
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) { if(response.status===401 && path!='/auth/login') logout(false); throw new Error(payload.error?.message || `请求失败 (${response.status})`) }
@@ -121,7 +125,9 @@ function toggleTargetGroups(){const available=targetGroups.value.map(group=>grou
 async function deploySourceGroups(){
   if(!form.sourceGroupIDs?.length){showError(new Error('请至少选择一个源分组'));return}
   if(!form.targetID||!form.targetGroupIDs?.length){showError(new Error('请选择目标节点和目标分组'));return}
-  await submit(()=>api(`/sources/${selectedSource.value}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||101),concurrency:Number(form.concurrency||1)})}),`已自动创建 ${form.sourceGroupIDs.length} 个专用 Key 和托管账号，默认停止调度`)
+  const accountCount=form.sourceGroupIDs.length*form.targetGroupIDs.length
+  const timeout=(form.sourceGroupIDs.length+accountCount+1)*30000
+  await submit(()=>api(`/sources/${selectedSource.value}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||101),concurrency:Number(form.concurrency||1)}),timeout}),`已自动创建 ${form.sourceGroupIDs.length} 个专用 Key 和 ${accountCount} 个独立托管账号，默认停止调度`)
 }
 async function createPolicy(){await submit(()=>api('/policies',{method:'POST',body:body({name:form.name,scopeType:'GLOBAL',config:{maxMultiplier:Number(form.maxMultiplier||1),minSuccessRate:Number(form.minSuccessRate||95),minSamples:Number(form.minSamples||5),confirmationFailures:Number(form.confirmationFailures||3),cooldownMinutes:Number(form.cooldownMinutes||15)}})}),'策略草稿已创建')}
 async function activatePolicy(policy){await action(()=>api(`/policies/${policy.id}/activate-version`,{method:'POST',body:body({version:policy.activeVersion||1})}),'策略已启用')}
@@ -255,11 +261,11 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <div><Database :size="18"/><span><small>数据源</small><strong>{{ sourceDetail.source.name }}</strong></span></div>
         <ArrowRight :size="18"/>
         <div><Network :size="18"/><span><small>目标节点</small><strong>{{ selectedTarget?.name||'尚未选择' }}</strong></span></div>
-        <span class="mapping-cardinality">1 : N</span>
+        <span class="mapping-cardinality">1 个源分组 : N 个独立账号</span>
       </div>
       <div class="mapping-builder">
         <section class="mapping-step">
-          <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>每个源分组创建一个独立托管账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
+          <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>每个源分组为每个目标分组创建独立账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
           <div class="source-option-list">
             <label v-for="group in sourceDetail.groups" :key="group.id" class="source-option" :class="{selected:form.sourceGroupIDs?.includes(group.id),mapped:isGroupMapped(group)}">
               <input v-model="form.sourceGroupIDs" type="checkbox" :value="group.id" :disabled="isGroupMapped(group)" :aria-label="`选择 ${group.name}`"/>
@@ -269,7 +275,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
           </div>
         </section>
         <section class="mapping-step">
-          <header><span class="step-index">2</span><div><h3>选择目标分组</h3><small>一个托管账号可同时加入多个分组</small></div></header>
+          <header><span class="step-index">2</span><div><h3>选择目标分组</h3><small>每个目标分组对应一个独立托管账号</small></div></header>
           <label class="target-node-select"><span>目标节点</span><select v-model="form.targetID" required @change="loadTargetGroups"><option value="" disabled>请选择</option><option v-for="item in writableTargets" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
           <div class="target-group-head"><span>目标分组 <b>{{ form.targetGroupIDs?.length||0 }}/{{ targetGroups.length }}</b></span><button v-if="targetGroups.length" type="button" class="btn small" @click="toggleTargetGroups"><Check :size="14"/>全选</button></div>
           <div class="target-option-list">
@@ -279,15 +285,15 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         </section>
       </div>
       <section class="mapping-preview">
-        <header><span class="step-index">3</span><div><h3>映射预览</h3><small>每一行都是一个源分组到多个目标分组的一对多关系</small></div></header>
+        <header><span class="step-index">3</span><div><h3>账号预览</h3><small>每一行都会创建一个账号，并由对应目标分组单独调度</small></div></header>
         <div v-if="!selectedSourceGroups.length||!selectedTargetGroups.length" class="mapping-preview-empty">选择两侧分组后，这里会显示最终映射关系</div>
         <div v-else class="mapping-preview-list">
-          <div v-for="group in selectedSourceGroups" :key="group.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ group.name }}</strong><small>{{ multiplierLabel(group.multiplier) }}</small></span><ArrowRight :size="18"/><span class="preview-targets"><span v-for="targetGroup in selectedTargetGroups" :key="targetGroup.id">{{ targetGroup.name }}</span></span></div>
+          <div v-for="pair in mappingPairs" :key="pair.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ pair.sourceGroup.name }}</strong><small>{{ multiplierLabel(pair.sourceGroup.multiplier) }}</small></span><ArrowRight :size="18"/><span class="preview-target"><strong>{{ pair.targetGroup.name }}</strong><small>独立托管账号</small></span></div>
         </div>
       </section>
       <footer class="mapping-submit">
         <div class="mapping-options"><label><span>优先级</span><input v-model="form.priority" type="number" min="101"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
-        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ form.sourceGroupIDs?.length||0 }} 个托管账号，每个绑定 {{ form.targetGroupIDs?.length||0 }} 个目标分组</small><button class="btn primary" :disabled="loading||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>确认创建</button></div>
+        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），每个账号只绑定 1 个目标分组</small><button class="btn primary" :disabled="loading||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>确认创建</button></div>
       </footer>
     </form>
   </ModalShell>

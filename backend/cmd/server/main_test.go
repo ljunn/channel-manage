@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -80,6 +82,45 @@ func TestUnwrapEnvelope(t *testing.T) {
 	value, err = unwrapEnvelope(direct, "SUB2API")
 	if err != nil || len(value.([]any)) != 1 {
 		t.Fatalf("direct Sub2API response was not accepted: %#v, %v", value, err)
+	}
+}
+
+func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T) {
+	requests := []map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"code":0,"data":{"id":%d}}`, len(requests))))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	targetGroups := []deploymentTargetGroup{
+		{ID: "local-1", Name: "低倍率", RemoteID: 11},
+		{ID: "local-2", Name: "高质量", RemoteID: 22},
+	}
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "SUB2API", "源站", "分组 A", "sk-test", []string{"gpt-test"}, targetGroups, 101, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 2 || len(requests) != 2 {
+		t.Fatalf("expected two independent accounts, got accounts=%d requests=%d", len(accounts), len(requests))
+	}
+	for index, request := range requests {
+		groupIDs, ok := request["group_ids"].([]any)
+		if !ok || len(groupIDs) != 1 || int(groupIDs[0].(float64)) != targetGroups[index].RemoteID {
+			t.Fatalf("account %d has invalid group_ids: %#v", index, request["group_ids"])
+		}
+		if !strings.Contains(request["name"].(string), targetGroups[index].Name) {
+			t.Fatalf("account %d name does not identify target group: %q", index, request["name"])
+		}
 	}
 }
 
