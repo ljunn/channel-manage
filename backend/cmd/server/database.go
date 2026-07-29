@@ -128,6 +128,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING', idempotency_key TEXT NOT NULL UNIQUE,
 			approved_at TIMESTAMPTZ, executed_at TIMESTAMPTZ, error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE action_intents DROP CONSTRAINT IF EXISTS action_intents_idempotency_key_key`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_action_intents_pending_key ON action_intents(idempotency_key) WHERE status IN ('PENDING','APPROVED')`,
 		`UPDATE action_intents SET status='REJECTED',error='已由自动策略执行替代',executed_at=now() WHERE status='PENDING'`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), severity TEXT NOT NULL, category TEXT NOT NULL, title TEXT NOT NULL,

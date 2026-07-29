@@ -18,7 +18,8 @@ const endpointLabels={
       const points=chart.getDatasetMeta(index).data
       const last=points?.[points.length-1]
       if(last?.x==null||last?.y==null)return
-      labels.push({dataset,last,y:last.y,color:dataset.borderColor})
+      const currentValue=Number(dataset.data?.[points.length-1]?.y)
+      labels.push({dataset,last,y:last.y,color:dataset.borderColor,currentValue})
     })
     if(!labels.length)return
     labels.sort((left,right)=>left.y-right.y)
@@ -34,7 +35,10 @@ const endpointLabels={
     labels.forEach(item=>{
       const fullLabel=item.dataset.label||''
       const labelX=chartArea.right+16
-      const maxWidth=chart.width-labelX-8
+      const valueLabel=Number.isFinite(item.currentValue)?`×${item.currentValue.toFixed(4)}`:'--'
+      const valueX=chart.width-8
+      const valueWidth=ctx.measureText(valueLabel).width
+      const maxWidth=Math.max(24,valueX-valueWidth-labelX-10)
       let label=fullLabel
       while(label.length>2&&ctx.measureText(`${label}…`).width>maxWidth)label=label.slice(0,-1)
       if(label!==fullLabel)label+='…'
@@ -47,6 +51,8 @@ const endpointLabels={
       ctx.fillStyle=item.color
       ctx.textAlign='left'
       ctx.fillText(label,labelX,item.labelY)
+      ctx.textAlign='right'
+      ctx.fillText(valueLabel,valueX,item.labelY)
     })
     ctx.restore()
   },
@@ -55,9 +61,10 @@ const endpointLabels={
 function render(){
   if(!canvas.value)return
   chart?.destroy()
-  const datasets=activeGroups.value.map((group,index)=>({label:group.targetName?`${group.targetName} / ${group.name}`:group.name,data:props.points.filter(point=>point.targetGroupId===group.id&&point[props.metric]!=null).map(point=>({x:new Date(point.capturedAt).getTime(),y:Number(point[props.metric])})),borderColor:palette[index%palette.length],backgroundColor:palette[index%palette.length],borderWidth:2,pointRadius:2.5,pointHoverRadius:5,tension:.24,spanGaps:true}))
+  const duplicateNames=new Set(activeGroups.value.filter((group,index,items)=>items.some((other,otherIndex)=>otherIndex!==index&&other.name===group.name)).map(group=>group.name))
+  const datasets=activeGroups.value.map((group,index)=>({label:duplicateNames.has(group.name)&&group.targetName?`${group.targetName} / ${group.name}`:group.name,data:props.points.filter(point=>point.targetGroupId===group.id&&point[props.metric]!=null).map(point=>({x:new Date(point.capturedAt).getTime(),y:Number(point[props.metric])})),borderColor:palette[index%palette.length],backgroundColor:palette[index%palette.length],borderWidth:2,pointRadius:2.5,pointHoverRadius:5,tension:.24,spanGaps:true}))
   const compact=window.matchMedia('(max-width: 760px)').matches
-  chart=new Chart(canvas.value,{type:'line',data:{datasets},plugins:[endpointLabels],options:{responsive:true,maintainAspectRatio:false,layout:{padding:{right:compact?100:235}},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:context=>`${context.dataset.label} · ${metricLabels[props.metric]} ×${context.parsed.y.toFixed(4)}`}}},scales:{x:{type:'linear',grid:{display:false},ticks:{maxTicksLimit:compact?4:7,callback:value=>new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit'}).format(new Date(value))},title:{display:true,text:'时间'}},y:{beginAtZero:false,grid:{color:'#edf1f3'},ticks:{callback:value=>`×${Number(value).toFixed(2)}`},title:{display:true,text:'倍率'}}}}})
+  chart=new Chart(canvas.value,{type:'line',data:{datasets},plugins:[endpointLabels],options:{responsive:true,maintainAspectRatio:false,layout:{padding:{right:compact?145:285}},interaction:{mode:'nearest',intersect:false},plugins:{legend:{display:false},tooltip:{callbacks:{label:context=>`${context.dataset.label} · ${metricLabels[props.metric]} ×${context.parsed.y.toFixed(4)}`}}},scales:{x:{type:'linear',grid:{display:false},ticks:{maxTicksLimit:compact?4:7,callback:value=>new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit'}).format(new Date(value))},title:{display:true,text:'时间'}},y:{beginAtZero:false,grid:{color:'#edf1f3'},ticks:{callback:value=>`×${Number(value).toFixed(2)}`},title:{display:true,text:'倍率'}}}}})
 }
 onMounted(render)
 watch(()=>[props.points,props.metric,props.selectedGroup,props.groups],render,{deep:true})

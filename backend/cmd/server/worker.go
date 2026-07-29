@@ -10,24 +10,51 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
+const (
+	fastProbeIntervalSeconds = 15
+	recoverySuccessSamples   = 3
+	maxConcurrentProbes      = 6
+)
+
 func (a *App) runScheduler(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	recoveryTicker := time.NewTicker(15 * time.Second)
+	maintenanceTicker := time.NewTicker(30 * time.Second)
+	defer recoveryTicker.Stop()
+	defer maintenanceTicker.Stop()
 	a.runAutomation(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			a.runAutomation(ctx)
+		case <-recoveryTicker.C:
+			a.runRecovery(ctx)
+		case <-maintenanceTicker.C:
+			a.runMaintenance(ctx)
 		}
 	}
 }
 
 func (a *App) runAutomation(ctx context.Context) {
+	a.runRecovery(ctx)
+	a.runMaintenance(ctx)
+}
+
+func (a *App) runRecovery(ctx context.Context) {
+	if !a.recoveryMu.TryLock() {
+		return
+	}
+	defer a.recoveryMu.Unlock()
+	a.probeDueChannels(ctx)
+	if err := a.evaluateManagedAccounts(ctx); err != nil {
+		log.Printf("策略评估失败: %v", err)
+	}
+}
+
+func (a *App) runMaintenance(ctx context.Context) {
 	if !a.workerMu.TryLock() {
 		return
 	}
@@ -35,15 +62,11 @@ func (a *App) runAutomation(ctx context.Context) {
 	a.scanDueSources(ctx)
 	a.syncDueTargets(ctx)
 	a.syncDueTargetMetrics(ctx)
-	a.probeDueChannels(ctx)
-	if err := a.evaluateManagedAccounts(ctx); err != nil {
-		log.Printf("策略评估失败: %v", err)
-	}
 }
 
 func (a *App) runPolicyEvaluation(ctx context.Context) {
-	a.workerMu.Lock()
-	defer a.workerMu.Unlock()
+	a.recoveryMu.Lock()
+	defer a.recoveryMu.Unlock()
 	if err := a.evaluateManagedAccounts(ctx); err != nil {
 		log.Printf("策略评估失败: %v", err)
 	}
@@ -92,23 +115,114 @@ func (a *App) syncDueTargets(ctx context.Context) {
 
 func (a *App) probeDueChannels(ctx context.Context) {
 	interval := a.settingInt(ctx, "probe_interval_seconds", 900)
-	rows, err := a.db.QueryContext(ctx, `SELECT id FROM channels WHERE lifecycle_state<>'MANUAL_HOLD' AND (last_probe_at IS NULL OR last_probe_at + $1 * interval '1 second' <= now())`, interval)
+	fastIntervals := a.fastProbeIntervals(ctx)
+	rows, err := a.db.QueryContext(ctx, `SELECT id,last_probe_at FROM channels WHERE lifecycle_state<>'MANUAL_HOLD'`)
 	if err != nil {
 		return
 	}
-	defer rows.Close()
 	ids := []string{}
 	for rows.Next() {
 		var id string
-		if rows.Scan(&id) == nil {
+		var lastProbe sql.NullTime
+		if rows.Scan(&id, &lastProbe) == nil {
+			dueInterval := interval
+			if fastInterval, fast := fastIntervals[id]; fast {
+				dueInterval = fastInterval
+			}
+			if lastProbe.Valid && time.Since(lastProbe.Time) < time.Duration(dueInterval)*time.Second {
+				continue
+			}
 			ids = append(ids, id)
 		}
 	}
-	for _, id := range ids {
-		if err := a.probeChannel(ctx, id); err != nil {
-			log.Printf("渠道 %s 探测失败: %v", id, err)
+	_ = rows.Close()
+	a.probeChannels(ctx, ids)
+}
+
+func (a *App) fastProbeIntervals(ctx context.Context) map[string]int {
+	configs := map[string]policyConfig{}
+	rows, err := a.db.QueryContext(ctx, `SELECT p.scope_id,v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version WHERE p.status='ACTIVE' AND p.scope_type='TARGET_GROUP'`)
+	if err != nil {
+		return nil
+	}
+	for rows.Next() {
+		var scopeID, configData string
+		if rows.Scan(&scopeID, &configData) == nil {
+			var config policyConfig
+			_ = json.Unmarshal([]byte(configData), &config)
+			configs[scopeID] = normalizePolicyConfig(config)
 		}
 	}
+	_ = rows.Close()
+	if len(configs) == 0 {
+		return nil
+	}
+	candidates, err := a.managedPolicyCandidates(ctx)
+	if err != nil {
+		return nil
+	}
+	result := map[string]int{}
+	for _, candidate := range candidates {
+		config, configured := configs[candidate.TargetGroupID]
+		if !configured || !candidateCanRecoverWithProbe(candidate, config) {
+			continue
+		}
+		if len(policyRejectionReasons(candidate, config)) == 0 {
+			continue
+		}
+		probeInterval := fastProbeIntervalFor(candidate)
+		if current, exists := result[candidate.ChannelID]; !exists || probeInterval < current {
+			result[candidate.ChannelID] = probeInterval
+		}
+	}
+	return result
+}
+
+func fastProbeIntervalFor(item managedPolicyCandidate) int {
+	if item.RecentSuccesses > 0 || item.ConsecutiveFailures <= 3 {
+		return fastProbeIntervalSeconds
+	}
+	if item.ConsecutiveFailures <= 10 {
+		return 60
+	}
+	return 300
+}
+
+func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
+	if item.State == "MANUAL_HOLD" || !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid || item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64 {
+		return false
+	}
+	return item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
+}
+
+func (a *App) probeChannels(ctx context.Context, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	for worker := 0; worker < min(maxConcurrentProbes, len(ids)); worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for id := range jobs {
+				if err := a.probeChannel(ctx, id); err != nil {
+					log.Printf("渠道 %s 探测失败: %v", id, err)
+				}
+			}
+		}()
+	}
+	for _, id := range ids {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
+		case jobs <- id:
+		}
+	}
+	close(jobs)
+	workers.Wait()
 }
 
 func (a *App) evaluateManagedAccounts(ctx context.Context) error {
@@ -176,30 +290,34 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string, before, after any, reason string) {
 	key := stableKey(managedID, action, jsonValue(before), jsonValue(after))
 	var id string
-	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,'APPROVED',$6,now()) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, managedID, action, jsonValue(before), jsonValue(after), reason, key).Scan(&id)
+	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,'APPROVED',$6,now()) ON CONFLICT DO NOTHING RETURNING id`, managedID, action, jsonValue(before), jsonValue(after), reason, key).Scan(&id)
 	if err == nil {
 		go a.executeAction(context.Background(), id)
 	}
 }
 
 type managedPolicyCandidate struct {
-	ID, TargetGroupID, RemoteName, SourceName, TargetName          string
-	State, StateReason, SourceGroup, TargetGroup, SyncStatus       string
-	Schedulable                                                    bool
-	Priority                                                       int
-	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95 sql.NullFloat64
-	Samples                                                        int
+	ID, ChannelID, TargetGroupID, RemoteName, SourceName, TargetName string
+	State, StateReason, SourceGroup, TargetGroup, SyncStatus         string
+	Schedulable                                                      bool
+	Priority                                                         int
+	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
+	Samples, RecentSuccesses, ConsecutiveFailures                    int
 }
 
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-$1 * interval '1 day')
+		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.started_at>now()-$1 * interval '1 day'),
+		(SELECT count(*) FROM (
+			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
+			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id ORDER BY p.started_at DESC LIMIT $2) recent
+		) streak WHERE success_streak)
 		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
-		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays)
+		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +325,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	items := []managedPolicyCandidate{}
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95, &item.RecentSuccesses); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -273,10 +391,21 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	if item.Samples < config.MinSamples {
 		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
 	}
-	if !item.SuccessRate.Valid || item.SuccessRate.Float64 < config.MinSuccessRate {
-		reasons = append(reasons, fmt.Sprintf("成功率低于 %.1f%%", config.MinSuccessRate))
+	if !policySuccessQualified(item, config) {
+		actual := "暂无"
+		if item.SuccessRate.Valid {
+			actual = fmt.Sprintf("%.1f%%", item.SuccessRate.Float64)
+		}
+		reasons = append(reasons, fmt.Sprintf("7 天成功率 %s 低于 %.1f%%，或最近探测成功 %d/%d", actual, config.MinSuccessRate, item.RecentSuccesses, recoverySuccessSamples))
 	}
 	return reasons
+}
+
+func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bool {
+	if !item.Schedulable {
+		return item.Samples >= config.MinSamples && item.RecentSuccesses >= recoverySuccessSamples
+	}
+	return (item.SuccessRate.Valid && item.SuccessRate.Float64 >= config.MinSuccessRate) || (item.Samples >= config.MinSamples && item.RecentSuccesses >= recoverySuccessSamples)
 }
 
 func stableKey(values ...string) string {

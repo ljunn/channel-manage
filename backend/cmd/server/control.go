@@ -167,16 +167,26 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			reasons = policyRejectionReasons(candidate, policy.Config)
 			eligible = len(reasons) == 0
 		}
+		fastValidation := configured && !eligible && candidateCanRecoverWithProbe(candidate, policy.Config)
+		fastInterval := fastProbeIntervalFor(candidate)
+		estimatedValidationSeconds := 0
+		if fastValidation {
+			remainingProbes := max(0, policy.Config.MinSamples-candidate.Samples)
+			if !candidate.Schedulable || candidate.State != "HEALTHY" || !policySuccessQualified(candidate, policy.Config) {
+				remainingProbes = max(remainingProbes, max(0, recoverySuccessSamples-candidate.RecentSuccesses))
+			}
+			estimatedValidationSeconds = remainingProbes * fastInterval
+		}
 		items = append(items, map[string]any{
 			"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName,
 			"sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup,
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
 			"schedulable": candidate.Schedulable, "eligible": eligible, "priority": candidate.Priority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
-			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95),
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "recentSuccesses": candidate.RecentSuccesses,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
 			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate,
-			"probeIntervalSeconds": probeInterval, "estimatedValidationSeconds": max(0, policy.Config.MinSamples-candidate.Samples) * probeInterval,
+			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,
 			"reasons": reasons,
 		})
 	}
@@ -308,7 +318,7 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": 30, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": fastProbeIntervalSeconds, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }

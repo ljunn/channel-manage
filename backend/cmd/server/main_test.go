@@ -351,7 +351,7 @@ func TestSyncTargetAccountConcurrency(t *testing.T) {
 func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5})
 	eligible := managedPolicyCandidate{
-		State: "HEALTHY", SourceMultiplier: sql.NullFloat64{Float64: .5, Valid: true}, TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
+		State: "HEALTHY", Schedulable: true, SourceMultiplier: sql.NullFloat64{Float64: .5, Valid: true}, TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
 		SuccessRate: sql.NullFloat64{Float64: 100, Valid: true}, Samples: 5,
 	}
 	if reasons := policyRejectionReasons(eligible, config); len(reasons) != 0 {
@@ -361,6 +361,59 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	reasons := policyRejectionReasons(eligible, config)
 	if len(reasons) != 1 || !strings.Contains(reasons[0], "超过目标分组上限") {
 		t.Fatalf("source multiplier above target limit was not rejected: %#v", reasons)
+	}
+}
+
+func TestPolicyRecoveryAcceptsThreeRecentSuccesses(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 10})
+	recovering := managedPolicyCandidate{
+		State: "HEALTHY", Samples: 10, RecentSuccesses: recoverySuccessSamples,
+		SourceMultiplier: sql.NullFloat64{Float64: .2, Valid: true},
+		TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
+		SuccessRate:      sql.NullFloat64{Float64: 70, Valid: true},
+	}
+	if reasons := policyRejectionReasons(recovering, config); len(reasons) != 0 {
+		t.Fatalf("recent consecutive successes should recover scheduling: %#v", reasons)
+	}
+	recovering.RecentSuccesses--
+	if reasons := policyRejectionReasons(recovering, config); len(reasons) != 1 || !strings.Contains(reasons[0], "最近探测成功") {
+		t.Fatalf("insufficient recovery successes should remain rejected: %#v", reasons)
+	}
+}
+
+func TestFastRecoveryExcludesManualHoldAndMultiplierViolation(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 10})
+	candidate := managedPolicyCandidate{
+		State: "HEALTHY", Samples: 4,
+		SourceMultiplier: sql.NullFloat64{Float64: .2, Valid: true},
+		TargetMultiplier: sql.NullFloat64{Float64: .5, Valid: true},
+	}
+	if !candidateCanRecoverWithProbe(candidate, config) {
+		t.Fatal("insufficient samples should enter fast validation")
+	}
+	candidate.State = "MANUAL_HOLD"
+	if candidateCanRecoverWithProbe(candidate, config) {
+		t.Fatal("manual hold must not enter fast recovery")
+	}
+	candidate.State = "HEALTHY"
+	candidate.SourceMultiplier.Float64 = .6
+	if candidateCanRecoverWithProbe(candidate, config) {
+		t.Fatal("multiplier violation must not enter fast recovery")
+	}
+}
+
+func TestFastProbeIntervalBacksOffAndAcceleratesOnRecovery(t *testing.T) {
+	if interval := fastProbeIntervalFor(managedPolicyCandidate{ConsecutiveFailures: 3}); interval != 15 {
+		t.Fatalf("initial recovery interval=%d, want 15", interval)
+	}
+	if interval := fastProbeIntervalFor(managedPolicyCandidate{ConsecutiveFailures: 8}); interval != 60 {
+		t.Fatalf("middle backoff interval=%d, want 60", interval)
+	}
+	if interval := fastProbeIntervalFor(managedPolicyCandidate{ConsecutiveFailures: 11}); interval != 300 {
+		t.Fatalf("long backoff interval=%d, want 300", interval)
+	}
+	if interval := fastProbeIntervalFor(managedPolicyCandidate{ConsecutiveFailures: 11, RecentSuccesses: 1}); interval != 15 {
+		t.Fatalf("recovering interval=%d, want 15", interval)
 	}
 }
 
@@ -403,7 +456,7 @@ func TestRankManagedAccountsExcludesIneligibleChannels(t *testing.T) {
 
 func eligiblePolicyCandidate(id string, sourceMultiplier, firstTokenP95 float64) managedPolicyCandidate {
 	return managedPolicyCandidate{
-		ID: id, State: "HEALTHY", Samples: 5,
+		ID: id, State: "HEALTHY", Samples: 5, RecentSuccesses: recoverySuccessSamples,
 		SourceMultiplier: sql.NullFloat64{Float64: sourceMultiplier, Valid: true},
 		TargetMultiplier: sql.NullFloat64{Float64: 1, Valid: true},
 		SuccessRate:      sql.NullFloat64{Float64: 100, Valid: true},
