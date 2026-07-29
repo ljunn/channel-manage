@@ -248,6 +248,14 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 			return a.targetStatus(w, r, id, parts[2])
 		}
 	}
+	if len(parts) == 2 && parts[0] == "policies" {
+		if method == http.MethodPatch {
+			return a.updatePolicy(w, r, parts[1])
+		}
+		if method == http.MethodDelete {
+			return a.deletePolicy(w, r, parts[1])
+		}
+	}
 	if len(parts) == 3 && parts[0] == "channels" && method == http.MethodPost {
 		return a.updateChannelState(w, r, parts[1], parts[2])
 	}

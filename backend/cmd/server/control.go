@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -232,7 +233,7 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 }
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,'') FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -240,17 +241,72 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 	items := []map[string]any{}
 	for rows.Next() {
 		var id, name, scope, status, config, targetGroupName, targetName string
-		var scopeID sql.NullString
+		var scopeID, targetID sql.NullString
 		var active sql.NullInt64
 		var created time.Time
-		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName); err != nil {
+		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID); err != nil {
 			return nil, err
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
+}
+
+func (a *App) updatePolicy(w http.ResponseWriter, r *http.Request, id string) error {
+	var input struct {
+		Name   string       `json:"name"`
+		Config policyConfig `json:"config"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" {
+		return &apiError{400, "INVALID_INPUT", "请填写策略名称"}
+	}
+	input.Config = normalizePolicyConfig(input.Config)
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var status string
+	if err = tx.QueryRowContext(r.Context(), `SELECT status FROM policies WHERE id=$1 FOR UPDATE`, id).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
+		}
+		return err
+	}
+	var version int
+	if err = tx.QueryRowContext(r.Context(), `INSERT INTO policy_versions(policy_id,version,config) SELECT $1,COALESCE(max(version),0)+1,$2 FROM policy_versions WHERE policy_id=$1 RETURNING version`, id, jsonValue(input.Config)).Scan(&version); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE policies SET name=$2,active_version=$3,updated_at=now() WHERE id=$1`, id, input.Name, version); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	a.audit(r.Context(), "UPDATE", "policy", id, map[string]any{"name": input.Name, "version": version, "config": input.Config})
+	go a.runPolicyEvaluation(context.Background())
+	writeData(w, map[string]any{"id": id, "name": input.Name, "version": version})
+	return nil
+}
+
+func (a *App) deletePolicy(w http.ResponseWriter, r *http.Request, id string) error {
+	result, err := a.db.ExecContext(r.Context(), `DELETE FROM policies WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	affected, _ := result.RowsAffected()
+	if affected == 0 {
+		return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
+	}
+	a.audit(r.Context(), "DELETE", "policy", id, nil)
+	writeData(w, map[string]bool{"deleted": true})
+	return nil
 }
 
 func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
@@ -267,13 +323,6 @@ func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
 	if input.ScopeType != "TARGET_GROUP" || input.ScopeID == "" {
 		return &apiError{400, "INVALID_POLICY_SCOPE", "请选择策略对应的目标分组"}
 	}
-	var groupExists int
-	if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM target_groups WHERE id=$1`, input.ScopeID).Scan(&groupExists); err != nil {
-		return err
-	}
-	if groupExists == 0 {
-		return &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
-	}
 	input.Config = normalizePolicyConfig(input.Config)
 	id := uuid.NewString()
 	tx, err := a.db.BeginTx(r.Context(), nil)
@@ -281,6 +330,24 @@ func (a *App) createPolicy(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err = tx.ExecContext(r.Context(), `SELECT pg_advisory_xact_lock(hashtext($1))`, input.ScopeID); err != nil {
+		return err
+	}
+	var groupExists int
+	if err = tx.QueryRowContext(r.Context(), `SELECT count(*) FROM target_groups WHERE id=$1`, input.ScopeID).Scan(&groupExists); err != nil {
+		return err
+	}
+	if groupExists == 0 {
+		return &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
+	}
+	var existingName string
+	err = tx.QueryRowContext(r.Context(), `SELECT name FROM policies WHERE scope_type='TARGET_GROUP' AND scope_id=$1 ORDER BY created_at DESC LIMIT 1`, input.ScopeID).Scan(&existingName)
+	if err == nil {
+		return &apiError{409, "POLICY_SCOPE_EXISTS", fmt.Sprintf("目标分组已有策略“%s”，请直接编辑现有策略", existingName)}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	_, err = tx.ExecContext(r.Context(), `INSERT INTO policies(id,name,scope_type,scope_id,status,active_version) VALUES($1,$2,$3,NULLIF($4,'')::uuid,'DRAFT',1)`, id, input.Name, input.ScopeType, input.ScopeID)
 	if err != nil {
 		return err
