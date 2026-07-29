@@ -244,12 +244,41 @@ func TestFetchPagedUsesBoundedPageSize(t *testing.T) {
 	}))
 	defer server.Close()
 	app := &App{httpClient: newRemoteHTTPClient()}
-	items, err := app.fetchPaged(context.Background(), server.URL, "/api/v1/admin/accounts?lite=true", remoteSession{})
+	items, err := app.fetchPaged(context.Background(), server.URL, "/api/v1/admin/groups", remoteSession{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if requests != 2 || len(items) != 2 {
 		t.Fatalf("requests=%d items=%d", requests, len(items))
+	}
+}
+
+func TestFetchTargetAssetsDoesNotReadAccounts(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	paths := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/admin/system/version":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"version":"test"}}`))
+		case "/api/v1/admin/groups":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"items":[],"pages":1}}`))
+		default:
+			t.Fatalf("unexpected target asset request: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	version, groups, err := app.fetchTargetAssets(context.Background(), server.URL, remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "test" || len(groups) != 0 {
+		t.Fatalf("version=%q groups=%d", version, len(groups))
+	}
+	if !reflect.DeepEqual(paths, []string{"/api/v1/admin/system/version", "/api/v1/admin/groups"}) {
+		t.Fatalf("unexpected target asset paths: %#v", paths)
 	}
 }
 

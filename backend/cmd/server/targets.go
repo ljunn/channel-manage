@@ -115,19 +115,7 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		a.targetSyncFailed(ctx, target, err)
 		return err
 	}
-	version := ""
-	if raw, _, requestErr := a.remoteJSON(requestCtx, target.BaseURL, http.MethodGet, "/api/v1/admin/system/version", session, nil); requestErr == nil {
-		if value, unwrapErr := unwrapEnvelope(raw, "SUB2API"); unwrapErr == nil {
-			record, _ := value.(map[string]any)
-			version = text(record["version"], "")
-		}
-	}
-	groups, err := a.fetchPaged(requestCtx, target.BaseURL, "/api/v1/admin/groups", session)
-	if err != nil {
-		a.targetSyncFailed(ctx, target, err)
-		return err
-	}
-	accounts, err := a.fetchPaged(requestCtx, target.BaseURL, "/api/v1/admin/accounts?lite=true", session)
+	version, groups, err := a.fetchTargetAssets(requestCtx, target.BaseURL, session)
 	if err != nil {
 		a.targetSyncFailed(ctx, target, err)
 		return err
@@ -148,24 +136,6 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	for _, record := range accounts {
-		idNumber, ok := number(record["id"])
-		if !ok {
-			continue
-		}
-		remoteID := strconv.Itoa(int(idNumber))
-		name := text(record["name"], remoteID)
-		if strings.HasPrefix(name, "[托管]") {
-			continue
-		}
-		priority, _ := number(record["priority"])
-		concurrency, _ := number(record["concurrency"])
-		schedulable, _ := record["schedulable"].(bool)
-		_, err = tx.ExecContext(ctx, `INSERT INTO protected_accounts(target_id,remote_id,name,platform,group_ids,schedulable,priority,concurrency,captured_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT(target_id,remote_id) DO UPDATE SET name=excluded.name,platform=excluded.platform,group_ids=excluded.group_ids,schedulable=excluded.schedulable,priority=excluded.priority,concurrency=excluded.concurrency,captured_at=now()`, id, remoteID, name, text(record["platform"], ""), jsonValue(stringSlice(record["group_ids"])), schedulable, int(priority), int(concurrency))
-		if err != nil {
-			return err
-		}
-	}
 	_, err = tx.ExecContext(ctx, `UPDATE targets SET status='ONLINE',version=$2,last_sync_at=now(),last_error='',updated_at=now() WHERE id=$1`, id, version)
 	if err != nil {
 		return err
@@ -176,6 +146,18 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	a.resolveEvent(ctx, "target-sync:"+id)
 	a.resolveEvent(ctx, "target-rate-limit:"+id)
 	return nil
+}
+
+func (a *App) fetchTargetAssets(ctx context.Context, baseURL string, session remoteSession) (string, []map[string]any, error) {
+	version := ""
+	if raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, "/api/v1/admin/system/version", session, nil); err == nil {
+		if value, unwrapErr := unwrapEnvelope(raw, "SUB2API"); unwrapErr == nil {
+			record, _ := value.(map[string]any)
+			version = text(record["version"], "")
+		}
+	}
+	groups, err := a.fetchPaged(ctx, baseURL, "/api/v1/admin/groups", session)
+	return version, groups, err
 }
 
 func (a *App) authenticateTarget(ctx context.Context, target Target, validate bool) (remoteSession, error) {
@@ -282,7 +264,7 @@ func (a *App) fetchPaged(ctx context.Context, baseURL, path string, session remo
 
 func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind string) error {
 	if kind == "groups" {
-		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,protected_best_priority,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
+		rows, err := a.db.QueryContext(r.Context(), `SELECT id,remote_id,name,updated_at FROM target_groups WHERE target_id=$1 ORDER BY name`, id)
 		if err != nil {
 			return err
 		}
@@ -290,38 +272,19 @@ func (a *App) targetStatus(w http.ResponseWriter, r *http.Request, id, kind stri
 		items := []map[string]any{}
 		for rows.Next() {
 			var groupID, remoteID, name string
-			var priority int
 			var updated time.Time
-			if err := rows.Scan(&groupID, &remoteID, &name, &priority, &updated); err != nil {
+			if err := rows.Scan(&groupID, &remoteID, &name, &updated); err != nil {
 				return err
 			}
-			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "protectedBestPriority": priority, "updatedAt": updated})
+			items = append(items, map[string]any{"id": groupID, "remoteId": remoteID, "name": name, "updatedAt": updated})
 		}
 		writeData(w, items)
 		return nil
 	}
-	query := `SELECT remote_id,name,platform,group_ids,schedulable,priority,concurrency,captured_at FROM protected_accounts WHERE target_id=$1 ORDER BY name`
 	if kind == "managed-accounts" {
 		return a.listManagedAccountsForTarget(w, r, id)
 	}
-	rows, err := a.db.QueryContext(r.Context(), query, id)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	items := []map[string]any{}
-	for rows.Next() {
-		var remoteID, name, platform, groups string
-		var schedulable bool
-		var priority, concurrency sql.NullInt64
-		var captured time.Time
-		if err := rows.Scan(&remoteID, &name, &platform, &groups, &schedulable, &priority, &concurrency, &captured); err != nil {
-			return err
-		}
-		items = append(items, map[string]any{"remoteId": remoteID, "name": name, "platform": platform, "groupIds": json.RawMessage(groups), "schedulable": schedulable, "priority": nullableInt(priority), "concurrency": nullableInt(concurrency), "capturedAt": captured})
-	}
-	writeData(w, items)
-	return nil
+	return &apiError{Status: http.StatusNotFound, Code: "NOT_FOUND", Message: "接口不存在"}
 }
 
 func nullableInt(value sql.NullInt64) any {

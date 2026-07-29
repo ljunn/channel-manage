@@ -201,7 +201,7 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 			writeData(w, map[string]string{"id": id, "status": "ONLINE"})
 			return nil
 		}
-		if len(parts) == 3 && method == http.MethodGet && (parts[2] == "groups" || parts[2] == "protected-accounts" || parts[2] == "managed-accounts") {
+		if len(parts) == 3 && method == http.MethodGet && (parts[2] == "groups" || parts[2] == "managed-accounts") {
 			return a.targetStatus(w, r, id, parts[2])
 		}
 	}

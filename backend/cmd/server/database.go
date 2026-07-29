@@ -63,15 +63,11 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE targets ADD COLUMN IF NOT EXISTS last_metrics_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS target_groups (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
-			remote_id TEXT NOT NULL, name TEXT NOT NULL, protected_best_priority INT NOT NULL DEFAULT 0,
+			remote_id TEXT NOT NULL, name TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, remote_id)
 		)`,
-		`CREATE TABLE IF NOT EXISTS protected_accounts (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), target_id UUID NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
-			remote_id TEXT NOT NULL, name TEXT NOT NULL, platform TEXT NOT NULL DEFAULT '', group_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-			schedulable BOOLEAN NOT NULL DEFAULT false, priority INT, concurrency INT, captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			UNIQUE(target_id, remote_id)
-		)`,
+		`ALTER TABLE target_groups DROP COLUMN IF EXISTS protected_best_priority`,
+		`DROP TABLE IF EXISTS protected_accounts`,
 		`CREATE TABLE IF NOT EXISTS channels (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 			source_key_id UUID NOT NULL REFERENCES source_keys(id) ON DELETE CASCADE, source_group_id UUID REFERENCES source_groups(id) ON DELETE SET NULL,
