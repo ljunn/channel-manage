@@ -231,6 +231,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 3 && parts[2] == "deployments" && method == http.MethodGet {
 			return a.listDeploymentJobs(w, r, id)
 		}
+		if len(parts) == 4 && parts[2] == "mappings" && method == http.MethodPut {
+			return a.updateSourceGroupMapping(w, r, id, parts[3])
+		}
 		if len(parts) == 3 && (parts[2] == "scan" || parts[2] == "test-connection") && method == http.MethodPost {
 			if err := a.retrySourceScan(r.Context(), id); err != nil {
 				return err

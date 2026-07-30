@@ -473,7 +473,7 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .source-option:last-child, .target-option:last-child { border-bottom: 0; }
 .source-option:hover, .target-option:hover { background: var(--soft); }
 .source-option.selected, .target-option.selected { background: var(--teal-50); }
-.source-option.mapped { color: var(--ink-400); cursor: default; }
+.source-option.mapped { border-left: 3px solid var(--teal-500); }
 .source-option input, .target-option input { width: 18px; height: 18px; flex: 0 0 auto; accent-color: var(--teal-600); }
 .source-option-copy, .source-option-meta, .target-option > span { min-width: 0; display: grid; gap: 3px; }
 .source-option-copy strong, .target-option strong { overflow-wrap: anywhere; font-size: 12px; }
@@ -500,6 +500,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .mapping-preview-row { min-height: 58px; display: grid; grid-template-columns: minmax(120px,180px) 22px minmax(0,1fr); align-items: center; gap: 10px; padding: 9px 10px; border-bottom: 1px solid var(--line-soft); }
 .mapping-preview-row:last-child { border-bottom: 0; }
 .mapping-preview-row > svg { color: var(--teal-600); }
+.mapping-preview-row.added { background: #f0faf7; }
+.mapping-preview-row.removed { background: #fff5f3; }
+.mapping-preview-row.removed > svg, .mapping-preview-row.removed .preview-source small { color: var(--danger); }
 .preview-source { min-width: 0; display: grid; gap: 2px; }
 .preview-source strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .preview-source small { color: var(--teal-700); font-size: 11px; font-weight: 600; }

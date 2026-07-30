@@ -39,6 +39,7 @@ type App struct {
 	httpClient                *http.Client
 	workerMu                  sync.Mutex
 	recoveryMu                sync.Mutex
+	mappingMu                 sync.Mutex
 	sourceAuthMu              sync.Mutex
 	targetAuthMu              sync.Mutex
 	targetMultiplierMu        sync.Mutex

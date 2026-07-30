@@ -663,11 +663,16 @@ func (a *App) sourceDetail(w http.ResponseWriter, r *http.Request, id string) er
 		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 	}
 	groupRows, err := a.db.QueryContext(r.Context(), `SELECT g.id,g.remote_id,g.name,g.description,g.multiplier,g.group_type,g.models,g.captured_at,
-		COALESCE(jsonb_agg(DISTINCT jsonb_build_object('targetId',t.id,'targetName',t.name)) FILTER (WHERE t.id IS NOT NULL),'[]'::jsonb)
+		COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
+			'targetId',t.id,'targetName',t.name,'targetGroupId',tg.id,'targetGroupName',tg.name,
+			'managedAccountId',m.id,'priority',m.priority,'concurrency',m.concurrency
+		)) FILTER (WHERE t.id IS NOT NULL AND tg.id IS NOT NULL),'[]'::jsonb)
 		FROM source_groups g
 		LEFT JOIN channels c ON c.source_group_id=g.id
 		LEFT JOIN managed_accounts m ON m.channel_id=c.id
 		LEFT JOIN targets t ON t.id=m.target_id
+		LEFT JOIN managed_account_groups mag ON mag.managed_account_id=m.id
+		LEFT JOIN target_groups tg ON tg.id=mag.target_group_id
 		WHERE g.source_id=$1 GROUP BY g.id ORDER BY g.name`, id)
 	if err != nil {
 		return err

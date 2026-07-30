@@ -66,8 +66,13 @@ const writableTargets = computed(() => data.targets.filter(item => item.writeEna
 const configuredPolicyScopes = computed(() => new Set(data.policies.map(item=>item.scopeId).filter(Boolean)))
 const selectedPolicyTargetGroup = computed(() => policyTargetGroups.value.find(group=>group.id===form.targetGroupID))
 const selectedSourceGroups = computed(() => (sourceDetail.value?.groups||[]).filter(group => form.sourceGroupIDs?.includes(group.id)))
+const selectedSourceGroup = computed(() => selectedSourceGroups.value[0]||null)
 const selectedTargetGroups = computed(() => targetGroups.value.filter(group => form.targetGroupIDs?.includes(group.id)))
-const mappingPairs = computed(() => selectedSourceGroups.value.flatMap(sourceGroup => selectedTargetGroups.value.map(targetGroup => ({ id:`${sourceGroup.id}:${targetGroup.id}`, sourceGroup, targetGroup }))))
+const originalTargetGroupIDs = computed(() => form.originalTargetGroupIDs||[])
+const addedTargetGroups = computed(() => selectedTargetGroups.value.filter(group=>!originalTargetGroupIDs.value.includes(group.id)))
+const removedTargetMappings = computed(() => (form.originalMappings||[]).filter(item=>!form.targetGroupIDs?.includes(item.targetGroupId)))
+const keptTargetGroups = computed(() => selectedTargetGroups.value.filter(group=>originalTargetGroupIDs.value.includes(group.id)))
+const selectedSourceHasMapping = computed(() => originalTargetGroupIDs.value.length>0)
 const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
 const activeDeploymentJob = computed(() => deploymentJobs.value.find(item=>item.status==='QUEUED'||item.status==='RUNNING')||null)
 const latestDeploymentJob = computed(() => deploymentJobs.value[0]||null)
@@ -201,7 +206,7 @@ async function viewSource(id){
 		const [detail,targets,settings,jobs]=await Promise.all([api(`/sources/${id}`),api('/targets'),api('/settings'),api(`/sources/${id}/deployments`)])
 		sourceDetail.value=detail;data.targets=targets;data.settings=settings
 		deploymentJobs.value=jobs
-		Object.assign(form,{sourceGroupIDs:[],targetGroupIDs:[],targetID:writableTargets.value[0]?.id||'',priority:1000,concurrency:1000})
+		Object.assign(form,{sourceGroupIDs:[],targetGroupIDs:[],originalTargetGroupIDs:[],originalMappings:[],targetID:writableTargets.value[0]?.id||'',priority:1000,concurrency:1000})
 		modal.value='source-detail'
 		if(form.targetID)void loadTargetGroups()
 		if(activeDeploymentJob.value)scheduleDeploymentPoll(id)
@@ -216,31 +221,47 @@ async function updateTarget(){
 async function loadTargetGroups(){
 	const targetID=form.targetID
 	const request=++targetGroupsRequest
-	targetGroups.value=[];form.targetGroupIDs=[];form.sourceGroupIDs=(form.sourceGroupIDs||[]).filter(id=>!isGroupMapped(sourceDetail.value?.groups.find(group=>group.id===id)))
+	targetGroups.value=[];form.targetGroupIDs=[];form.originalTargetGroupIDs=[];form.originalMappings=[]
 	if(!targetID){targetGroupsLoading.value=false;return}
 	targetGroupsLoading.value=true
 	try{
 		const groups=await api(`/targets/${targetID}/groups`)
-		if(request===targetGroupsRequest&&form.targetID===targetID)targetGroups.value=groups
+		if(request===targetGroupsRequest&&form.targetID===targetID){targetGroups.value=groups;if(selectedSourceGroup.value)selectSourceGroup(selectedSourceGroup.value)}
 	}catch(reason){if(request===targetGroupsRequest)showError(reason)}finally{if(request===targetGroupsRequest)targetGroupsLoading.value=false}
 }
 function isGroupMapped(group){return !!group?.deployments?.some(item=>item.targetId===form.targetID)}
 function mappedTargets(group){return (group.deployments||[]).map(item=>item.targetName).join('、')}
-function toggleSourceGroups(){const available=(sourceDetail.value?.groups||[]).filter(group=>!isGroupMapped(group)).map(group=>group.id);form.sourceGroupIDs=form.sourceGroupIDs?.length===available.length?[]:available}
+function selectSourceGroup(group){
+	form.sourceGroupIDs=[group.id]
+	const mappings=(group.deployments||[]).filter(item=>item.targetId===form.targetID&&item.targetGroupId)
+	form.originalMappings=mappings
+	form.originalTargetGroupIDs=[...new Set(mappings.map(item=>item.targetGroupId))]
+	form.targetGroupIDs=[...form.originalTargetGroupIDs]
+	form.priority=Number(mappings[0]?.priority||1000)
+	form.concurrency=Number(mappings[0]?.concurrency||1000)
+}
 function toggleTargetGroups(){const available=targetGroups.value.map(group=>group.id);form.targetGroupIDs=form.targetGroupIDs?.length===available.length?[]:available}
 async function deploySourceGroups(){
 	if(deploymentBusy.value||activeDeploymentJob.value)return
-  if(!form.sourceGroupIDs?.length){showError(new Error('请至少选择一个源分组'));return}
-  if(!form.targetID||!form.targetGroupIDs?.length){showError(new Error('请选择目标节点和目标分组'));return}
+	if(!selectedSourceGroup.value){showError(new Error('请先选择一个源分组'));return}
+	if(!form.targetID){showError(new Error('请选择目标节点'));return}
+	if(!selectedSourceHasMapping.value&&!form.targetGroupIDs?.length){showError(new Error('首次绑定请至少选择一个目标分组'));return}
 	const sourceID=selectedSource.value
-	const sourceGroupCount=form.sourceGroupIDs.length
-  const accountCount=form.sourceGroupIDs.length*form.targetGroupIDs.length
 	deploymentBusy.value=true;clearMessages()
 	try{
+		if(selectedSourceHasMapping.value){
+			const result=await api(`/sources/${sourceID}/mappings/${selectedSourceGroup.value.id}`,{method:'PUT',timeout:180000,body:body({targetID:form.targetID,targetGroupIDs:form.targetGroupIDs||[]})})
+			const detail=await api(`/sources/${sourceID}`)
+			sourceDetail.value=detail
+			const refreshed=detail.groups.find(group=>group.id===selectedSourceGroup.value?.id)
+			if(refreshed)selectSourceGroup(refreshed)
+			notice.value=result.changed?`绑定已保存：新增 ${result.created} 个，移除 ${result.removed} 个，保留 ${result.kept} 个`:'绑定没有变化'
+			return
+		}
+		const accountCount=form.targetGroupIDs.length
 		const job=await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)})})
 		deploymentJobs.value=[{id:job.jobId,status:job.status,progressDone:job.progressDone,progressTotal:job.progressTotal,error:'',result:{}},...deploymentJobs.value]
-		form.sourceGroupIDs=[];form.targetGroupIDs=[]
-		notice.value=`后台任务已提交：将创建 ${sourceGroupCount} 个专用 Key 和 ${accountCount} 个独立托管账号`
+		notice.value=`后台任务已提交：将创建 1 个专用 Key 和 ${accountCount} 个独立托管账号`
 		scheduleDeploymentPoll(sourceID)
 	}catch(reason){showError(reason)}finally{deploymentBusy.value=false}
 }
@@ -257,6 +278,8 @@ async function pollDeploymentJobs(sourceID){
 		if(latest?.status==='COMPLETED'){
 			const [detail,sources]=await Promise.all([api(`/sources/${sourceID}`),api('/sources')])
 			sourceDetail.value=detail;data.sources=sources
+			const refreshed=detail.groups.find(group=>group.id===selectedSourceGroup.value?.id)
+			if(refreshed)selectSourceGroup(refreshed)
 			notice.value=`后台创建完成：${latest.result?.sourceKeysCreated||0} 个专用 Key，${latest.result?.created||0} 个独立托管账号`
 		}else if(latest?.status==='FAILED')showError(new Error(latest.error||'后台创建失败'))
 	}catch(reason){showError(reason);scheduleDeploymentPoll(sourceID)}
@@ -508,35 +531,38 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
       <div v-else-if="latestDeploymentJob?.status==='FAILED'" class="message error mapping-job-status"><AlertTriangle :size="16"/><span><strong>上次后台创建失败</strong><small>{{ latestDeploymentJob.error }}</small></span></div>
       <div class="mapping-builder">
         <section class="mapping-step">
-          <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>每个源分组为每个目标分组创建独立账号</small></div><button type="button" class="btn small" @click="toggleSourceGroups"><Check :size="14"/>全选可用</button></header>
+          <header><span class="step-index">1</span><div><h3>选择源分组</h3><small>点击后自动显示它当前绑定的目标分组</small></div></header>
           <div class="source-option-list">
             <label v-for="group in sourceDetail.groups" :key="group.id" class="source-option" :class="{selected:form.sourceGroupIDs?.includes(group.id),mapped:isGroupMapped(group)}">
-              <input v-model="form.sourceGroupIDs" type="checkbox" :value="group.id" :disabled="isGroupMapped(group)" :aria-label="`选择 ${group.name}`"/>
+              <input type="radio" name="source-mapping-group" :checked="form.sourceGroupIDs?.includes(group.id)" :aria-label="`选择 ${group.name}`" @change="selectSourceGroup(group)"/>
               <span class="source-option-copy"><strong>{{ group.name }}</strong><small>{{ group.description||`远端 ID ${group.remoteId}` }}</small></span>
-              <span class="source-option-meta"><b :class="{missing:group.multiplier==null}">{{ multiplierLabel(group.multiplier) }}</b><small v-if="isGroupMapped(group)">已映射到 {{ selectedTarget?.name }}</small><small v-else-if="group.deployments?.length">另有 {{ mappedTargets(group) }}</small></span>
+              <span class="source-option-meta"><b :class="{missing:group.multiplier==null}">{{ multiplierLabel(group.multiplier) }}</b><small v-if="isGroupMapped(group)">已绑定 {{ group.deployments.filter(item=>item.targetId===form.targetID).length }} 个分组</small><small v-else-if="group.deployments?.length">另有 {{ mappedTargets(group) }}</small><small v-else>未绑定</small></span>
             </label>
           </div>
         </section>
         <section class="mapping-step">
-          <header><span class="step-index">2</span><div><h3>选择目标分组</h3><small>每个目标分组对应一个独立托管账号</small></div></header>
+          <header><span class="step-index">2</span><div><h3>修改目标分组</h3><small>{{ selectedSourceGroup?`正在编辑 ${selectedSourceGroup.name}`:'请先选择左侧源分组' }}</small></div></header>
           <label class="target-node-select"><span>目标节点</span><select v-model="form.targetID" required @change="loadTargetGroups"><option value="" disabled>请选择</option><option v-for="item in writableTargets" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
-          <div class="target-group-head"><span>目标分组 <b>{{ form.targetGroupIDs?.length||0 }}/{{ targetGroups.length }}</b></span><button v-if="targetGroups.length" type="button" class="btn small" @click="toggleTargetGroups"><Check :size="14"/>全选</button></div>
+          <div class="target-group-head"><span>目标分组 <b>{{ form.targetGroupIDs?.length||0 }}/{{ targetGroups.length }}</b></span><button v-if="targetGroups.length&&selectedSourceGroup" type="button" class="btn small" @click="toggleTargetGroups"><Check :size="14"/>全选</button></div>
           <div class="target-option-list">
 			<div v-if="targetGroupsLoading" class="empty-inline loading-inline"><span class="spinner"/>正在刷新目标分组</div><div v-else-if="!form.targetID" class="empty-inline">请先选择目标节点</div><div v-else-if="!targetGroups.length" class="empty-inline">该节点尚未同步分组</div>
-            <label v-for="group in targetGroups" :key="group.id" class="target-option" :class="{selected:form.targetGroupIDs?.includes(group.id)}"><input v-model="form.targetGroupIDs" type="checkbox" :value="group.id"/><span><strong>{{ group.name }}</strong><small>{{ multiplierLabel(group.multiplier) }} · {{ group.platform }} · ID {{ group.remoteId }}</small></span></label>
+            <label v-for="group in targetGroups" :key="group.id" class="target-option" :class="{selected:form.targetGroupIDs?.includes(group.id)}"><input v-model="form.targetGroupIDs" type="checkbox" :value="group.id" :disabled="!selectedSourceGroup"/><span><strong>{{ group.name }}</strong><small>{{ multiplierLabel(group.multiplier) }} · {{ group.platform }} · ID {{ group.remoteId }}</small></span></label>
           </div>
         </section>
       </div>
       <section class="mapping-preview">
-        <header><span class="step-index">3</span><div><h3>账号预览</h3><small>每一行都会创建一个账号，并由对应目标分组单独调度</small></div></header>
-        <div v-if="!selectedSourceGroups.length||!selectedTargetGroups.length" class="mapping-preview-empty">选择两侧分组后，这里会显示最终映射关系</div>
+        <header><span class="step-index">3</span><div><h3>保存预览</h3><small>保存后自动新增、保留或移除对应的独立托管账号</small></div></header>
+        <div v-if="!selectedSourceGroup" class="mapping-preview-empty">选择一个源分组后，这里会显示绑定变化</div>
+        <div v-else-if="!selectedTargetGroups.length&&!removedTargetMappings.length" class="mapping-preview-empty">当前没有绑定目标分组；勾选后即可保存</div>
         <div v-else class="mapping-preview-list">
-          <div v-for="pair in mappingPairs" :key="pair.id" class="mapping-preview-row"><span class="preview-source"><strong>{{ pair.sourceGroup.name }}</strong><small>{{ multiplierLabel(pair.sourceGroup.multiplier) }}</small></span><ArrowRight :size="18"/><span class="preview-target"><strong>{{ pair.targetGroup.name }}</strong><small>{{ pair.targetGroup.platform }} 独立托管账号</small></span></div>
+          <div v-for="group in keptTargetGroups" :key="`keep:${group.id}`" class="mapping-preview-row"><span class="preview-source"><strong>{{ selectedSourceGroup.name }}</strong><small>保留</small></span><ArrowRight :size="18"/><span class="preview-target"><strong>{{ group.name }}</strong><small>{{ group.platform }} 独立托管账号</small></span></div>
+          <div v-for="group in addedTargetGroups" :key="`add:${group.id}`" class="mapping-preview-row added"><span class="preview-source"><strong>{{ selectedSourceGroup.name }}</strong><small>新增</small></span><ArrowRight :size="18"/><span class="preview-target"><strong>{{ group.name }}</strong><small>{{ group.platform }} 独立托管账号</small></span></div>
+          <div v-for="item in removedTargetMappings" :key="`remove:${item.targetGroupId}`" class="mapping-preview-row removed"><span class="preview-source"><strong>{{ selectedSourceGroup.name }}</strong><small>移除</small></span><ArrowRight :size="18"/><span class="preview-target"><strong>{{ item.targetGroupName }}</strong><small>对应托管账号将停用并删除</small></span></div>
         </div>
       </section>
       <footer class="mapping-submit">
-        <div class="mapping-options"><label><span>初始优先级</span><input v-model="form.priority" type="number" min="1"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
-        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能创建</div><small v-else>将创建 {{ mappingPairs.length }} 个独立托管账号（{{ form.sourceGroupIDs?.length||0 }} 个源分组 × {{ form.targetGroupIDs?.length||0 }} 个目标分组），账号类型跟随各自目标分组</small><button class="btn primary" :disabled="deploymentBusy||activeDeploymentJob||data.settings.shadow_mode||!form.sourceGroupIDs?.length||!form.targetGroupIDs?.length"><Workflow :size="16"/>{{ deploymentBusy?'正在提交':activeDeploymentJob?'后台创建中':'确认创建' }}</button></div>
+        <div v-if="!selectedSourceHasMapping" class="mapping-options"><label><span>初始优先级</span><input v-model="form.priority" type="number" min="1"/></label><label><span>并发</span><input v-model="form.concurrency" type="number" min="1"/></label></div>
+        <div class="mapping-submit-action"><div v-if="data.settings.shadow_mode" class="message warning"><AlertTriangle :size="16"/>当前为影子模式，关闭后才能保存</div><small v-else-if="selectedSourceGroup">最终绑定 {{ selectedTargetGroups.length }} 个目标分组<span v-if="selectedSourceHasMapping">（新增 {{ addedTargetGroups.length }}，移除 {{ removedTargetMappings.length }}）</span></small><small v-else>请先选择源分组</small><button class="btn primary" :disabled="deploymentBusy||activeDeploymentJob||data.settings.shadow_mode||!selectedSourceGroup||(!selectedSourceHasMapping&&!form.targetGroupIDs?.length)"><Workflow :size="16"/>{{ deploymentBusy?'正在保存':activeDeploymentJob?'后台创建中':'保存绑定' }}</button></div>
       </footer>
     </form>
   </ModalShell>
