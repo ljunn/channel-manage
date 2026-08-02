@@ -371,7 +371,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 			break
 		}
 		item.mapping = modelMappingForPlatform(item.platform, decodeModels(item.modelsJSON))
-		item.desiredHash = modelMappingHash(item.mapping)
+		item.desiredHash = managedAccountConfigHash(item.platform, item.mapping)
 		if item.desiredHash == item.currentHash {
 			continue
 		}
@@ -426,7 +426,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 		}
 		credentials := map[string]any{
 			"api_key":                      string(key),
-			"base_url":                     strings.TrimSuffix(sourceBase, "/") + "/v1",
+			"base_url":                     accountBaseURL(sourceBase, item.platform),
 			"model_mapping":                item.mapping,
 			"pool_mode":                    true,
 			"pool_mode_retry_count":        3,
@@ -492,7 +492,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
 		}
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, modelMappingHash(modelMappingForPlatform(platform, models)))
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPlatform(platform, models)))
 	if err != nil {
 		return fmt.Errorf("保存新账号关联失败: %w", err)
 	}

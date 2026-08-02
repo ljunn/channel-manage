@@ -21,6 +21,7 @@ const (
 	managedPriorityStart     = 1000
 	managedPriorityStep      = 100
 	maxFirstTokenMs          = 60_000
+	businessLatencyFreshness = 15 * time.Minute
 )
 
 func (a *App) runScheduler(ctx context.Context) {
@@ -372,10 +373,14 @@ func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string
 type managedPolicyCandidate struct {
 	ID, ChannelID, TargetGroupID, RemoteName, SourceName, TargetName string
 	State, StateReason, SourceGroup, TargetGroup, SyncStatus         string
+	SpeedMetricSource                                                string
 	Schedulable                                                      bool
 	Priority                                                         int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
+	BusinessFirstToken, ProbeFirstTokenP95                           sql.NullFloat64
+	BusinessLatencyAt                                                sql.NullTime
 	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures int
+	SpeedMetricSamples                                               int
 	ConfirmationFailures                                             int
 }
 
@@ -385,6 +390,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
+		m.business_first_token_ms,m.business_latency_samples,m.business_latency_at,
 		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour'),
 		(SELECT count(*) FROM (
 			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
@@ -404,13 +410,27 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.FirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
+		}
+		item.FirstTokenP95, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
+		if item.SpeedMetricSource != "BUSINESS" {
+			item.SpeedMetricSamples = 0
 		}
 		item.ConfirmationFailures = confirmationFailures
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func effectiveSpeedMetric(business sql.NullFloat64, businessAt sql.NullTime, probe sql.NullFloat64, now time.Time) (sql.NullFloat64, string) {
+	if business.Valid && businessAt.Valid && now.Sub(businessAt.Time) <= businessLatencyFreshness {
+		return business, "BUSINESS"
+	}
+	if probe.Valid {
+		return probe, "PROBE"
+	}
+	return sql.NullFloat64{}, ""
 }
 
 func candidatesForTargetGroup(items []managedPolicyCandidate, targetGroupID string) []managedPolicyCandidate {

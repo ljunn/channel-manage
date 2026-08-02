@@ -266,7 +266,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		}
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
-			mappingHash := modelMappingHash(modelMappingForPlatform(account.TargetGroup.Platform, item.Models))
+			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, item.Models))
 			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID, mappingHash)
 			if err != nil {
 				return nil, err
@@ -434,7 +434,7 @@ func pageRecords(value any) []map[string]any {
 }
 
 func (a *App) readModelsWithKey(ctx context.Context, baseURL, key string) ([]string, error) {
-	value, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, "/v1/models", remoteSession{Authorization: "Bearer " + key}, nil)
+	value, _, err := a.remoteJSON(ctx, accountBaseURL(baseURL, "openai"), http.MethodGet, "/models", remoteSession{Authorization: "Bearer " + key}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -452,6 +452,23 @@ func (a *App) readModelsWithKey(ctx context.Context, baseURL, key string) ([]str
 	}
 	sort.Strings(models)
 	return models, nil
+}
+
+func accountBaseURL(sourceBase, targetPlatform string) string {
+	base := strings.TrimRight(strings.TrimSpace(sourceBase), "/")
+	endsInV1 := strings.HasSuffix(strings.ToLower(base), "/v1")
+	switch managedPlatform(targetPlatform) {
+	case "anthropic", "gemini":
+		if endsInV1 {
+			return base[:len(base)-len("/v1")]
+		}
+		return base
+	default:
+		if endsInV1 {
+			return base
+		}
+		return base + "/v1"
+	}
 }
 
 func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (string, error) {
@@ -486,7 +503,7 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 	if len(modelMap) == 0 {
 		return "", &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
 	}
-	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
+	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)
 	if err != nil {
 		return "", err

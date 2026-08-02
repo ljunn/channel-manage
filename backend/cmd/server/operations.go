@@ -19,10 +19,14 @@ func (a *App) listChannels(ctx context.Context) ([]map[string]any, error) {
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour'),
+		COALESCE(
+			(SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY m.business_first_token_ms) FROM managed_accounts m WHERE m.channel_id=c.id AND m.business_first_token_ms IS NOT NULL AND m.business_latency_at>now()-$1*interval '1 second'),
+			(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour')
+		),
+		EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id AND m.business_first_token_ms IS NOT NULL AND m.business_latency_at>now()-$1*interval '1 second'),
 		(SELECT COALESCE(sum(m.requests),0) FROM metric_buckets m WHERE m.channel_id=c.id AND m.window_start>now()-interval '1 hour'),
 		(SELECT CASE WHEN COALESCE(sum(m.requests),0)=0 THEN NULL ELSE 100.0*(sum(m.requests)-sum(m.errors))/sum(m.requests) END FROM metric_buckets m WHERE m.channel_id=c.id AND m.window_start>now()-interval '1 hour')
-		FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id ORDER BY s.name,k.name,g.name`)
+		FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id ORDER BY s.name,k.name,g.name`, int(businessLatencyFreshness/time.Second))
 	if err != nil {
 		return nil, err
 	}
@@ -32,12 +36,17 @@ func (a *App) listChannels(ctx context.Context) ([]map[string]any, error) {
 		var id, sourceName, keyName, groupName, state, reason, tier string
 		var multiplier, score, rate1h, rate7d, p95, businessRate sql.NullFloat64
 		var failures, samples, businessRequests int
+		var usesBusinessLatency bool
 		var lastProbe sql.NullTime
 		var changed time.Time
-		if err := rows.Scan(&id, &sourceName, &keyName, &groupName, &multiplier, &state, &reason, &score, &tier, &failures, &lastProbe, &changed, &samples, &rate1h, &rate7d, &p95, &businessRequests, &businessRate); err != nil {
+		if err := rows.Scan(&id, &sourceName, &keyName, &groupName, &multiplier, &state, &reason, &score, &tier, &failures, &lastProbe, &changed, &samples, &rate1h, &rate7d, &p95, &usesBusinessLatency, &businessRequests, &businessRate); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "sourceName": sourceName, "keyName": keyName, "groupName": groupName, "multiplier": nullableFloat(multiplier), "lifecycleState": state, "stateReason": reason, "score": nullableFloat(score), "priorityTier": tier, "consecutiveFailures": failures, "lastProbeAt": nullableTime(lastProbe), "stateChangedAt": changed, "probeSamples1h": samples, "probeExpected1h": 4, "probeSamples7d": samples, "probeExpected7d": 672, "successRate": nullableFloat(rate1h), "successRate7d": nullableFloat(rate7d), "firstTokenP95Ms": nullableFloat(p95), "requests": samples, "businessRequests1h": businessRequests, "businessSuccessRate1h": nullableFloat(businessRate), "metricWindowMinutes": 60})
+		speedSource := "PROBE"
+		if usesBusinessLatency {
+			speedSource = "BUSINESS"
+		}
+		items = append(items, map[string]any{"id": id, "sourceName": sourceName, "keyName": keyName, "groupName": groupName, "multiplier": nullableFloat(multiplier), "lifecycleState": state, "stateReason": reason, "score": nullableFloat(score), "priorityTier": tier, "consecutiveFailures": failures, "lastProbeAt": nullableTime(lastProbe), "stateChangedAt": changed, "probeSamples1h": samples, "probeExpected1h": 4, "probeSamples7d": samples, "probeExpected7d": 672, "successRate": nullableFloat(rate1h), "successRate7d": nullableFloat(rate7d), "firstTokenP95Ms": nullableFloat(p95), "speedFirstTokenMs": nullableFloat(p95), "speedMetricSource": speedSource, "requests": samples, "businessRequests1h": businessRequests, "businessSuccessRate1h": nullableFloat(businessRate), "metricWindowMinutes": 60})
 	}
 	return items, rows.Err()
 }
@@ -101,43 +110,52 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	slowFirstToken := false
 	skippedActiveProbe := false
 	if managed {
-		firstTokenMs, probeModels, unavailableModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
-		unavailableNote := ""
-		if len(unavailableModels) > 0 {
-			unavailableNote = fmt.Sprintf("；已跳过不支持的分组测试模型 %s", strings.Join(unavailableModels, "、"))
+		needsActiveProbe, probeCheckErr := a.managedChannelNeedsActiveProbe(ctx, id)
+		if probeCheckErr != nil {
+			return probeCheckErr
 		}
-		if len(probeModels) == 0 && len(unavailableModels) > 0 && sampleErr == nil {
+		if !needsActiveProbe {
 			skippedActiveProbe = true
-			summary = truncate(summary+unavailableNote, 200)
-		} else if len(probeModels) == 0 {
-			probeKind = "ACTIVE"
-			requestErr = sampleErr
-			errorType = "PROBE_MODEL_UNAVAILABLE"
-			if requestErr == nil {
-				requestErr = fmt.Errorf("没有已配置的分组测试模型")
-			}
-			summary = truncate(requestErr.Error(), 200)
-			latency = 0
+			summary = truncate(summary+"；近期已有真实业务首 Token，跳过生成式探测", 200)
 		} else {
-			probeKind = "ACTIVE"
-			latency = firstTokenMs
-			firstTokenValue = firstTokenMs
-			requestErr = sampleErr
-			slowFirstToken = firstTokenMs > maxFirstTokenMs
-			modelLabel := strings.Join(probeModels, "、")
-			if slowFirstToken {
-				errorType = "FIRST_TOKEN_TOO_SLOW"
-				summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
-			} else if sampleErr != nil {
-				errorType, summary = classifyProbeFailure(sampleErr)
-				if errorType != "BALANCE_EXHAUSTED" {
-					summary = truncate(sampleErr.Error(), 200)
-				}
-			} else {
-				errorType = ""
-				summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
+			firstTokenMs, probeModels, unavailableModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
+			unavailableNote := ""
+			if len(unavailableModels) > 0 {
+				unavailableNote = fmt.Sprintf("；已跳过不支持的分组测试模型 %s", strings.Join(unavailableModels, "、"))
 			}
-			summary = truncate(summary+unavailableNote, 200)
+			if len(probeModels) == 0 && len(unavailableModels) > 0 && sampleErr == nil {
+				skippedActiveProbe = true
+				summary = truncate(summary+unavailableNote, 200)
+			} else if len(probeModels) == 0 {
+				probeKind = "ACTIVE"
+				requestErr = sampleErr
+				errorType = "PROBE_MODEL_UNAVAILABLE"
+				if requestErr == nil {
+					requestErr = fmt.Errorf("没有已配置的分组测试模型")
+				}
+				summary = truncate(requestErr.Error(), 200)
+				latency = 0
+			} else {
+				probeKind = "ACTIVE"
+				latency = firstTokenMs
+				firstTokenValue = firstTokenMs
+				requestErr = sampleErr
+				slowFirstToken = firstTokenMs > maxFirstTokenMs
+				modelLabel := strings.Join(probeModels, "、")
+				if slowFirstToken {
+					errorType = "FIRST_TOKEN_TOO_SLOW"
+					summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
+				} else if sampleErr != nil {
+					errorType, summary = classifyProbeFailure(sampleErr)
+					if errorType != "BALANCE_EXHAUSTED" {
+						summary = truncate(sampleErr.Error(), 200)
+					}
+				} else {
+					errorType = ""
+					summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
+				}
+				summary = truncate(summary+unavailableNote, 200)
+			}
 		}
 	}
 	success := requestErr == nil && !slowFirstToken
@@ -195,6 +213,18 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	// Only a whole target group losing all eligible accounts creates an alert.
 	a.resolveEvent(ctx, "channel-probe:"+id)
 	return requestErr
+}
+
+func (a *App) managedChannelNeedsActiveProbe(ctx context.Context, channelID string) (bool, error) {
+	var needsProbe bool
+	err := a.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM managed_accounts m
+		WHERE m.channel_id=$1 AND (
+			m.business_first_token_ms IS NULL OR m.business_latency_at IS NULL OR
+			m.business_latency_at<=now()-$2*interval '1 second'
+		)
+	)`, channelID, int(businessLatencyFreshness/time.Second)).Scan(&needsProbe)
+	return needsProbe, err
 }
 
 func classifyProbeFailure(err error) (string, string) {
@@ -466,7 +496,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if len(modelMap) == 0 {
 		return &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
 	}
-	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": strings.TrimSuffix(sourceBase, "/") + "/v1", "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
+	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(requestCtx, targetBase, http.MethodPost, "/api/v1/admin/accounts", session, payload)
 	if err != nil {
 		return err
@@ -491,7 +521,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id, modelMappingHash(modelMap))
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id, managedAccountConfigHash(targetPlatform, modelMap))
 	if err != nil {
 		return err
 	}
@@ -750,14 +780,17 @@ func (a *App) marketManagedChannels(ctx context.Context) ([]map[string]any, erro
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
 		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
 		(SELECT CASE WHEN COALESCE(sum(b.requests),0)=0 THEN NULL ELSE 100.0*(sum(b.requests)-sum(b.errors))/sum(b.requests) END FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-interval '7 days'),
-		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour')
+		COALESCE(
+			CASE WHEN m.business_first_token_ms IS NOT NULL AND m.business_latency_at>now()-$1*interval '1 second' THEN m.business_first_token_ms END,
+			(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour')
+		)
 		FROM managed_account_groups mag
 		JOIN managed_accounts m ON m.id=mag.managed_account_id
 		JOIN channels c ON c.id=m.channel_id
 		JOIN sources s ON s.id=c.source_id
 		LEFT JOIN source_groups g ON g.id=c.source_group_id
 		JOIN target_groups tg ON tg.id=mag.target_group_id
-		ORDER BY tg.id,c.id,m.created_at DESC`)
+		ORDER BY tg.id,c.id,m.created_at DESC`, int(businessLatencyFreshness/time.Second))
 	if err != nil {
 		return nil, err
 	}

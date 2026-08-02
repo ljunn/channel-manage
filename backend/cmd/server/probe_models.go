@@ -77,6 +77,14 @@ func modelMappingHash(mapping map[string]string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(keys, "\n"))))
 }
 
+func managedAccountConfigHash(platform string, mapping map[string]string) string {
+	hash := modelMappingHash(mapping)
+	if normalized := managedPlatform(platform); normalized == "anthropic" || normalized == "gemini" {
+		return "root-base-v1:" + hash
+	}
+	return hash
+}
+
 func decodeModels(raw string) []string {
 	models := []string{}
 	_ = json.Unmarshal([]byte(raw), &models)

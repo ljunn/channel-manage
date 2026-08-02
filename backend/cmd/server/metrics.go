@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const recentBusinessLatencySamples = 10
 
 type businessMetricBucket struct {
 	ChannelID        string
@@ -25,6 +29,18 @@ type businessMetricBucket struct {
 type slowFirstTokenSample struct {
 	FirstTokenMs int
 	CreatedAt    time.Time
+}
+
+type businessLatencySnapshot struct {
+	FirstTokenMs int
+	Samples      int
+	LatestAt     time.Time
+}
+
+type targetMetricBinding struct {
+	ManagedID string
+	RemoteID  string
+	ChannelID string
 }
 
 func (a *App) syncDueTargetMetrics(ctx context.Context) {
@@ -55,37 +71,48 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	if err != nil {
 		return err
 	}
-	requestCtx, cancel := timeoutContext(ctx)
-	defer cancel()
-	session, err := a.authenticateTarget(requestCtx, target, true)
+	authCtx, cancel := timeoutContext(ctx)
+	session, err := a.authenticateTarget(authCtx, target, true)
+	cancel()
 	if err != nil {
 		return err
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT remote_id,channel_id FROM managed_accounts WHERE target_id=$1 AND remote_id<>''`, targetID)
+	rows, err := a.db.QueryContext(ctx, `SELECT id,remote_id,channel_id FROM managed_accounts WHERE target_id=$1 AND remote_id<>''`, targetID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	bindings := map[string]string{}
+	bindings := []targetMetricBinding{}
 	for rows.Next() {
-		var remoteID, channelID string
-		if err := rows.Scan(&remoteID, &channelID); err != nil {
+		var binding targetMetricBinding
+		if err := rows.Scan(&binding.ManagedID, &binding.RemoteID, &binding.ChannelID); err != nil {
 			return err
 		}
-		bindings[remoteID] = channelID
+		bindings = append(bindings, binding)
 	}
 	to := time.Now().UTC()
 	from := to.Add(-7 * time.Minute)
 	buckets := map[string]*businessMetricBucket{}
-	for remoteID, channelID := range bindings {
-		path := fmt.Sprintf("/api/v1/admin/ops/requests?start_time=%s&end_time=%s&kind=all&sort=created_at_desc&account_id=%s", from.Format(time.RFC3339), to.Format(time.RFC3339), remoteID)
+	latencySnapshots := map[string]businessLatencySnapshot{}
+	for _, binding := range bindings {
+		latencyCtx, latencyCancel := timeoutContext(ctx)
+		snapshot, snapshotErr := a.fetchRecentBusinessLatency(latencyCtx, target.BaseURL, binding.RemoteID, session)
+		latencyCancel()
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+		latencySnapshots[binding.ManagedID] = snapshot
+
+		path := fmt.Sprintf("/api/v1/admin/ops/requests?start_time=%s&end_time=%s&kind=all&sort=created_at_desc&account_id=%s", from.Format(time.RFC3339), to.Format(time.RFC3339), binding.RemoteID)
+		requestCtx, requestCancel := timeoutContext(ctx)
 		items, err := a.fetchPaged(requestCtx, target.BaseURL, path, session)
+		requestCancel()
 		if err != nil {
 			return err
 		}
 		for _, item := range items {
 			accountNumber, ok := number(item["account_id"])
-			if !ok || strconv.Itoa(int(accountNumber)) != remoteID {
+			if !ok || strconv.Itoa(int(accountNumber)) != binding.RemoteID {
 				continue
 			}
 			created, err := time.Parse(time.RFC3339, text(item["created_at"], ""))
@@ -93,10 +120,10 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 				continue
 			}
 			window := created.UTC().Truncate(time.Minute)
-			key := channelID + ":" + window.Format(time.RFC3339)
+			key := binding.ChannelID + ":" + window.Format(time.RFC3339)
 			bucket := buckets[key]
 			if bucket == nil {
-				bucket = &businessMetricBucket{ChannelID: channelID, Window: window}
+				bucket = &businessMetricBucket{ChannelID: binding.ChannelID, Window: window}
 				buckets[key] = bucket
 			}
 			bucket.Requests++
@@ -131,6 +158,16 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 		return err
 	}
 	defer tx.Rollback()
+	for managedID, snapshot := range latencySnapshots {
+		if snapshot.Samples == 0 {
+			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=NULL,business_latency_samples=0,business_latency_at=NULL WHERE id=$1`, managedID)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=$2,business_latency_samples=$3,business_latency_at=$4 WHERE id=$1`, managedID, snapshot.FirstTokenMs, snapshot.Samples, snapshot.LatestAt)
+		}
+		if err != nil {
+			return err
+		}
+	}
 	slowSamples := map[string]slowFirstTokenSample{}
 	for _, bucket := range buckets {
 		firstTokenP95 := percentile(bucket.FirstToken, .95)
@@ -176,6 +213,75 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 		}
 	}
 	return nil
+}
+
+func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID string, session remoteSession) (businessLatencySnapshot, error) {
+	path := "/api/v1/admin/usage?account_id=" + url.QueryEscape(remoteID) +
+		"&stream=true&sort_by=created_at&sort_order=desc&page=1&page_size=" + strconv.Itoa(recentBusinessLatencySamples)
+	raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, path, session, nil)
+	if err != nil {
+		return businessLatencySnapshot{}, err
+	}
+	value, err := unwrapEnvelope(raw, "SUB2API")
+	if err != nil {
+		return businessLatencySnapshot{}, err
+	}
+	record, ok := value.(map[string]any)
+	if !ok {
+		return businessLatencySnapshot{}, &apiError{502, "SCHEMA_CHANGED", "目标节点用量分页格式不兼容"}
+	}
+	items, ok := record["items"].([]any)
+	if !ok {
+		return businessLatencySnapshot{}, &apiError{502, "SCHEMA_CHANGED", "目标节点用量列表格式不兼容"}
+	}
+	values := make([]int, 0, recentBusinessLatencySamples)
+	latest := time.Time{}
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		accountNumber, ok := number(item["account_id"])
+		if !ok || strconv.Itoa(int(accountNumber)) != remoteID {
+			continue
+		}
+		firstToken, ok := number(item["first_token_ms"])
+		if !ok || firstToken < 0 {
+			continue
+		}
+		created, parseErr := parseRemoteTimestamp(text(item["created_at"], ""))
+		if parseErr != nil {
+			continue
+		}
+		values = append(values, int(firstToken))
+		if created.After(latest) {
+			latest = created
+		}
+	}
+	if len(values) == 0 {
+		return businessLatencySnapshot{}, nil
+	}
+	return businessLatencySnapshot{FirstTokenMs: medianInt(values), Samples: len(values), LatestAt: latest}, nil
+}
+
+func parseRemoteTimestamp(value string) (time.Time, error) {
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, value)
+}
+
+func medianInt(values []int) int {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]int(nil), values...)
+	sort.Ints(sorted)
+	middle := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[middle]
+	}
+	return sorted[middle-1] + (sorted[middle]-sorted[middle-1])/2
 }
 
 func (a *App) disableSlowChannelAccounts(ctx context.Context, channelID, reason string) error {

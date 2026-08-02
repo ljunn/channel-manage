@@ -230,7 +230,7 @@ func (a *App) commitSourceGroupMapping(ctx context.Context, targetID string, cha
 	defer tx.Rollback()
 	for _, account := range created {
 		managedID := uuid.NewString()
-		mappingHash := modelMappingHash(modelMappingForPlatform(account.TargetGroup.Platform, models))
+		mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, models))
 		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, "channel-manage:"+managedID, mappingHash); err != nil {
 			return err
 		}
@@ -299,7 +299,7 @@ func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, 
 				failures = append(failures, account.TargetGroup.Name+": 恢复调度失败")
 			}
 		}
-		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, modelMappingHash(modelMappingForPlatform(account.TargetGroup.Platform, models))); err != nil {
+		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, models))); err != nil {
 			failures = append(failures, account.TargetGroup.Name+": 保存恢复账号失败")
 		}
 	}

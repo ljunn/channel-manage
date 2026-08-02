@@ -179,9 +179,33 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 			t.Fatalf("account %d platform=%v, want target group platform %s", index, request["platform"], targetGroup.Platform)
 		}
 		credentials := request["credentials"].(map[string]any)
-		if credentials["base_url"] != "https://source.example/v1" {
-			t.Fatalf("account %d base_url=%v, want published source API endpoint", index, credentials["base_url"])
+		expectedBaseURL := "https://source.example/v1"
+		if targetGroup.Platform == "anthropic" {
+			expectedBaseURL = "https://source.example"
 		}
+		if credentials["base_url"] != expectedBaseURL {
+			t.Fatalf("account %d base_url=%v, want %s", index, credentials["base_url"], expectedBaseURL)
+		}
+	}
+}
+
+func TestAccountBaseURLMatchesTargetPlatform(t *testing.T) {
+	tests := []struct {
+		name, sourceBase, platform, want string
+	}{
+		{"openai adds version", "https://source.example", "openai", "https://source.example/v1"},
+		{"openai keeps version", "https://source.example/v1/", "openai", "https://source.example/v1"},
+		{"grok adds version", "https://source.example", "grok", "https://source.example/v1"},
+		{"anthropic uses root", "https://source.example", "anthropic", "https://source.example"},
+		{"anthropic removes version", "https://source.example/v1/", "claude", "https://source.example"},
+		{"gemini removes version", "https://source.example/v1", "gemini", "https://source.example"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := accountBaseURL(test.sourceBase, test.platform); got != test.want {
+				t.Fatalf("accountBaseURL(%q, %q)=%q, want %q", test.sourceBase, test.platform, got, test.want)
+			}
+		})
 	}
 }
 
@@ -869,6 +893,77 @@ func TestPercentile(t *testing.T) {
 	}
 	if got := percentile(nil, .5); got != nil {
 		t.Fatalf("empty percentile=%v", got)
+	}
+}
+
+func TestMedianInt(t *testing.T) {
+	values := []int{900, 100, 500, 300}
+	if got := medianInt(values); got != 400 {
+		t.Fatalf("median=%d, want 400", got)
+	}
+	if !reflect.DeepEqual(values, []int{900, 100, 500, 300}) {
+		t.Fatalf("medianInt mutated its input: %#v", values)
+	}
+	if got := medianInt([]int{900, 100, 500}); got != 500 {
+		t.Fatalf("odd median=%d, want 500", got)
+	}
+}
+
+func TestFetchRecentBusinessLatencyUsesTenLatestStreamingRecords(t *testing.T) {
+	requested := 0
+	latest := time.Date(2026, 7, 30, 12, 0, 0, 123000000, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested++
+		if r.URL.Path != "/api/v1/admin/usage" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		query := r.URL.Query()
+		if query.Get("account_id") != "42" || query.Get("page") != "1" || query.Get("page_size") != "10" {
+			t.Fatalf("unexpected pagination query: %s", r.URL.RawQuery)
+		}
+		if query.Get("stream") != "true" || query.Get("sort_by") != "created_at" || query.Get("sort_order") != "desc" {
+			t.Fatalf("unexpected usage filters: %s", r.URL.RawQuery)
+		}
+		items := make([]map[string]any, 0, 10)
+		for index, firstToken := range []int{1000, 100, 900, 200, 800, 300, 700, 400, 600, 500} {
+			items = append(items, map[string]any{
+				"id":             index + 1,
+				"account_id":     42,
+				"first_token_ms": firstToken,
+				"created_at":     latest.Add(-time.Duration(index) * time.Second).Format(time.RFC3339Nano),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": items, "pages": 1}})
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	snapshot, err := app.fetchRecentBusinessLatency(context.Background(), server.URL, "42", remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requested != 1 {
+		t.Fatalf("usage requests=%d, want 1", requested)
+	}
+	if snapshot.Samples != 10 || snapshot.FirstTokenMs != 550 || !snapshot.LatestAt.Equal(latest) {
+		t.Fatalf("unexpected snapshot: %#v", snapshot)
+	}
+}
+
+func TestEffectiveSpeedMetricPrefersFreshBusinessAndFallsBackToProbe(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	business := sql.NullFloat64{Float64: 850, Valid: true}
+	probe := sql.NullFloat64{Float64: 120, Valid: true}
+
+	metric, source := effectiveSpeedMetric(business, sql.NullTime{Time: now.Add(-businessLatencyFreshness + time.Second), Valid: true}, probe, now)
+	if !metric.Valid || metric.Float64 != 850 || source != "BUSINESS" {
+		t.Fatalf("fresh business metric was not preferred: %#v %s", metric, source)
+	}
+
+	metric, source = effectiveSpeedMetric(business, sql.NullTime{Time: now.Add(-businessLatencyFreshness - time.Second), Valid: true}, probe, now)
+	if !metric.Valid || metric.Float64 != 120 || source != "PROBE" {
+		t.Fatalf("stale business metric did not fall back to probe: %#v %s", metric, source)
 	}
 }
 

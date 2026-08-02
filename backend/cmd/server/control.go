@@ -216,7 +216,7 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
 			"schedulable": candidate.Schedulable, "eligible": eligible, "priority": candidate.Priority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
-			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "recentSuccesses": displayedSuccesses,
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "recentSuccesses": displayedSuccesses,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
 			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate,
 			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,
@@ -598,7 +598,7 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	preview := []map[string]any{}
 	for _, candidate := range candidatesForTargetGroup(candidates, scopeID) {
 		reasons := policyRejectionReasons(candidate, config)
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil
