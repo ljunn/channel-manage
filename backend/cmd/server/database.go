@@ -24,12 +24,16 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS sources (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, platform TEXT NOT NULL,
 			base_url TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'ACTIVE',
+			recharge_url TEXT NOT NULL DEFAULT '', manually_untrusted BOOLEAN NOT NULL DEFAULT false, manually_untrusted_at TIMESTAMPTZ,
 			credential_cipher BYTEA, username_hint TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
 			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, scan_interval_seconds INT NOT NULL DEFAULT 900,
 			scan_status TEXT NOT NULL DEFAULT 'IDLE', last_scan_at TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '',
 			balance NUMERIC(18,6), balance_currency TEXT NOT NULL DEFAULT 'USD', value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1, expires_at TIMESTAMPTZ,
 			tags JSONB NOT NULL DEFAULT '[]'::jsonb, risk_note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS recharge_url TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS manually_untrusted BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS manually_untrusted_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1`,
 		`ALTER TABLE sources DROP COLUMN IF EXISTS asset_mode`,
 		`UPDATE sources SET scan_status='IDLE',last_error='',updated_at=now() WHERE scan_status='RUNNING'`,

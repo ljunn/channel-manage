@@ -306,7 +306,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		JOIN channels c ON c.id=m.channel_id
 		JOIN sources s ON s.id=c.source_id
 		JOIN source_keys k ON k.id=c.source_key_id
-		WHERE m.target_id=$1 AND m.platform<>tg.platform AND m.remote_id<>''`, target.ID)
+		WHERE m.target_id=$1 AND s.manually_untrusted=false AND m.platform<>tg.platform AND m.remote_id<>''`, target.ID)
 	if err != nil {
 		log.Printf("读取托管账号平台失败 [%s]: %v", target.ID, err)
 		return
@@ -392,7 +392,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 		JOIN channels c ON c.id=m.channel_id
 		JOIN sources s ON s.id=c.source_id
 		JOIN source_keys k ON k.id=c.source_key_id
-		WHERE m.target_id=$1 AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'`, target.ID)
+		WHERE m.target_id=$1 AND s.manually_untrusted=false AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'`, target.ID)
 	if err != nil {
 		log.Printf("读取托管账号模型映射失败 [%s]: %v", target.ID, err)
 		return

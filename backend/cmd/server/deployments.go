@@ -91,8 +91,12 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 		return err
 	}
 	var scanStatus, sourceError string
-	if err := a.db.QueryRowContext(r.Context(), `SELECT scan_status,last_error FROM sources WHERE id=$1`, sourceID).Scan(&scanStatus, &sourceError); err != nil {
+	var manuallyUntrusted bool
+	if err := a.db.QueryRowContext(r.Context(), `SELECT scan_status,last_error,manually_untrusted FROM sources WHERE id=$1`, sourceID).Scan(&scanStatus, &sourceError, &manuallyUntrusted); err != nil {
 		return err
+	}
+	if manuallyUntrusted {
+		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能创建新的托管账号"}
 	}
 	if scanStatus == "AUTH_REQUIRED" {
 		return &apiError{409, "SOURCE_AUTH_ACTION_REQUIRED", sourceError}

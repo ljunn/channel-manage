@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,28 +15,34 @@ import (
 )
 
 type Source struct {
-	ID                  string     `json:"id"`
-	Name                string     `json:"name"`
-	Platform            string     `json:"platform"`
-	BaseURL             string     `json:"baseUrl"`
-	Status              string     `json:"status"`
-	ValueDivisor        float64    `json:"valueDivisor"`
-	UsernameHint        string     `json:"usernameHint"`
-	Version             string     `json:"version"`
-	ScanIntervalSeconds int        `json:"scanIntervalSeconds"`
-	ScanStatus          string     `json:"scanStatus"`
-	LastScanAt          *time.Time `json:"lastScanAt"`
-	LastError           string     `json:"lastError"`
-	Balance             *float64   `json:"balance"`
-	BalanceCurrency     string     `json:"balanceCurrency"`
-	BalanceBurnRate     *float64   `json:"balanceBurnRate"`
-	BalanceEtaHours     *float64   `json:"balanceEtaHours"`
-	BalanceSampleCount  int        `json:"balanceSampleCount"`
-	KeyCount            int        `json:"keyCount"`
-	GroupCount          int        `json:"groupCount"`
-	BoundGroupCount     int        `json:"boundGroupCount"`
-	ManagedAccountCount int        `json:"managedAccountCount"`
-	CreatedAt           time.Time  `json:"createdAt"`
+	ID                       string     `json:"id"`
+	Name                     string     `json:"name"`
+	Platform                 string     `json:"platform"`
+	BaseURL                  string     `json:"baseUrl"`
+	RechargeURL              string     `json:"rechargeUrl"`
+	Status                   string     `json:"status"`
+	ManuallyUntrusted        bool       `json:"manuallyUntrusted"`
+	ManuallyUntrustedAt      *time.Time `json:"manuallyUntrustedAt"`
+	ValueDivisor             float64    `json:"valueDivisor"`
+	UsernameHint             string     `json:"usernameHint"`
+	Version                  string     `json:"version"`
+	ScanIntervalSeconds      int        `json:"scanIntervalSeconds"`
+	ScanStatus               string     `json:"scanStatus"`
+	LastScanAt               *time.Time `json:"lastScanAt"`
+	LastError                string     `json:"lastError"`
+	Balance                  *float64   `json:"balance"`
+	BalanceCurrency          string     `json:"balanceCurrency"`
+	BalanceBurnRate          *float64   `json:"balanceBurnRate"`
+	BalanceEtaHours          *float64   `json:"balanceEtaHours"`
+	BalanceSampleCount       int        `json:"balanceSampleCount"`
+	KeyCount                 int        `json:"keyCount"`
+	GroupCount               int        `json:"groupCount"`
+	BoundGroupCount          int        `json:"boundGroupCount"`
+	ManagedAccountCount      int        `json:"managedAccountCount"`
+	SystemRecommendation     string     `json:"systemRecommendation"`
+	RecommendationConfidence string     `json:"recommendationConfidence"`
+	RecommendationReasons    []string   `json:"recommendationReasons"`
+	CreatedAt                time.Time  `json:"createdAt"`
 }
 
 type sourceCredentials struct {
@@ -50,7 +57,7 @@ type sourceCredentials struct {
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.status,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
+	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
 		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),
 		(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id),
 		(SELECT count(DISTINCT c.source_group_id) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=s.id AND c.source_group_id IS NOT NULL),
@@ -63,13 +70,16 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 	result := []Source{}
 	for rows.Next() {
 		var item Source
-		var lastScan sql.NullTime
+		var lastScan, manuallyUntrustedAt sql.NullTime
 		var balance sql.NullFloat64
-		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.Status, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.RechargeURL, &item.Status, &item.ManuallyUntrusted, &manuallyUntrustedAt, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
 			return nil, err
 		}
 		if lastScan.Valid {
 			item.LastScanAt = &lastScan.Time
+		}
+		if manuallyUntrustedAt.Valid {
+			item.ManuallyUntrustedAt = &manuallyUntrustedAt.Time
 		}
 		if balance.Valid {
 			item.Balance = &balance.Float64
@@ -91,14 +101,17 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		result[index].BalanceEtaHours = &forecast.EtaHours
 		result[index].BalanceSampleCount = forecast.Samples
 	}
+	if err := a.applySourceQualityRecommendations(ctx, result); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
 func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	var input struct {
-		Name, Platform, Type, BaseURL, AuthMode, Username, Password, AccessToken, RefreshToken string
-		ValueNumerator, ValueDenominator                                                       float64
-		ScanIntervalSeconds                                                                    int
+		Name, Platform, Type, BaseURL, RechargeURL, AuthMode, Username, Password, AccessToken, RefreshToken string
+		ValueNumerator, ValueDenominator                                                                    float64
+		ScanIntervalSeconds                                                                                 int
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		return err
@@ -147,6 +160,10 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	rechargeURL, err := normalizeOptionalLink(input.RechargeURL)
+	if err != nil {
+		return err
+	}
 	encryptedCredential, err := a.encryptSecret([]byte(jsonValue(credential)))
 	if err != nil {
 		return err
@@ -160,7 +177,7 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 		interval = 900
 	}
 	id := uuid.NewString()
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,value_divisor,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, strings.TrimSpace(input.Name), platform, baseURL, divisor, encryptedCredential, credentialHint, interval)
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO sources(id,name,platform,base_url,recharge_url,value_divisor,credential_cipher,username_hint,scan_interval_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, strings.TrimSpace(input.Name), platform, baseURL, rechargeURL, divisor, encryptedCredential, credentialHint, interval)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") {
 			return &apiError{409, "SOURCE_ALREADY_EXISTS", "该平台地址已添加"}
@@ -183,7 +200,7 @@ func normalizeAccessToken(value string) string {
 
 func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) error {
 	var input struct {
-		Name                                                    string
+		Name, RechargeURL                                       string
 		AuthMode, Username, Password, AccessToken, RefreshToken string
 		ValueNumerator, ValueDenominator                        float64
 		ScanIntervalSeconds                                     int
@@ -195,6 +212,10 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 		return &apiError{400, "INVALID_INPUT", "请填写数据源名称"}
 	}
 	divisor, err := sourceValueDivisor(input.ValueNumerator, input.ValueDenominator)
+	if err != nil {
+		return err
+	}
+	rechargeURL, err := normalizeOptionalLink(input.RechargeURL)
 	if err != nil {
 		return err
 	}
@@ -250,7 +271,7 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 		return err
 	}
 	scale := oldDivisor / divisor
-	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET name=$2,value_divisor=$3,scan_interval_seconds=$4,balance=balance*$5,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name), divisor, input.ScanIntervalSeconds, scale); err != nil {
+	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET name=$2,recharge_url=$3,value_divisor=$4,scan_interval_seconds=$5,balance=balance*$6,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name), rechargeURL, divisor, input.ScanIntervalSeconds, scale); err != nil {
 		return err
 	}
 	if credentialChanged {
@@ -276,6 +297,22 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 	go a.scanSource(context.Background(), id)
 	writeData(w, map[string]any{"id": id, "valueDivisor": divisor, "status": "ACCEPTED"})
 	return nil
+}
+
+func normalizeOptionalLink(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+		return "", &apiError{400, "INVALID_RECHARGE_URL", "充值地址必须是完整的 HTTP 或 HTTPS 地址"}
+	}
+	if parsed.Scheme == "http" && !envBool("ALLOW_INSECURE_UPSTREAMS", false) {
+		return "", &apiError{400, "INSECURE_RECHARGE_URL", "充值地址必须使用 HTTPS"}
+	}
+	parsed.Fragment = ""
+	return parsed.String(), nil
 }
 
 func sourceValueDivisor(numerator, denominator float64) (float64, error) {
@@ -354,13 +391,17 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		}
 		message := userErrorMessage(reported)
 		_, _ = a.db.ExecContext(ctx, `UPDATE sources SET scan_status=$2,last_scan_at=now(),last_error=$3,updated_at=now() WHERE id=$1`, id, status, truncate(message, 500))
-		a.openEvent(ctx, "P1", "SOURCE_SCAN", "数据源扫描失败", source.Name+": "+message, "source-scan:"+id)
+		if !a.sourceIsManuallyUntrusted(ctx, id) {
+			a.openEvent(ctx, "P1", "SOURCE_SCAN", "数据源扫描失败", source.Name+": "+message, "source-scan:"+id)
+		}
 		return reported
 	}
 	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
 	if err == nil {
-		a.resolveEvent(ctx, "source-scan:"+id)
-		a.evaluateSourceBalance(ctx, id)
+		if !a.sourceIsManuallyUntrusted(ctx, id) {
+			a.resolveEvent(ctx, "source-scan:"+id)
+			a.evaluateSourceBalance(ctx, id)
+		}
 	}
 	return err
 }

@@ -147,14 +147,18 @@ func recommendedRecharge(balance, burnRate, targetHours float64) float64 {
 }
 
 func (a *App) evaluateSourceBalance(ctx context.Context, sourceID string) {
-	var name, baseURL, accountHint, currency string
+	var name, baseURL, rechargeURL, accountHint, currency string
+	var manuallyUntrusted bool
 	var balance sql.NullFloat64
-	if err := a.db.QueryRowContext(ctx, `SELECT name,base_url,username_hint,balance,balance_currency FROM sources WHERE id=$1`, sourceID).Scan(&name, &baseURL, &accountHint, &balance, &currency); err != nil || !balance.Valid {
+	if err := a.db.QueryRowContext(ctx, `SELECT name,base_url,recharge_url,username_hint,balance,balance_currency,manually_untrusted FROM sources WHERE id=$1`, sourceID).Scan(&name, &baseURL, &rechargeURL, &accountHint, &balance, &currency, &manuallyUntrusted); err != nil || !balance.Valid || manuallyUntrusted {
 		return
+	}
+	if rechargeURL == "" {
+		rechargeURL = baseURL
 	}
 	dedupeKey := "source-balance:" + sourceID
 	if balance.Float64 <= 0 {
-		detail := fmt.Sprintf("数据源：%s\n源站地址：%s\n充值账号：%s\n当前余额：%.2f %s\n判定原因：账户已经没有可用余额", name, baseURL, fallbackText(accountHint, "请登录源站查看"), balance.Float64, currency)
+		detail := fmt.Sprintf("数据源：%s\n充值地址：%s\n充值账号：%s\n当前余额：%.2f %s\n判定原因：账户已经没有可用余额", name, rechargeURL, fallbackText(accountHint, "请登录源站查看"), balance.Float64, currency)
 		a.openEvent(ctx, "P0", "SOURCE_BALANCE", "账户可用余额已耗尽", detail, dedupeKey)
 		return
 	}
@@ -186,7 +190,7 @@ func (a *App) evaluateSourceBalance(ctx context.Context, sourceID string) {
 	leadHours, period := balanceAlertLead(time.Now().In(location), workHours, nightHours, weekendHours)
 	exhaustsAt := time.Now().In(location).Add(time.Duration(forecast.EtaHours * float64(time.Hour)))
 	recharge := recommendedRecharge(balance.Float64, forecast.BurnRate, float64(leadHours+2))
-	detail := fmt.Sprintf("数据源：%s\n源站地址：%s\n充值账号：%s\n当前余额：%.2f %s\n实际消耗速度：%.2f %s / 小时（中位数）\n预计剩余：%.1f 小时\n预计耗尽时间：%s\n当前预警提前量：%d 小时（%s）\n建议最低充值：%.2f %s\n判定依据：连续 2 次扫描均低于预警线", name, baseURL, fallbackText(accountHint, "请登录源站查看"), balance.Float64, currency, forecast.BurnRate, currency, forecast.EtaHours, exhaustsAt.Format("2006-01-02 15:04"), leadHours, period, recharge, currency)
+	detail := fmt.Sprintf("数据源：%s\n充值地址：%s\n充值账号：%s\n当前余额：%.2f %s\n实际消耗速度：%.2f %s / 小时（中位数）\n预计剩余：%.1f 小时\n预计耗尽时间：%s\n当前预警提前量：%d 小时（%s）\n建议最低充值：%.2f %s\n判定依据：连续 2 次扫描均低于预警线", name, rechargeURL, fallbackText(accountHint, "请登录源站查看"), balance.Float64, currency, forecast.BurnRate, currency, forecast.EtaHours, exhaustsAt.Format("2006-01-02 15:04"), leadHours, period, recharge, currency)
 	if forecast.EtaHours <= 1 {
 		if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours <= 1 }) {
 			a.openEvent(ctx, "P0", "SOURCE_BALANCE", "账户可用余额预计 1 小时内耗尽", detail, dedupeKey)

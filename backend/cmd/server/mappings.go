@@ -70,6 +70,9 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 	if shadow {
 		return &apiError{409, "SHADOW_MODE", "请先在系统设置中关闭影子模式，再修改绑定"}
 	}
+	if a.sourceIsManuallyUntrusted(r.Context(), sourceID) {
+		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能新增或修改绑定"}
+	}
 
 	a.mappingMu.Lock()
 	defer a.mappingMu.Unlock()

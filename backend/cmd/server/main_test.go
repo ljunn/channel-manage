@@ -395,6 +395,71 @@ func TestBalanceEmailSubjectNamesSourceAndBalance(t *testing.T) {
 	}
 }
 
+func TestBalanceEmailKeepsOnlyRechargeFields(t *testing.T) {
+	detail := "数据源：微信\n充值地址：https://example.com/billing\n充值账号：vi****nt\n当前余额：12.00 USD\n实际消耗速度：3.00 USD / 小时（中位数）\n预计耗尽时间：2026-08-03 18:30\n建议最低充值：50.00 USD\n判定依据：连续 2 次扫描均低于预警线"
+	content := formatBalanceEmail("P1", detail, time.Now(), "建议停止充值，7 天真实业务成功率 94.1%")
+	for _, expected := range []string{"当前余额：12.00 USD", "建议充值：至少 50.00 USD", "预计耗尽：2026-08-03 18:30", "充值账号：vi****nt", "系统参考：建议停止充值", "前往充值：https://example.com/billing"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("balance email is missing %q:\n%s", expected, content)
+		}
+	}
+	for _, unwanted := range []string{"实际消耗速度", "判定依据", "事件 ID", "系统会自动做什么"} {
+		if strings.Contains(content, unwanted) {
+			t.Fatalf("balance email contains unwanted %q:\n%s", unwanted, content)
+		}
+	}
+}
+
+func TestSourceQualityRecommendationIsEvidenceOnly(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		input sourceQualityInput
+		want  string
+	}{
+		{"insufficient", sourceQualityInput{CreatedAt: now.Add(-24 * time.Hour), ProbeSamples: 30, ProbeSuccessRate: sql.NullFloat64{Float64: 100, Valid: true}}, sourceRecommendationInsufficient},
+		{"stop", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 95, Valid: true}}, sourceRecommendationStop},
+		{"observe", sourceQualityInput{CreatedAt: now.Add(-4 * 24 * time.Hour), BusinessRequests: 300, BusinessSuccessRate: sql.NullFloat64{Float64: 98.5, Valid: true}}, sourceRecommendationObserve},
+		{"use", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1800, Valid: true}}, sourceRecommendationUse},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, _, reasons := recommendSourceQuality(test.input, now)
+			if got != test.want || len(reasons) == 0 {
+				t.Fatalf("recommendSourceQuality() = %q, %v; want %q with reasons", got, reasons, test.want)
+			}
+		})
+	}
+}
+
+func TestUntrustedSourceIsAlwaysRejectedBySchedulingPolicy(t *testing.T) {
+	candidate := managedPolicyCandidate{
+		SourceUntrusted:  true,
+		State:            "HEALTHY",
+		SourceMultiplier: sql.NullFloat64{Float64: 0.5, Valid: true},
+		TargetMultiplier: sql.NullFloat64{Float64: 1, Valid: true},
+		Samples:          10,
+		SuccessRate:      sql.NullFloat64{Float64: 100, Valid: true},
+		RecentSuccesses:  recoverySuccessSamples,
+	}
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5})
+	if len(reasons) != 1 || reasons[0] != "数据源已被人工标记为不可信" {
+		t.Fatalf("untrusted source was not rejected clearly: %v", reasons)
+	}
+	if candidateCanRecoverWithProbe(candidate, policyConfig{}) {
+		t.Fatal("untrusted source was scheduled for recovery probes")
+	}
+}
+
+func TestSourceEventDedupeFindsOnlyMappedSource(t *testing.T) {
+	if got := sourceIDFromEvent("SOURCE_BALANCE", "source-balance:source-1"); got != "source-1" {
+		t.Fatalf("sourceIDFromEvent() = %q", got)
+	}
+	if got := sourceIDFromEvent("TARGET_SYNC", "target-sync:target-1"); got != "" {
+		t.Fatalf("target event unexpectedly mapped to source %q", got)
+	}
+}
+
 func TestSendEmailRetriesTemporaryProviderFailureWithStableIdempotencyKey(t *testing.T) {
 	requests := 0
 	keys := []string{}

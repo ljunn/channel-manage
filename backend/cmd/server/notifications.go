@@ -167,17 +167,34 @@ func (a *App) sendEmailOnce(ctx context.Context, config emailNotificationConfig,
 }
 
 func (a *App) notifyEvent(ctx context.Context, eventID, severity, title, detail string) {
-	var category string
+	var category, dedupeKey string
 	var createdAt time.Time
-	if err := a.db.QueryRowContext(ctx, `SELECT category,created_at FROM events WHERE id=$1`, eventID).Scan(&category, &createdAt); err != nil {
+	var resolvedAt sql.NullTime
+	if err := a.db.QueryRowContext(ctx, `SELECT category,dedupe_key,created_at,resolved_at FROM events WHERE id=$1`, eventID).Scan(&category, &dedupeKey, &createdAt, &resolvedAt); err != nil {
+		return
+	}
+	sourceID := sourceIDFromEvent(category, dedupeKey)
+	if sourceID != "" && a.sourceIsManuallyUntrusted(ctx, sourceID) {
 		return
 	}
 	if !a.eventEmailEnabled(ctx, category, severity) {
 		return
 	}
 	guidance := eventEmailGuidanceFor(category, severity == "恢复")
+	messageTime := createdAt
+	if severity == "恢复" && resolvedAt.Valid {
+		messageTime = resolvedAt.Time
+	}
+	if category == "SOURCE_BALANCE" && severity == "恢复" && sourceID != "" {
+		detail = a.currentBalanceEmailDetail(ctx, sourceID, true, detail)
+	} else if category == "SOURCE_BALANCE" && sourceID != "" {
+		detail = a.currentBalanceEmailDetail(ctx, sourceID, false, detail)
+	}
 	subject := eventEmailSubject(severity, category, title, detail, guidance)
-	content := formatEventEmail(eventID, severity, title, detail, createdAt, guidance)
+	content := formatEventEmail(eventID, severity, title, detail, messageTime, guidance)
+	if category == "SOURCE_BALANCE" {
+		content = formatBalanceEmail(severity, detail, messageTime, a.sourceQualityReference(ctx, sourceID))
+	}
 	rows, err := a.db.QueryContext(ctx, `SELECT id FROM notification_channels WHERE status='ACTIVE'`)
 	if err != nil {
 		return
@@ -204,6 +221,62 @@ func (a *App) notifyEvent(ctx context.Context, eventID, severity, title, detail 
 		_, _ = a.db.ExecContext(ctx, `INSERT INTO notification_deliveries(event_id,channel_id,status,error) VALUES($1,$2,$3,$4)`, eventID, id, deliveryStatus, errorMessage)
 		_, _ = a.db.ExecContext(ctx, `UPDATE notification_channels SET last_error=$2,updated_at=now() WHERE id=$1`, id, errorMessage)
 	}
+}
+
+func (a *App) currentBalanceEmailDetail(ctx context.Context, sourceID string, replace bool, detail string) string {
+	var name, baseURL, rechargeURL, accountHint, currency string
+	var balance sql.NullFloat64
+	if a.db.QueryRowContext(ctx, `SELECT name,base_url,recharge_url,username_hint,balance,balance_currency FROM sources WHERE id=$1`, sourceID).Scan(&name, &baseURL, &rechargeURL, &accountHint, &balance, &currency) != nil {
+		return detail
+	}
+	if rechargeURL == "" {
+		rechargeURL = baseURL
+	}
+	if replace {
+		detail = "数据源：" + name
+	}
+	fields := []struct{ name, value string }{
+		{"数据源", name},
+		{"充值地址", rechargeURL},
+		{"充值账号", accountHint},
+	}
+	if balance.Valid {
+		fields = append(fields, struct{ name, value string }{"当前余额", fmt.Sprintf("%.2f %s", balance.Float64, currency)})
+	}
+	for _, field := range fields {
+		if field.value != "" && eventDetailField(detail, field.name) == "" {
+			detail += "\n" + field.name + "：" + field.value
+		}
+	}
+	return strings.TrimSpace(detail)
+}
+
+func formatBalanceEmail(severity, detail string, eventTime time.Time, systemReference string) string {
+	location := time.FixedZone("UTC+8", 8*60*60)
+	lines := []string{}
+	if balance := eventDetailField(detail, "当前余额"); balance != "" {
+		lines = append(lines, "当前余额："+balance)
+	}
+	if severity == "恢复" {
+		lines = append(lines, "恢复时间："+eventTime.In(location).Format("2006-01-02 15:04 UTC+8"))
+		return strings.Join(lines, "\n")
+	}
+	if recharge := eventDetailField(detail, "建议最低充值"); recharge != "" {
+		lines = append(lines, "建议充值：至少 "+recharge)
+	}
+	if exhaustion := eventDetailField(detail, "预计耗尽时间"); exhaustion != "" {
+		lines = append(lines, "预计耗尽："+exhaustion)
+	}
+	if account := eventDetailField(detail, "充值账号"); account != "" {
+		lines = append(lines, "充值账号："+account)
+	}
+	if systemReference != "" {
+		lines = append(lines, "系统参考："+systemReference)
+	}
+	if rechargeURL := eventDetailField(detail, "充值地址"); rechargeURL != "" {
+		lines = append(lines, "", "前往充值："+rechargeURL)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func eventEmailSubject(severity, category, title, detail string, guidance eventEmailGuidance) string {

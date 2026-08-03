@@ -440,13 +440,16 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	}
 	remoteName := "[托管] " + input.Name
 	var sourceBase, encryptedKey, keyModels, targetBase string
-	var targetWrite bool
-	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,k.models,t.base_url,t.write_enabled FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &keyModels, &targetBase, &targetWrite)
+	var targetWrite, manuallyUntrusted bool
+	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,k.models,t.base_url,t.write_enabled,s.manually_untrusted FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &keyModels, &targetBase, &targetWrite, &manuallyUntrusted)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在或尚未授权生产使用"}
 	}
 	if err != nil {
 		return err
+	}
+	if manuallyUntrusted {
+		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能创建新的托管账号"}
 	}
 	if !targetWrite {
 		return &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入"}

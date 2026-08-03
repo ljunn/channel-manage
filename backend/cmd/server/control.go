@@ -15,6 +15,9 @@ import (
 )
 
 func (a *App) openEvent(ctx context.Context, severity, category, title, detail, dedupeKey string) {
+	if sourceID := sourceIDFromEvent(category, dedupeKey); sourceID != "" && a.sourceIsManuallyUntrusted(ctx, sourceID) {
+		return
+	}
 	var existingID, existingSeverity string
 	err := a.db.QueryRowContext(ctx, `SELECT id,severity FROM events WHERE dedupe_key=$1 AND status<>'RESOLVED' ORDER BY created_at DESC LIMIT 1`, dedupeKey).Scan(&existingID, &existingSeverity)
 	if err == nil {
