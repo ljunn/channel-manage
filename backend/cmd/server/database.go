@@ -221,7 +221,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"balance_alert_work_hours": "4", "balance_alert_night_hours": "12", "balance_alert_weekend_hours": "36",
 		"email_alert_source_balance": "true", "email_alert_source_scan": "true", "email_alert_target_sync": "true",
 		"email_alert_group_availability": "true", "email_alert_action_execution": "true", "email_alert_platform_sync": "true",
-		"email_alert_recovery": "true",
+		"email_alert_recovery": "false",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

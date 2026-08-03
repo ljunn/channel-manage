@@ -346,7 +346,7 @@ func eventEmailSetting(category string) string {
 		return "email_alert_group_availability"
 	case "ACTION_EXECUTION":
 		return "email_alert_action_execution"
-	case "ACCOUNT_PLATFORM_SYNC":
+	case "ACCOUNT_PLATFORM_SYNC", "ACCOUNT_MODEL_SYNC":
 		return "email_alert_platform_sync"
 	default:
 		return ""
@@ -354,11 +354,14 @@ func eventEmailSetting(category string) string {
 }
 
 func (a *App) eventEmailEnabled(ctx context.Context, category, severity string) bool {
-	if severity == "恢复" && !a.settingBoolDefault(ctx, "email_alert_recovery", true) {
+	if severity == "恢复" && !a.settingBoolDefault(ctx, "email_alert_recovery", false) {
 		return false
 	}
 	setting := eventEmailSetting(category)
-	return setting == "" || a.settingBoolDefault(ctx, setting, true)
+	if setting == "" {
+		return false
+	}
+	return a.settingBoolDefault(ctx, setting, true)
 }
 
 func (a *App) settingBoolDefault(ctx context.Context, key string, fallback bool) bool {
@@ -391,6 +394,8 @@ func eventEmailGuidanceFor(category string, recovered bool) eventEmailGuidance {
 		return eventEmailGuidance{"远程调度写入失败", "系统判定的启停或优先级变更没有完整写入目标节点。", "请打开“调度运行”的执行记录，查看失败账号和远端返回原因后处理。", "系统会保留失败记录并继续执行后续有效调度；故障解除后自动恢复。"}
 	case "ACCOUNT_PLATFORM_SYNC":
 		return eventEmailGuidance{"账号平台校正失败", "托管账号的平台格式可能与目标分组不一致，该账号不会可靠参与调度。", "请检查目标分组的平台类型以及目标节点的账号创建权限，不要手动删除旧账号。", "系统会安全重建格式正确的账号，成功后切换绑定并清理旧账号。"}
+	case "ACCOUNT_MODEL_SYNC":
+		return eventEmailGuidance{"账号模型映射校正失败", "托管账号的模型映射没有按目标分组策略完整更新，相关模型可能无法正确调度。", "请检查目标节点的账号写入权限和远端返回错误，不要手动覆盖托管账号配置。", "系统会在下一轮目标同步时重试模型映射，成功后自动关闭事件。"}
 	default:
 		return eventEmailGuidance{"生产运行异常", "相关业务可能受到影响，具体范围请查看邮件中的事件详情。", "请打开事件中心定位对应事件，并按详情中的对象和错误信息处理。", "系统会继续监控并在满足恢复条件后自动关闭事件。"}
 	}

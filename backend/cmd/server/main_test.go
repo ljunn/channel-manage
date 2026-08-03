@@ -367,6 +367,19 @@ func TestEventEmailGuidanceIsActionable(t *testing.T) {
 	if eventEmailSetting("GROUP_AVAILABILITY") != "email_alert_group_availability" {
 		t.Fatal("group availability setting was not mapped")
 	}
+	if eventEmailSetting("ACCOUNT_MODEL_SYNC") != "email_alert_platform_sync" {
+		t.Fatal("model mapping correction must use the account configuration setting")
+	}
+	if eventEmailSetting("TARGET_LOG") != "" {
+		t.Fatal("unconfigured event category unexpectedly has an email setting")
+	}
+	if (&App{}).eventEmailEnabled(context.Background(), "TARGET_LOG", "P1") {
+		t.Fatal("unconfigured event category was allowed to send email")
+	}
+	modelGuidance := eventEmailGuidanceFor("ACCOUNT_MODEL_SYNC", false)
+	if modelGuidance.Scene != "账号模型映射校正失败" || !strings.Contains(modelGuidance.Action, "写入权限") {
+		t.Fatalf("model correction guidance is incomplete: %#v", modelGuidance)
+	}
 	if emailDeliveryKind("恢复") != "recovery" || emailDeliveryKind("P0") != "p0" {
 		t.Fatal("email delivery idempotency keys must use stable ASCII kinds")
 	}
