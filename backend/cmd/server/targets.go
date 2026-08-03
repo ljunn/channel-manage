@@ -163,6 +163,27 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	return nil
 }
 
+func (a *App) syncPolicyModelMappings(ctx context.Context, targetGroupID string) {
+	var targetID string
+	if err := a.db.QueryRowContext(ctx, `SELECT target_id FROM target_groups WHERE id=$1`, targetGroupID).Scan(&targetID); err != nil {
+		log.Printf("读取策略目标分组失败 [%s]: %v", targetGroupID, err)
+		return
+	}
+	requestCtx, cancel := timeoutContext(ctx)
+	defer cancel()
+	target, _, err := a.targetCredentials(requestCtx, targetID)
+	if err != nil {
+		log.Printf("读取策略目标节点失败 [%s]: %v", targetID, err)
+		return
+	}
+	session, err := a.authenticateTarget(requestCtx, target, true)
+	if err != nil {
+		log.Printf("认证策略目标节点失败 [%s]: %v", targetID, err)
+		return
+	}
+	a.syncManagedAccountModelMappings(requestCtx, target, session)
+}
+
 func (a *App) syncManagedAccountSchedulableStates(ctx context.Context, target Target, session remoteSession) {
 	if !target.WriteEnabled {
 		return
@@ -275,7 +296,10 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		a.targetPlatformMu.Unlock()
 	}()
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,
-		tg.platform,tg.remote_id,s.id,s.name,s.platform,s.base_url,k.key_cipher,k.models
+		tg.platform,tg.remote_id,s.id,s.name,s.platform,s.base_url,k.key_cipher,k.models,COALESCE((
+			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
+		),'{}'::jsonb)
 		FROM managed_accounts m
 		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
 		JOIN target_groups tg ON tg.id=mg.target_group_id
@@ -294,15 +318,20 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		source                                                  Source
 		encryptedKey                                            []byte
 		modelsJSON                                              string
+		disabledModels                                          []string
 	}
 	items := []accountPlatform{}
 	for rows.Next() {
 		var item accountPlatform
+		var configData string
 		if err = rows.Scan(&item.id, &item.remoteID, &item.remoteName, &item.priority, &item.concurrency, &item.schedulable,
 			&item.platform, &item.targetGroupRemoteID, &item.source.ID, &item.source.Name, &item.source.Platform, &item.source.BaseURL,
-			&item.encryptedKey, &item.modelsJSON); err != nil {
+			&item.encryptedKey, &item.modelsJSON, &configData); err != nil {
 			break
 		}
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		item.disabledModels = normalizePolicyConfig(config).DisabledModels
 		item.platform = managedPlatform(item.platform)
 		items = append(items, item)
 	}
@@ -313,7 +342,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 	}
 	failed := 0
 	for _, item := range items {
-		if err = a.replaceManagedAccountPlatform(ctx, target, session, item.id, item.remoteID, item.remoteName, item.platform, item.targetGroupRemoteID, item.priority, item.concurrency, item.schedulable, item.source, item.encryptedKey, item.modelsJSON); err != nil {
+		if err = a.replaceManagedAccountPlatform(ctx, target, session, item.id, item.remoteID, item.remoteName, item.platform, item.targetGroupRemoteID, item.priority, item.concurrency, item.schedulable, item.source, item.encryptedKey, item.modelsJSON, item.disabledModels); err != nil {
 			failed++
 			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate(err.Error(), 500))
 		}
@@ -349,10 +378,14 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	type mappingAccount struct {
 		id, remoteID, platform, sourceID, sourceName, sourcePlatform, sourceBase, modelsJSON, currentHash string
 		encryptedKey                                                                                      []byte
+		disabledModels                                                                                    []string
 		mapping                                                                                           map[string]string
 		desiredHash                                                                                       string
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,tg.platform,s.id,s.name,s.platform,s.base_url,k.models,m.model_mapping_hash,k.key_cipher
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,tg.platform,s.id,s.name,s.platform,s.base_url,k.models,m.model_mapping_hash,k.key_cipher,COALESCE((
+			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
+		),'{}'::jsonb)
 		FROM managed_accounts m
 		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
 		JOIN target_groups tg ON tg.id=mg.target_group_id
@@ -367,10 +400,14 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	items := []mappingAccount{}
 	for rows.Next() {
 		var item mappingAccount
-		if err = rows.Scan(&item.id, &item.remoteID, &item.platform, &item.sourceID, &item.sourceName, &item.sourcePlatform, &item.sourceBase, &item.modelsJSON, &item.currentHash, &item.encryptedKey); err != nil {
+		var configData string
+		if err = rows.Scan(&item.id, &item.remoteID, &item.platform, &item.sourceID, &item.sourceName, &item.sourcePlatform, &item.sourceBase, &item.modelsJSON, &item.currentHash, &item.encryptedKey, &configData); err != nil {
 			break
 		}
-		item.mapping = modelMappingForPlatform(item.platform, decodeModels(item.modelsJSON))
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		item.disabledModels = normalizePolicyConfig(config).DisabledModels
+		item.mapping = modelMappingForPolicy(item.platform, decodeModels(item.modelsJSON), item.disabledModels)
 		item.desiredHash = managedAccountConfigHash(item.platform, item.mapping)
 		if item.desiredHash == item.currentHash {
 			continue
@@ -404,9 +441,8 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	failed := 0
 	for _, item := range items {
 		if len(item.mapping) == 0 {
-			failed++
-			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error='源渠道没有目标分组平台可用的模型',updated_at=now() WHERE id=$1`, item.id)
-			continue
+			_ = a.syncTargetAccountSchedulable(ctx, target.BaseURL, item.remoteID, session, false)
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET schedulable=false,updated_at=now() WHERE id=$1`, item.id)
 		}
 		sourceBase, ok := sourceBases[item.sourceID]
 		if !ok {
@@ -452,7 +488,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	}
 }
 
-func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string) error {
+func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string, disabledModels []string) error {
 	groupID, err := strconv.Atoi(targetGroupRemoteID)
 	if err != nil {
 		return fmt.Errorf("目标分组 ID 不兼容: %w", err)
@@ -469,7 +505,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 	if err != nil {
 		return fmt.Errorf("读取源站 API 地址失败: %w", err)
 	}
-	newRemoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, platform, string(key), models, []int{groupID}, remoteName, priority, concurrency)
+	newRemoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, platform, string(key), models, disabledModels, []int{groupID}, remoteName, priority, concurrency)
 	if err != nil {
 		return fmt.Errorf("创建正确类型账号失败: %w", err)
 	}
@@ -492,7 +528,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
 		}
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPlatform(platform, models)))
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPolicy(platform, models, disabledModels)))
 	if err != nil {
 		return fmt.Errorf("保存新账号关联失败: %w", err)
 	}

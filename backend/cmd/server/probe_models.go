@@ -68,6 +68,35 @@ func modelMappingForPlatform(platform string, models []string) map[string]string
 	return mapping
 }
 
+func normalizeModelNames(models []string) []string {
+	result := make([]string, 0, len(models))
+	seen := make(map[string]bool, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		result = append(result, model)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func modelMappingForPolicy(platform string, models, disabledModels []string) map[string]string {
+	disabled := make(map[string]bool, len(disabledModels))
+	for _, model := range normalizeModelNames(disabledModels) {
+		disabled[model] = true
+	}
+	mapping := map[string]string{}
+	for model, upstream := range modelMappingForPlatform(platform, models) {
+		if !disabled[model] {
+			mapping[model] = upstream
+		}
+	}
+	return mapping
+}
+
 func modelMappingHash(mapping map[string]string) string {
 	keys := make([]string, 0, len(mapping))
 	for model := range mapping {

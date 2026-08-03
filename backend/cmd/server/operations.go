@@ -470,11 +470,18 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	}
 	groupRemoteIDs := []int{}
 	targetPlatform := ""
+	disabledModels := []string{}
 	for _, groupID := range input.TargetGroupIDs {
-		var remoteID string
-		if err := a.db.QueryRowContext(r.Context(), `SELECT remote_id,platform FROM target_groups WHERE id=$1 AND target_id=$2`, groupID, input.TargetID).Scan(&remoteID, &targetPlatform); err != nil {
+		var remoteID, configData string
+		if err := a.db.QueryRowContext(r.Context(), `SELECT tg.remote_id,tg.platform,COALESCE((
+			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
+		),'{}'::jsonb) FROM target_groups tg WHERE tg.id=$1 AND tg.target_id=$2`, groupID, input.TargetID).Scan(&remoteID, &targetPlatform, &configData); err != nil {
 			return &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组无效"}
 		}
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		disabledModels = normalizePolicyConfig(config).DisabledModels
 		numeric, err := strconv.Atoi(remoteID)
 		if err != nil {
 			return &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组 ID 不兼容"}
@@ -492,9 +499,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
-	modelMap := modelMappingForPlatform(targetPlatform, models)
+	modelMap := modelMappingForPolicy(targetPlatform, models, disabledModels)
 	if len(modelMap) == 0 {
-		return &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
+		return &apiError{409, "NO_ALLOWED_MODELS", "源渠道在应用分组禁用清单后没有可用模型"}
 	}
 	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(requestCtx, targetBase, http.MethodPost, "/api/v1/admin/accounts", session, payload)

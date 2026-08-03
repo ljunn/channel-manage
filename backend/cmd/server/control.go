@@ -312,11 +312,12 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
-	Mode                 string  `json:"mode"`
-	MinSuccessRate       float64 `json:"minSuccessRate"`
-	MinSamples           int     `json:"minSamples"`
-	AllowEqualMultiplier bool    `json:"allowEqualMultiplier"`
-	ProbeModel           string  `json:"probeModel"`
+	Mode                 string   `json:"mode"`
+	MinSuccessRate       float64  `json:"minSuccessRate"`
+	MinSamples           int      `json:"minSamples"`
+	AllowEqualMultiplier bool     `json:"allowEqualMultiplier"`
+	ProbeModel           string   `json:"probeModel"`
+	DisabledModels       []string `json:"disabledModels"`
 }
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
@@ -329,6 +330,7 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.MinSamples < 1 {
 		config.MinSamples = 5
 	}
+	config.DisabledModels = normalizeModelNames(config.DisabledModels)
 	return config
 }
 
@@ -344,15 +346,25 @@ func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, conf
 	if config.ProbeModel == "" {
 		config.ProbeModel = defaultModel
 	}
+	availableModels := decodeModels(modelsJSON)
+	available := make(map[string]bool, len(availableModels))
 	allowed := false
-	for _, model := range decodeModels(modelsJSON) {
+	for _, model := range availableModels {
+		available[model] = true
 		if model == config.ProbeModel && probeModelMatchesPlatform(platform, model) {
 			allowed = true
-			break
 		}
 	}
 	if !allowed {
 		return config, &apiError{400, "INVALID_PROBE_MODEL", "测试模型必须来自目标分组的同平台文本模型"}
+	}
+	for _, model := range config.DisabledModels {
+		if !available[model] {
+			return config, &apiError{400, "INVALID_DISABLED_MODEL", "禁用模型必须来自目标分组的模型清单"}
+		}
+		if model == config.ProbeModel {
+			return config, &apiError{400, "PROBE_MODEL_DISABLED", "测试模型不能同时加入禁用模型清单"}
+		}
 	}
 	return config, nil
 }
@@ -432,11 +444,19 @@ func (a *App) updatePolicy(w http.ResponseWriter, r *http.Request, id string) er
 	}
 	a.audit(r.Context(), "UPDATE", "policy", id, map[string]any{"name": input.Name, "version": version, "config": input.Config})
 	go a.runPolicyEvaluation(context.Background())
+	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]any{"id": id, "name": input.Name, "version": version})
 	return nil
 }
 
 func (a *App) deletePolicy(w http.ResponseWriter, r *http.Request, id string) error {
+	var scopeID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT scope_id FROM policies WHERE id=$1`, id).Scan(&scopeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
+		}
+		return err
+	}
 	result, err := a.db.ExecContext(r.Context(), `DELETE FROM policies WHERE id=$1`, id)
 	if err != nil {
 		return err
@@ -446,20 +466,22 @@ func (a *App) deletePolicy(w http.ResponseWriter, r *http.Request, id string) er
 		return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
 	}
 	a.audit(r.Context(), "DELETE", "policy", id, nil)
+	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]bool{"deleted": true})
 	return nil
 }
 
 func (a *App) deactivatePolicy(w http.ResponseWriter, r *http.Request, id string) error {
-	result, err := a.db.ExecContext(r.Context(), `UPDATE policies SET status='DRAFT',updated_at=now() WHERE id=$1 AND status='ACTIVE'`, id)
+	var scopeID string
+	err := a.db.QueryRowContext(r.Context(), `UPDATE policies SET status='DRAFT',updated_at=now() WHERE id=$1 AND status='ACTIVE' RETURNING scope_id`, id).Scan(&scopeID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &apiError{409, "POLICY_NOT_ACTIVE", "策略未处于启用状态"}
+		}
 		return err
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		return &apiError{409, "POLICY_NOT_ACTIVE", "策略未处于启用状态"}
-	}
 	a.audit(r.Context(), "DEACTIVATE", "policy", id, nil)
+	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]any{"id": id, "status": "DRAFT"})
 	return nil
 }
@@ -575,6 +597,10 @@ func (a *App) activatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	a.audit(r.Context(), "ACTIVATE", "policy", id, map[string]int{"version": input.Version})
 	go a.runPolicyEvaluation(context.Background())
+	var scopeID string
+	if err = a.db.QueryRowContext(r.Context(), `SELECT scope_id FROM policies WHERE id=$1`, id).Scan(&scopeID); err == nil {
+		go a.syncPolicyModelMappings(context.Background(), scopeID)
+	}
 	writeData(w, map[string]any{"id": id, "version": input.Version, "status": "ACTIVE"})
 	return nil
 }

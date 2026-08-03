@@ -32,6 +32,7 @@ type deploymentSourceGroup struct {
 type deploymentTargetGroup struct {
 	ID, Name, Platform string
 	RemoteID           int
+	DisabledModels     []string
 }
 
 type generatedRemoteKey struct {
@@ -266,7 +267,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		}
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
-			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, item.Models))
+			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, item.Models, account.TargetGroup.DisabledModels))
 			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID, mappingHash)
 			if err != nil {
 				return nil, err
@@ -336,10 +337,16 @@ func (a *App) validateDeploymentTargetGroups(ctx context.Context, targetID strin
 		}
 		seen[id] = true
 		var group deploymentTargetGroup
-		var remoteID string
-		if err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name,platform FROM target_groups WHERE id=$1 AND target_id=$2`, id, targetID).Scan(&group.ID, &remoteID, &group.Name, &group.Platform); err != nil {
+		var remoteID, configData string
+		if err := a.db.QueryRowContext(ctx, `SELECT tg.id,tg.remote_id,tg.name,tg.platform,COALESCE((
+			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
+		),'{}'::jsonb) FROM target_groups tg WHERE tg.id=$1 AND tg.target_id=$2`, id, targetID).Scan(&group.ID, &remoteID, &group.Name, &group.Platform, &configData); err != nil {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组不存在或不属于该节点"}
 		}
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		group.DisabledModels = normalizePolicyConfig(config).DisabledModels
 		numeric, err := strconv.Atoi(remoteID)
 		if err != nil {
 			return nil, &apiError{400, "INVALID_TARGET_GROUP_IDS", "目标分组 ID 不兼容"}
@@ -498,10 +505,10 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 	return normalized, nil
 }
 
-func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
-	modelMap := modelMappingForPlatform(targetPlatform, models)
+func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
+	modelMap := modelMappingForPolicy(targetPlatform, models, disabledModels)
 	if len(modelMap) == 0 {
-		return "", &apiError{409, "NO_PLATFORM_MODELS", "源渠道没有目标分组平台可用的模型"}
+		return "", &apiError{409, "NO_ALLOWED_MODELS", "源渠道在应用分组禁用清单后没有可用模型"}
 	}
 	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)
@@ -542,7 +549,7 @@ func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string
 			for index := range jobs {
 				targetGroup := targetGroups[index]
 				remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
-				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, targetGroup.Platform, key, models, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
+				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, targetGroup.Platform, key, models, targetGroup.DisabledModels, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
 				results <- accountResult{index: index, account: createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup}, err: err}
 			}
 		}()

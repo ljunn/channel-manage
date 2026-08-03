@@ -215,7 +215,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) {
+	if item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
 	return item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -373,6 +373,7 @@ func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string
 type managedPolicyCandidate struct {
 	ID, ChannelID, TargetGroupID, RemoteName, SourceName, TargetName string
 	State, StateReason, SourceGroup, TargetGroup, SyncStatus         string
+	Platform, ModelsJSON                                             string
 	SpeedMetricSource                                                string
 	Schedulable                                                      bool
 	Priority                                                         int
@@ -387,7 +388,7 @@ type managedPolicyCandidate struct {
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		m.business_first_token_ms,m.business_latency_samples,m.business_latency_at,
@@ -400,7 +401,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
 			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id AND p.kind='RECOVERY' ORDER BY p.started_at DESC LIMIT $2) recent
 		) streak WHERE success_streak)
-		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
+		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN source_keys k ON k.id=c.source_key_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
 		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples)
 	if err != nil {
 		return nil, err
@@ -410,7 +411,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP95, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -485,6 +486,9 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	if item.State != "HEALTHY" && !unconfirmed {
 		reasons = append(reasons, "渠道状态为 "+item.State+"："+item.StateReason)
 	}
+	if !policyHasAllowedModels(item, config) {
+		reasons = append(reasons, "源渠道在应用分组禁用清单后没有可用模型")
+	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
 		reasons = append(reasons, "源分组或目标分组倍率缺失")
 	} else if item.SourceMultiplier.Float64 > item.TargetMultiplier.Float64+multiplierComparisonTolerance {
@@ -503,6 +507,14 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 		reasons = append(reasons, fmt.Sprintf("7 天成功率 %s 低于 %.1f%%，或最近探测成功 %d/%d", actual, config.MinSuccessRate, item.RecentSuccesses, recoverySuccessSamples))
 	}
 	return reasons
+}
+
+func policyHasAllowedModels(item managedPolicyCandidate, config policyConfig) bool {
+	config = normalizePolicyConfig(config)
+	if len(config.DisabledModels) == 0 {
+		return true
+	}
+	return len(modelMappingForPolicy(item.Platform, decodeModels(item.ModelsJSON), config.DisabledModels)) > 0
 }
 
 const multiplierComparisonTolerance = 1e-9

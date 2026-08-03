@@ -137,10 +137,10 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 
 	app := &App{httpClient: server.Client()}
 	targetGroups := []deploymentTargetGroup{
-		{ID: "local-1", Name: "低倍率", Platform: "anthropic", RemoteID: 11},
+		{ID: "local-1", Name: "低倍率", Platform: "anthropic", RemoteID: 11, DisabledModels: []string{"claude-test"}},
 		{ID: "local-2", Name: "高质量", Platform: "grok", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"claude-test", "grok-test"}, targetGroups, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"claude-test", "claude-allowed", "grok-test"}, targetGroups, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +186,11 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		if credentials["base_url"] != expectedBaseURL {
 			t.Fatalf("account %d base_url=%v, want %s", index, credentials["base_url"], expectedBaseURL)
 		}
+	}
+	credentials := requestsByGroup[11]["credentials"].(map[string]any)
+	mapping := credentials["model_mapping"].(map[string]any)
+	if _, exists := mapping["claude-test"]; exists || mapping["claude-allowed"] != "claude-allowed" {
+		t.Fatalf("disabled model was sent to target account: %#v", mapping)
 	}
 }
 
@@ -754,6 +759,31 @@ func TestModelMappingForPlatformKeepsOnlyMatchingFamily(t *testing.T) {
 		if len(mapping) != 1 || mapping[test.expected] != test.expected {
 			t.Fatalf("%s mapping=%#v", test.platform, mapping)
 		}
+	}
+}
+
+func TestModelMappingForPolicyExcludesDisabledModels(t *testing.T) {
+	models := []string{"gpt-5.5", "gpt-5.4", "claude-sonnet-4-6"}
+	mapping := modelMappingForPolicy("openai", models, []string{" gpt-5.4 ", "gpt-5.4"})
+	if !reflect.DeepEqual(mapping, map[string]string{"gpt-5.5": "gpt-5.5"}) {
+		t.Fatalf("policy mapping=%#v", mapping)
+	}
+}
+
+func TestNormalizePolicyConfigNormalizesDisabledModels(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{DisabledModels: []string{" gpt-5.4 ", "", "gpt-5.5", "gpt-5.4"}})
+	if !reflect.DeepEqual(config.DisabledModels, []string{"gpt-5.4", "gpt-5.5"}) {
+		t.Fatalf("disabled models=%#v", config.DisabledModels)
+	}
+}
+
+func TestPolicyRejectsAccountWithoutAllowedModels(t *testing.T) {
+	candidate := eligiblePolicyCandidate("only-disabled", .2, 120)
+	candidate.Platform = "openai"
+	candidate.ModelsJSON = `["gpt-5.4"]`
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5, DisabledModels: []string{"gpt-5.4"}})
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "没有可用模型") {
+		t.Fatalf("account without allowed models was not rejected: %#v", reasons)
 	}
 }
 

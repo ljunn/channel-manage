@@ -194,7 +194,10 @@ func (a *App) loadSourceGroupMapping(ctx context.Context, sourceID, sourceGroupI
 	if err != nil {
 		return channel, nil, err
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,tg.id,tg.name,tg.platform,tg.remote_id FROM managed_accounts m JOIN managed_account_groups mag ON mag.managed_account_id=m.id JOIN target_groups tg ON tg.id=mag.target_group_id JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1 AND c.source_group_id=$2 AND m.target_id=$3 ORDER BY tg.name`, sourceID, sourceGroupID, targetID)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,tg.id,tg.name,tg.platform,tg.remote_id,COALESCE((
+		SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+		WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
+	),'{}'::jsonb) FROM managed_accounts m JOIN managed_account_groups mag ON mag.managed_account_id=m.id JOIN target_groups tg ON tg.id=mag.target_group_id JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1 AND c.source_group_id=$2 AND m.target_id=$3 ORDER BY tg.name`, sourceID, sourceGroupID, targetID)
 	if err != nil {
 		return channel, nil, err
 	}
@@ -204,10 +207,13 @@ func (a *App) loadSourceGroupMapping(ctx context.Context, sourceID, sourceGroupI
 	seenAccounts := map[string]bool{}
 	for rows.Next() {
 		var item existingMappingAccount
-		var remoteGroupID string
-		if err = rows.Scan(&item.ID, &item.RemoteID, &item.RemoteName, &item.Priority, &item.Concurrency, &item.Schedulable, &item.TargetGroup.ID, &item.TargetGroup.Name, &item.TargetGroup.Platform, &remoteGroupID); err != nil {
+		var remoteGroupID, configData string
+		if err = rows.Scan(&item.ID, &item.RemoteID, &item.RemoteName, &item.Priority, &item.Concurrency, &item.Schedulable, &item.TargetGroup.ID, &item.TargetGroup.Name, &item.TargetGroup.Platform, &remoteGroupID, &configData); err != nil {
 			return channel, nil, err
 		}
+		var config policyConfig
+		_ = json.Unmarshal([]byte(configData), &config)
+		item.TargetGroup.DisabledModels = normalizePolicyConfig(config).DisabledModels
 		if seen[item.TargetGroup.ID] || seenAccounts[item.ID] {
 			return channel, nil, &apiError{409, "MAPPING_DATA_CONFLICT", "同一源分组重复绑定了目标分组，请先处理数据冲突"}
 		}
@@ -230,7 +236,7 @@ func (a *App) commitSourceGroupMapping(ctx context.Context, targetID string, cha
 	defer tx.Rollback()
 	for _, account := range created {
 		managedID := uuid.NewString()
-		mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, models))
+		mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels))
 		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, "channel-manage:"+managedID, mappingHash); err != nil {
 			return err
 		}
@@ -289,7 +295,7 @@ func (a *App) restoreMappingScheduling(target Target, session remoteSession, acc
 func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, session remoteSession, sourceAPIBase, key string, models []string, accounts []existingMappingAccount) error {
 	var failures []string
 	for _, account := range accounts {
-		remoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, account.TargetGroup.Platform, key, models, []int{account.TargetGroup.RemoteID}, account.RemoteName, account.Priority, account.Concurrency)
+		remoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, account.TargetGroup.Platform, key, models, account.TargetGroup.DisabledModels, []int{account.TargetGroup.RemoteID}, account.RemoteName, account.Priority, account.Concurrency)
 		if err != nil {
 			failures = append(failures, account.TargetGroup.Name+": "+userErrorMessage(err))
 			continue
@@ -299,7 +305,7 @@ func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, 
 				failures = append(failures, account.TargetGroup.Name+": 恢复调度失败")
 			}
 		}
-		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPlatform(account.TargetGroup.Platform, models))); err != nil {
+		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels))); err != nil {
 			failures = append(failures, account.TargetGroup.Name+": 保存恢复账号失败")
 		}
 	}
