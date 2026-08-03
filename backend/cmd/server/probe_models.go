@@ -154,6 +154,19 @@ func preferredProbeModel(platform string, models []string) string {
 	return ""
 }
 
+func defaultProbeModelForPlatform(platform string) string {
+	defaults := map[string]string{
+		"openai":    "gpt-4.1-mini",
+		"anthropic": "claude-3-5-haiku-latest",
+		"gemini":    "gemini-2.5-flash",
+		"grok":      "grok-3-mini",
+	}
+	if model := defaults[managedPlatform(platform)]; model != "" {
+		return model
+	}
+	return "gpt-4.1-mini"
+}
+
 func (a *App) ensureTargetProbeModels(ctx context.Context, targetID string) error {
 	rows, err := a.db.QueryContext(ctx, `SELECT id,platform,models FROM target_groups WHERE target_id=$1 AND probe_model='' ORDER BY name`, targetID)
 	if err != nil {

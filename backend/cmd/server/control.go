@@ -333,43 +333,55 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.MinSamples < 1 {
 		config.MinSamples = 5
 	}
+	config.ProbeModel = strings.TrimSpace(config.ProbeModel)
 	config.DisabledModels = normalizeModelNames(config.DisabledModels)
 	return config
 }
 
 func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, config policyConfig) (policyConfig, error) {
-	var platform, modelsJSON, defaultModel string
-	if err := a.db.QueryRowContext(ctx, `SELECT platform,models,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &modelsJSON, &defaultModel); err != nil {
+	var platform, defaultModel string
+	if err := a.db.QueryRowContext(ctx, `SELECT platform,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &defaultModel); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return config, &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
 		}
 		return config, err
 	}
-	config.ProbeModel = strings.TrimSpace(config.ProbeModel)
 	if config.ProbeModel == "" {
-		config.ProbeModel = defaultModel
+		config.ProbeModel = strings.TrimSpace(defaultModel)
 	}
-	availableModels := decodeModels(modelsJSON)
-	available := make(map[string]bool, len(availableModels))
-	allowed := false
-	for _, model := range availableModels {
-		available[model] = true
-		if model == config.ProbeModel && probeModelMatchesPlatform(platform, model) {
-			allowed = true
-		}
+	if config.ProbeModel == "" {
+		config.ProbeModel = defaultProbeModelForPlatform(platform)
 	}
-	if !allowed {
-		return config, &apiError{400, "INVALID_PROBE_MODEL", "测试模型必须来自目标分组的同平台文本模型"}
-	}
-	for _, model := range config.DisabledModels {
-		if !available[model] {
-			return config, &apiError{400, "INVALID_DISABLED_MODEL", "禁用模型必须来自目标分组的模型清单"}
-		}
-		if model == config.ProbeModel {
-			return config, &apiError{400, "PROBE_MODEL_DISABLED", "测试模型不能同时加入禁用模型清单"}
-		}
+	if err := validatePolicyModelNames(config); err != nil {
+		return config, err
 	}
 	return config, nil
+}
+
+func validatePolicyModelNames(config policyConfig) error {
+	if !validPolicyModelName(config.ProbeModel) {
+		return &apiError{400, "INVALID_PROBE_MODEL", "测试模型需要是 1 至 200 个字符的单行模型名称"}
+	}
+	if len(config.DisabledModels) > 200 {
+		return &apiError{400, "TOO_MANY_DISABLED_MODELS", "禁用模型最多填写 200 个"}
+	}
+	for _, model := range config.DisabledModels {
+		if !validPolicyModelName(model) {
+			return &apiError{400, "INVALID_DISABLED_MODEL", "禁用模型需要是 1 至 200 个字符的单行模型名称"}
+		}
+		if model == config.ProbeModel {
+			return &apiError{400, "PROBE_MODEL_DISABLED", "测试模型不能同时加入禁用模型清单"}
+		}
+	}
+	return nil
+}
+
+func validPolicyModelName(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || len([]rune(model)) > 200 {
+		return false
+	}
+	return !strings.ContainsAny(model, "\r\n\x00")
 }
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {

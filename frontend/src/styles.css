@@ -424,9 +424,11 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .form-grid { margin-top: 16px; }
 .form-grid label, .modal-form > label { min-width: 0; display: grid; gap: 6px; }
 .form-grid label span, .modal-form label > span:first-child, .modal-form legend { color: var(--ink-700); font-size: 12px; font-weight: 500; }
-.form-grid input, .modal-form input, .modal-form select { width: 100%; height: 38px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; outline: 0; background: var(--paper); color: var(--ink); font-size: 13px; transition: border-color .15s,box-shadow .15s; }
-.form-grid input:hover, .modal-form input:hover, .modal-form select:hover { border-color: var(--ink-300); }
-.form-grid input:focus, .modal-form input:focus, .modal-form select:focus { border-color: var(--teal-500); box-shadow: 0 0 0 3px rgba(53,181,170,.13); }
+.form-grid input, .modal-form input, .modal-form select, .modal-form textarea { width: 100%; height: 38px; padding: 0 11px; border: 1px solid var(--line); border-radius: 7px; outline: 0; background: var(--paper); color: var(--ink); font-size: 13px; transition: border-color .15s,box-shadow .15s; }
+.modal-form textarea { min-height: 116px; padding: 9px 11px; line-height: 1.55; resize: vertical; }
+.modal-form > label > small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.form-grid input:hover, .modal-form input:hover, .modal-form select:hover, .modal-form textarea:hover { border-color: var(--ink-300); }
+.form-grid input:focus, .modal-form input:focus, .modal-form select:focus, .modal-form textarea:focus { border-color: var(--teal-500); box-shadow: 0 0 0 3px rgba(53,181,170,.13); }
 .modal-form input:disabled { background: var(--soft); color: var(--ink-400); cursor: not-allowed; }
 .modal-form .full { grid-column: 1/-1; }
 .modal-form footer { display: flex; justify-content: flex-end; gap: 9px; padding-top: 14px; border-top: 1px solid var(--line-soft); }

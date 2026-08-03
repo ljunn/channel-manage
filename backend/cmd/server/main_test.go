@@ -836,9 +836,31 @@ func TestModelMappingForPolicyExcludesDisabledModels(t *testing.T) {
 }
 
 func TestNormalizePolicyConfigNormalizesDisabledModels(t *testing.T) {
-	config := normalizePolicyConfig(policyConfig{DisabledModels: []string{" gpt-5.4 ", "", "gpt-5.5", "gpt-5.4"}})
+	config := normalizePolicyConfig(policyConfig{ProbeModel: " custom-model-v2 ", DisabledModels: []string{" gpt-5.4 ", "", "gpt-5.5", "gpt-5.4"}})
+	if config.ProbeModel != "custom-model-v2" {
+		t.Fatalf("probe model=%q", config.ProbeModel)
+	}
 	if !reflect.DeepEqual(config.DisabledModels, []string{"gpt-5.4", "gpt-5.5"}) {
 		t.Fatalf("disabled models=%#v", config.DisabledModels)
+	}
+}
+
+func TestPolicyModelNamesAllowModelsOutsideDiscoveredList(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{ProbeModel: "future-text-model-2027", DisabledModels: []string{"legacy-special-model", "unlisted-preview-model"}})
+	if err := validatePolicyModelNames(config); err != nil {
+		t.Fatalf("manual model names were rejected: %v", err)
+	}
+	config.DisabledModels = append(config.DisabledModels, config.ProbeModel)
+	if err := validatePolicyModelNames(config); err == nil {
+		t.Fatal("probe model was allowed in disabled models")
+	}
+}
+
+func TestDefaultProbeModelExistsForEveryManagedPlatform(t *testing.T) {
+	for _, platform := range []string{"openai", "anthropic", "gemini", "grok", "custom"} {
+		if model := defaultProbeModelForPlatform(platform); model == "" {
+			t.Fatalf("platform %s has no default probe model", platform)
+		}
 	}
 }
 
