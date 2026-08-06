@@ -47,6 +47,7 @@ type Source struct {
 	BusinessRequests7d    int        `json:"businessRequests7d"`
 	BusinessSuccessRate7d *float64   `json:"businessSuccessRate7d"`
 	FirstTokenP95Ms7d     *float64   `json:"firstTokenP95Ms7d"`
+	FirstTokenSource      string     `json:"firstTokenSource"`
 	ProbeSamples7d        int        `json:"probeSamples7d"`
 	ProbeSuccessRate7d    *float64   `json:"probeSuccessRate7d"`
 	ScanIncidents7d       int        `json:"scanIncidents7d"`

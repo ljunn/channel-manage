@@ -436,6 +436,8 @@ func TestSourceStabilityAssessmentUsesOperationalSignals(t *testing.T) {
 		{"stable", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1800, Valid: true}}, sourceStabilityStable},
 		{"business-overrides-probe", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 20, Valid: true}, BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}}, sourceStabilityStable},
 		{"slow-first-response", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 12_000, Valid: true}}, sourceStabilityUnstable},
+		{"slow-probe-first-response-fallback", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 99, Valid: true}, ProbeFirstTokenP95Ms: sql.NullFloat64{Float64: 12_000, Valid: true}}, sourceStabilityUnstable},
+		{"business-first-response-preferred", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 99, Valid: true}, ProbeFirstTokenP95Ms: sql.NullFloat64{Float64: 20_000, Valid: true}, BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1000, Valid: true}}, sourceStabilityStable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
