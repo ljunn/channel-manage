@@ -34,6 +34,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS recharge_url TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS manually_untrusted BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS manually_untrusted_at TIMESTAMPTZ`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS scheduling_paused BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS scheduling_paused_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1`,
 		`ALTER TABLE sources DROP COLUMN IF EXISTS asset_mode`,
 		`UPDATE sources SET scan_status='IDLE',last_error='',updated_at=now() WHERE scan_status='RUNNING'`,

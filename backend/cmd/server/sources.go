@@ -23,6 +23,8 @@ type Source struct {
 	Status                   string     `json:"status"`
 	ManuallyUntrusted        bool       `json:"manuallyUntrusted"`
 	ManuallyUntrustedAt      *time.Time `json:"manuallyUntrustedAt"`
+	SchedulingPaused         bool       `json:"schedulingPaused"`
+	SchedulingPausedAt       *time.Time `json:"schedulingPausedAt"`
 	ValueDivisor             float64    `json:"valueDivisor"`
 	UsernameHint             string     `json:"usernameHint"`
 	Version                  string     `json:"version"`
@@ -57,7 +59,7 @@ type sourceCredentials struct {
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
+	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.scheduling_paused,s.scheduling_paused_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
 		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),
 		(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id),
 		(SELECT count(DISTINCT c.source_group_id) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=s.id AND c.source_group_id IS NOT NULL),
@@ -70,9 +72,9 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 	result := []Source{}
 	for rows.Next() {
 		var item Source
-		var lastScan, manuallyUntrustedAt sql.NullTime
+		var lastScan, manuallyUntrustedAt, schedulingPausedAt sql.NullTime
 		var balance sql.NullFloat64
-		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.RechargeURL, &item.Status, &item.ManuallyUntrusted, &manuallyUntrustedAt, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.RechargeURL, &item.Status, &item.ManuallyUntrusted, &manuallyUntrustedAt, &item.SchedulingPaused, &schedulingPausedAt, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
 			return nil, err
 		}
 		if lastScan.Valid {
@@ -80,6 +82,9 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		}
 		if manuallyUntrustedAt.Valid {
 			item.ManuallyUntrustedAt = &manuallyUntrustedAt.Time
+		}
+		if schedulingPausedAt.Valid {
+			item.SchedulingPausedAt = &schedulingPausedAt.Time
 		}
 		if balance.Valid {
 			item.Balance = &balance.Float64
@@ -549,12 +554,21 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["description"], ""), text(record["platform"], "default"), multiplier, []string{}})
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/user/profile", session, nil)
-		if err == nil {
-			profileValue, _ := unwrapEnvelope(profileRaw, source.Platform)
-			profile, _ := profileValue.(map[string]any)
-			if v, ok := number(profile["balance"]); ok {
-				balance = &v
-			}
+		if err != nil {
+			return fmt.Errorf("读取账户余额失败: %w", err)
+		}
+		profileValue, err := unwrapEnvelope(profileRaw, source.Platform)
+		if err != nil {
+			return err
+		}
+		profile, ok := profileValue.(map[string]any)
+		if !ok {
+			return &apiError{502, "SCHEMA_CHANGED", "账户资料接口返回格式不兼容"}
+		}
+		if v, ok := sourceProfileBalance(profile); ok {
+			balance = &v
+		} else {
+			return &apiError{502, "SCHEMA_CHANGED", "账户资料缺少 balance 或 credit_balance 余额字段"}
 		}
 	} else {
 		raw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/user/self/groups", session, nil)
@@ -578,13 +592,22 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["desc"], ""), "default", multiplier, []string{}})
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/user/self", session, nil)
-		if err == nil {
-			profileValue, _ := unwrapEnvelope(profileRaw, source.Platform)
-			profile, _ := profileValue.(map[string]any)
-			if quota, ok := number(profile["quota"]); ok {
-				v := quota / 500000
-				balance = &v
-			}
+		if err != nil {
+			return fmt.Errorf("读取账户余额失败: %w", err)
+		}
+		profileValue, err := unwrapEnvelope(profileRaw, source.Platform)
+		if err != nil {
+			return err
+		}
+		profile, ok := profileValue.(map[string]any)
+		if !ok {
+			return &apiError{502, "SCHEMA_CHANGED", "账户资料接口返回格式不兼容"}
+		}
+		if quota, ok := number(profile["quota"]); ok {
+			v := quota / 500000
+			balance = &v
+		} else {
+			return &apiError{502, "SCHEMA_CHANGED", "账户资料缺少 quota 余额字段"}
 		}
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -631,6 +654,15 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 		return err
 	}
 	return tx.Commit()
+}
+
+func sourceProfileBalance(profile map[string]any) (float64, bool) {
+	for _, key := range []string{"balance", "credit_balance", "creditBalance"} {
+		if value, ok := number(profile[key]); ok {
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 func sub2APIGroupMultiplier(record, rates map[string]any, remoteID string) *float64 {
@@ -706,7 +738,8 @@ func (a *App) sourceDetail(w http.ResponseWriter, r *http.Request, id string) er
 	groupRows, err := a.db.QueryContext(r.Context(), `SELECT g.id,g.remote_id,g.name,g.description,g.multiplier,g.group_type,g.models,g.captured_at,
 		COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
 			'targetId',t.id,'targetName',t.name,'targetGroupId',tg.id,'targetGroupName',tg.name,
-			'managedAccountId',m.id,'priority',m.priority,'concurrency',m.concurrency
+			'managedAccountId',m.id,'priority',m.priority,'concurrency',m.concurrency,
+			'policyActive',EXISTS(SELECT 1 FROM policies p WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE')
 		)) FILTER (WHERE t.id IS NOT NULL AND tg.id IS NOT NULL),'[]'::jsonb)
 		FROM source_groups g
 		LEFT JOIN channels c ON c.source_group_id=g.id

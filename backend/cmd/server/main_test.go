@@ -431,9 +431,10 @@ func TestSourceQualityRecommendationIsEvidenceOnly(t *testing.T) {
 		want  string
 	}{
 		{"insufficient", sourceQualityInput{CreatedAt: now.Add(-24 * time.Hour), ProbeSamples: 30, ProbeSuccessRate: sql.NullFloat64{Float64: 100, Valid: true}}, sourceRecommendationInsufficient},
-		{"stop", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 95, Valid: true}}, sourceRecommendationStop},
-		{"observe", sourceQualityInput{CreatedAt: now.Add(-4 * 24 * time.Hour), BusinessRequests: 300, BusinessSuccessRate: sql.NullFloat64{Float64: 98.5, Valid: true}}, sourceRecommendationObserve},
+		{"stop", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 85, Valid: true}}, sourceRecommendationStop},
+		{"observe", sourceQualityInput{CreatedAt: now.Add(-4 * 24 * time.Hour), BusinessRequests: 300, BusinessSuccessRate: sql.NullFloat64{Float64: 95, Valid: true}}, sourceRecommendationObserve},
 		{"use", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1800, Valid: true}}, sourceRecommendationUse},
+		{"business-overrides-probe-model", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 20, Valid: true}, BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}}, sourceRecommendationObserve},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -442,6 +443,21 @@ func TestSourceQualityRecommendationIsEvidenceOnly(t *testing.T) {
 				t.Fatalf("recommendSourceQuality() = %q, %v; want %q with reasons", got, reasons, test.want)
 			}
 		})
+	}
+}
+
+func TestSourceProfileBalanceSupportsSub2APICreditBalance(t *testing.T) {
+	for _, profile := range []map[string]any{
+		{"balance": 12.5},
+		{"credit_balance": 9.913731},
+		{"creditBalance": "7.25"},
+	} {
+		if value, ok := sourceProfileBalance(profile); !ok || value <= 0 {
+			t.Fatalf("sourceProfileBalance(%v) = %.6f, %v", profile, value, ok)
+		}
+	}
+	if _, ok := sourceProfileBalance(map[string]any{"name": "missing"}); ok {
+		t.Fatal("missing balance field was accepted")
 	}
 }
 
@@ -461,6 +477,25 @@ func TestUntrustedSourceIsAlwaysRejectedBySchedulingPolicy(t *testing.T) {
 	}
 	if candidateCanRecoverWithProbe(candidate, policyConfig{}) {
 		t.Fatal("untrusted source was scheduled for recovery probes")
+	}
+}
+
+func TestPausedSourceIsAlwaysRejectedBySchedulingPolicy(t *testing.T) {
+	candidate := managedPolicyCandidate{
+		SourcePaused:     true,
+		State:            "HEALTHY",
+		SourceMultiplier: sql.NullFloat64{Float64: 0.5, Valid: true},
+		TargetMultiplier: sql.NullFloat64{Float64: 1, Valid: true},
+		Samples:          10,
+		SuccessRate:      sql.NullFloat64{Float64: 100, Valid: true},
+		RecentSuccesses:  recoverySuccessSamples,
+	}
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5})
+	if len(reasons) != 1 || reasons[0] != "数据源已人工暂停调度" {
+		t.Fatalf("paused source was not rejected clearly: %v", reasons)
+	}
+	if candidateCanRecoverWithProbe(candidate, policyConfig{}) {
+		t.Fatal("paused source was scheduled for recovery probes")
 	}
 }
 

@@ -102,20 +102,25 @@ func recommendSourceQuality(input sourceQualityInput, now time.Time) (string, st
 
 	stopReasons := []string{}
 	observeReasons := []string{}
-	if input.BusinessSuccessRate.Valid {
+	strongBusinessEvidence := input.BusinessRequests >= 100 && input.BusinessSuccessRate.Valid
+	if strongBusinessEvidence {
 		rate := input.BusinessSuccessRate.Float64
-		if rate < 97 {
-			stopReasons = append(stopReasons, fmt.Sprintf("7 天真实业务成功率 %.1f%%，低于 97%%", rate))
-		} else if rate < 99 {
-			observeReasons = append(observeReasons, fmt.Sprintf("7 天真实业务成功率 %.1f%%，低于 99%%", rate))
+		if rate < 90 {
+			stopReasons = append(stopReasons, fmt.Sprintf("7 天真实业务成功率 %.1f%%，低于 90%%", rate))
+		} else if rate < 97 {
+			observeReasons = append(observeReasons, fmt.Sprintf("7 天真实业务成功率 %.1f%%，低于 97%%", rate))
 		}
 	}
 	if input.ProbeSuccessRate.Valid && input.ProbeSamples >= 20 {
 		rate := input.ProbeSuccessRate.Float64
-		if rate < 90 {
-			stopReasons = append(stopReasons, fmt.Sprintf("7 天主动探测成功率 %.1f%%，低于 90%%", rate))
-		} else if rate < 98 {
-			observeReasons = append(observeReasons, fmt.Sprintf("7 天主动探测成功率 %.1f%%，低于 98%%", rate))
+		if strongBusinessEvidence {
+			if input.BusinessSuccessRate.Float64 >= 97 && rate < 50 {
+				observeReasons = append(observeReasons, fmt.Sprintf("主动探测成功率 %.1f%% 与真实业务表现不一致，请检查测试模型", rate))
+			}
+		} else if rate < 50 {
+			stopReasons = append(stopReasons, fmt.Sprintf("缺少足够真实业务时，主动探测成功率仅 %.1f%%", rate))
+		} else if rate < 90 {
+			observeReasons = append(observeReasons, fmt.Sprintf("缺少足够真实业务时，主动探测成功率为 %.1f%%", rate))
 		}
 	}
 	if input.FirstTokenP95Ms.Valid {
@@ -143,7 +148,7 @@ func recommendSourceQuality(input sourceQualityInput, now time.Time) (string, st
 		return sourceRecommendationObserve, confidence, firstReasons(observeReasons, 3)
 	}
 	reasons := []string{}
-	if input.BusinessSuccessRate.Valid {
+	if strongBusinessEvidence {
 		reasons = append(reasons, fmt.Sprintf("7 天真实业务成功率 %.1f%%", input.BusinessSuccessRate.Float64))
 	} else if input.ProbeSuccessRate.Valid {
 		reasons = append(reasons, fmt.Sprintf("7 天主动探测成功率 %.1f%%", input.ProbeSuccessRate.Float64))

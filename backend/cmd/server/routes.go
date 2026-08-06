@@ -222,6 +222,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 3 && parts[2] == "trust" && method == http.MethodPatch {
 			return a.updateSourceTrust(w, r, id)
 		}
+		if len(parts) == 3 && parts[2] == "scheduling" && method == http.MethodPatch {
+			return a.updateSourceScheduling(w, r, id)
+		}
 		if len(parts) == 2 && method == http.MethodDelete {
 			return a.deleteSource(w, r, id)
 		}

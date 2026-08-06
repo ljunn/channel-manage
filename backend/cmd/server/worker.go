@@ -215,7 +215,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.SourceUntrusted || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+	if item.SourceUntrusted || item.SourcePaused || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
 	return item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -377,6 +377,7 @@ type managedPolicyCandidate struct {
 	SpeedMetricSource                                                string
 	Schedulable                                                      bool
 	SourceUntrusted                                                  bool
+	SourcePaused                                                     bool
 	Priority                                                         int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
 	BusinessFirstToken, ProbeFirstTokenP95                           sql.NullFloat64
@@ -389,7 +390,7 @@ type managedPolicyCandidate struct {
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		m.business_first_token_ms,m.business_latency_samples,m.business_latency_at,
@@ -412,7 +413,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP95, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -485,6 +486,9 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	reasons := []string{}
 	if item.SourceUntrusted {
 		reasons = append(reasons, "数据源已被人工标记为不可信")
+	}
+	if item.SourcePaused {
+		reasons = append(reasons, "数据源已人工暂停调度")
 	}
 	unconfirmed := unconfirmedProbeFailure(item)
 	if item.State != "HEALTHY" && !unconfirmed {

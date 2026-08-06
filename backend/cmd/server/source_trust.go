@@ -85,6 +85,70 @@ func (a *App) updateSourceTrust(w http.ResponseWriter, r *http.Request, id strin
 	return nil
 }
 
+func (a *App) updateSourceScheduling(w http.ResponseWriter, r *http.Request, id string) error {
+	var input struct {
+		Paused bool `json:"paused"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		return err
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var name string
+	var current, manuallyUntrusted bool
+	if err = tx.QueryRowContext(r.Context(), `SELECT name,scheduling_paused,manually_untrusted FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&name, &current, &manuallyUntrusted); err != nil {
+		if err == sql.ErrNoRows {
+			return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
+		}
+		return err
+	}
+	if !input.Paused && manuallyUntrusted {
+		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被标记为不可信，取消不可信标记后才能恢复调度"}
+	}
+	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET scheduling_paused=$2,scheduling_paused_at=CASE WHEN $2 THEN COALESCE(scheduling_paused_at,now()) ELSE NULL END,updated_at=now() WHERE id=$1`, id, input.Paused); err != nil {
+		return err
+	}
+	if input.Paused {
+		if _, err = tx.ExecContext(r.Context(), `UPDATE action_intents SET status='REJECTED',error='数据源已暂停调度',executed_at=now()
+			WHERE managed_account_id IN (SELECT m.id FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1)
+			AND status IN ('PENDING','APPROVED') AND after_state @> '{"schedulable":true}'::jsonb`, id); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if current != input.Paused {
+		a.audit(r.Context(), "SET_SOURCE_SCHEDULING", "source", id, map[string]any{"name": name, "paused": input.Paused})
+	}
+	if input.Paused {
+		rows, queryErr := a.db.QueryContext(r.Context(), `SELECT m.id,m.schedulable FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1`, id)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var managedID string
+			var schedulable bool
+			if err = rows.Scan(&managedID, &schedulable); err != nil {
+				return err
+			}
+			a.enqueueManagedAction(context.Background(), managedID, "SET_SCHEDULABLE", map[string]bool{"schedulable": schedulable}, map[string]bool{"schedulable": false}, "数据源已人工暂停调度")
+		}
+		if err = rows.Err(); err != nil {
+			return err
+		}
+	} else {
+		go a.runRecovery(context.Background())
+		go a.runPolicyEvaluation(context.Background())
+	}
+	writeData(w, map[string]any{"id": id, "schedulingPaused": input.Paused})
+	return nil
+}
+
 func sourceIDFromEvent(category, dedupeKey string) string {
 	prefix := ""
 	switch category {
