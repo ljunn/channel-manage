@@ -15,36 +15,42 @@ import (
 )
 
 type Source struct {
-	ID                       string     `json:"id"`
-	Name                     string     `json:"name"`
-	Platform                 string     `json:"platform"`
-	BaseURL                  string     `json:"baseUrl"`
-	RechargeURL              string     `json:"rechargeUrl"`
-	Status                   string     `json:"status"`
-	ManuallyUntrusted        bool       `json:"manuallyUntrusted"`
-	ManuallyUntrustedAt      *time.Time `json:"manuallyUntrustedAt"`
-	SchedulingPaused         bool       `json:"schedulingPaused"`
-	SchedulingPausedAt       *time.Time `json:"schedulingPausedAt"`
-	ValueDivisor             float64    `json:"valueDivisor"`
-	UsernameHint             string     `json:"usernameHint"`
-	Version                  string     `json:"version"`
-	ScanIntervalSeconds      int        `json:"scanIntervalSeconds"`
-	ScanStatus               string     `json:"scanStatus"`
-	LastScanAt               *time.Time `json:"lastScanAt"`
-	LastError                string     `json:"lastError"`
-	Balance                  *float64   `json:"balance"`
-	BalanceCurrency          string     `json:"balanceCurrency"`
-	BalanceBurnRate          *float64   `json:"balanceBurnRate"`
-	BalanceEtaHours          *float64   `json:"balanceEtaHours"`
-	BalanceSampleCount       int        `json:"balanceSampleCount"`
-	KeyCount                 int        `json:"keyCount"`
-	GroupCount               int        `json:"groupCount"`
-	BoundGroupCount          int        `json:"boundGroupCount"`
-	ManagedAccountCount      int        `json:"managedAccountCount"`
-	SystemRecommendation     string     `json:"systemRecommendation"`
-	RecommendationConfidence string     `json:"recommendationConfidence"`
-	RecommendationReasons    []string   `json:"recommendationReasons"`
-	CreatedAt                time.Time  `json:"createdAt"`
+	ID                    string     `json:"id"`
+	Name                  string     `json:"name"`
+	Platform              string     `json:"platform"`
+	BaseURL               string     `json:"baseUrl"`
+	RechargeURL           string     `json:"rechargeUrl"`
+	Status                string     `json:"status"`
+	ManuallyUntrusted     bool       `json:"manuallyUntrusted"`
+	ManuallyUntrustedAt   *time.Time `json:"manuallyUntrustedAt"`
+	SchedulingPaused      bool       `json:"schedulingPaused"`
+	SchedulingPausedAt    *time.Time `json:"schedulingPausedAt"`
+	ValueDivisor          float64    `json:"valueDivisor"`
+	UsernameHint          string     `json:"usernameHint"`
+	Version               string     `json:"version"`
+	ScanIntervalSeconds   int        `json:"scanIntervalSeconds"`
+	ScanStatus            string     `json:"scanStatus"`
+	LastScanAt            *time.Time `json:"lastScanAt"`
+	LastError             string     `json:"lastError"`
+	Balance               *float64   `json:"balance"`
+	BalanceCurrency       string     `json:"balanceCurrency"`
+	BalanceBurnRate       *float64   `json:"balanceBurnRate"`
+	BalanceEtaHours       *float64   `json:"balanceEtaHours"`
+	BalanceSampleCount    int        `json:"balanceSampleCount"`
+	KeyCount              int        `json:"keyCount"`
+	GroupCount            int        `json:"groupCount"`
+	BoundGroupCount       int        `json:"boundGroupCount"`
+	ManagedAccountCount   int        `json:"managedAccountCount"`
+	StabilityStatus       string     `json:"stabilityStatus"`
+	StabilityConfidence   string     `json:"stabilityConfidence"`
+	StabilityReasons      []string   `json:"stabilityReasons"`
+	BusinessRequests7d    int        `json:"businessRequests7d"`
+	BusinessSuccessRate7d *float64   `json:"businessSuccessRate7d"`
+	FirstTokenP95Ms7d     *float64   `json:"firstTokenP95Ms7d"`
+	ProbeSamples7d        int        `json:"probeSamples7d"`
+	ProbeSuccessRate7d    *float64   `json:"probeSuccessRate7d"`
+	ScanIncidents7d       int        `json:"scanIncidents7d"`
+	CreatedAt             time.Time  `json:"createdAt"`
 }
 
 type sourceCredentials struct {
@@ -106,7 +112,7 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		result[index].BalanceEtaHours = &forecast.EtaHours
 		result[index].BalanceSampleCount = forecast.Samples
 	}
-	if err := a.applySourceQualityRecommendations(ctx, result); err != nil {
+	if err := a.applySourceStabilityAssessments(ctx, result); err != nil {
 		return nil, err
 	}
 	return result, nil

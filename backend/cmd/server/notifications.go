@@ -193,7 +193,7 @@ func (a *App) notifyEvent(ctx context.Context, eventID, severity, title, detail 
 	subject := eventEmailSubject(severity, category, title, detail, guidance)
 	content := formatEventEmail(eventID, severity, title, detail, messageTime, guidance)
 	if category == "SOURCE_BALANCE" {
-		content = formatBalanceEmail(severity, detail, messageTime, a.sourceQualityReference(ctx, sourceID))
+		content = formatBalanceEmail(severity, detail, messageTime)
 	}
 	rows, err := a.db.QueryContext(ctx, `SELECT id FROM notification_channels WHERE status='ACTIVE'`)
 	if err != nil {
@@ -251,7 +251,7 @@ func (a *App) currentBalanceEmailDetail(ctx context.Context, sourceID string, re
 	return strings.TrimSpace(detail)
 }
 
-func formatBalanceEmail(severity, detail string, eventTime time.Time, systemReference string) string {
+func formatBalanceEmail(severity, detail string, eventTime time.Time) string {
 	location := time.FixedZone("UTC+8", 8*60*60)
 	lines := []string{}
 	if balance := eventDetailField(detail, "当前余额"); balance != "" {
@@ -269,9 +269,6 @@ func formatBalanceEmail(severity, detail string, eventTime time.Time, systemRefe
 	}
 	if account := eventDetailField(detail, "充值账号"); account != "" {
 		lines = append(lines, "充值账号："+account)
-	}
-	if systemReference != "" {
-		lines = append(lines, "系统参考："+systemReference)
 	}
 	if rechargeURL := eventDetailField(detail, "充值地址"); rechargeURL != "" {
 		lines = append(lines, "", "前往充值："+rechargeURL)

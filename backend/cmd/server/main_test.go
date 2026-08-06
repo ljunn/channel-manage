@@ -410,37 +410,38 @@ func TestBalanceEmailSubjectNamesSourceAndBalance(t *testing.T) {
 
 func TestBalanceEmailKeepsOnlyRechargeFields(t *testing.T) {
 	detail := "数据源：微信\n充值地址：https://example.com/billing\n充值账号：vi****nt\n当前余额：12.00 USD\n实际消耗速度：3.00 USD / 小时（中位数）\n预计耗尽时间：2026-08-03 18:30\n建议最低充值：50.00 USD\n判定依据：连续 2 次扫描均低于预警线"
-	content := formatBalanceEmail("P1", detail, time.Now(), "建议停止充值，7 天真实业务成功率 94.1%")
-	for _, expected := range []string{"当前余额：12.00 USD", "建议充值：至少 50.00 USD", "预计耗尽：2026-08-03 18:30", "充值账号：vi****nt", "系统参考：建议停止充值", "前往充值：https://example.com/billing"} {
+	content := formatBalanceEmail("P1", detail, time.Now())
+	for _, expected := range []string{"当前余额：12.00 USD", "建议充值：至少 50.00 USD", "预计耗尽：2026-08-03 18:30", "充值账号：vi****nt", "前往充值：https://example.com/billing"} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("balance email is missing %q:\n%s", expected, content)
 		}
 	}
-	for _, unwanted := range []string{"实际消耗速度", "判定依据", "事件 ID", "系统会自动做什么"} {
+	for _, unwanted := range []string{"实际消耗速度", "判定依据", "系统参考", "事件 ID", "系统会自动做什么"} {
 		if strings.Contains(content, unwanted) {
 			t.Fatalf("balance email contains unwanted %q:\n%s", unwanted, content)
 		}
 	}
 }
 
-func TestSourceQualityRecommendationIsEvidenceOnly(t *testing.T) {
+func TestSourceStabilityAssessmentUsesOperationalSignals(t *testing.T) {
 	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name  string
 		input sourceQualityInput
 		want  string
 	}{
-		{"insufficient", sourceQualityInput{CreatedAt: now.Add(-24 * time.Hour), ProbeSamples: 30, ProbeSuccessRate: sql.NullFloat64{Float64: 100, Valid: true}}, sourceRecommendationInsufficient},
-		{"stop", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 85, Valid: true}}, sourceRecommendationStop},
-		{"observe", sourceQualityInput{CreatedAt: now.Add(-4 * 24 * time.Hour), BusinessRequests: 300, BusinessSuccessRate: sql.NullFloat64{Float64: 95, Valid: true}}, sourceRecommendationObserve},
-		{"use", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1800, Valid: true}}, sourceRecommendationUse},
-		{"business-overrides-probe-model", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 20, Valid: true}, BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}}, sourceRecommendationObserve},
+		{"insufficient", sourceQualityInput{CreatedAt: now.Add(-24 * time.Hour), ProbeSamples: 30, ProbeSuccessRate: sql.NullFloat64{Float64: 100, Valid: true}}, sourceStabilityInsufficient},
+		{"unstable", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 85, Valid: true}}, sourceStabilityUnstable},
+		{"degraded", sourceQualityInput{CreatedAt: now.Add(-4 * 24 * time.Hour), BusinessRequests: 300, BusinessSuccessRate: sql.NullFloat64{Float64: 95, Valid: true}}, sourceStabilityDegraded},
+		{"stable", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 1800, Valid: true}}, sourceStabilityStable},
+		{"business-overrides-probe", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), ProbeSamples: 200, ProbeSuccessRate: sql.NullFloat64{Float64: 20, Valid: true}, BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}}, sourceStabilityStable},
+		{"slow-first-response", sourceQualityInput{CreatedAt: now.Add(-8 * 24 * time.Hour), BusinessRequests: 1200, BusinessSuccessRate: sql.NullFloat64{Float64: 99.8, Valid: true}, FirstTokenP95Ms: sql.NullFloat64{Float64: 12_000, Valid: true}}, sourceStabilityUnstable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, _, reasons := recommendSourceQuality(test.input, now)
+			got, _, reasons := assessSourceStability(test.input, now)
 			if got != test.want || len(reasons) == 0 {
-				t.Fatalf("recommendSourceQuality() = %q, %v; want %q with reasons", got, reasons, test.want)
+				t.Fatalf("assessSourceStability() = %q, %v; want %q with reasons", got, reasons, test.want)
 			}
 		})
 	}

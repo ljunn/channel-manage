@@ -187,7 +187,7 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .balance-forecast { min-width: 150px; }
 .balance-forecast strong { font-family: var(--mono); }
 .balance-forecast small:last-child { color: var(--teal-700); }
-.source-quality-cell { min-width: 124px; }
+.source-quality-cell { min-width: 190px; }
 .source-quality-cell small { margin-top: 3px; }
 .source-untrusted-row { background: #fff9f8; }
 .scheduling-tabs { min-height: 48px; display: flex; gap: 22px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
@@ -474,14 +474,18 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .mapping-job-status strong, .mapping-job-status small { display: block; }
 .mapping-job-status small { color: inherit; opacity: .82; }
 .mapping-cardinality { margin-left: auto; color: var(--teal-700); font-size: 12px; font-weight: 700; }
-.source-quality-panel { min-height: 74px; display: grid; grid-template-columns: minmax(220px,.9fr) minmax(260px,1.2fr) auto; align-items: center; gap: 18px; padding: 12px 14px; border-block: 1px solid var(--line); }
+.source-quality-panel { min-height: 96px; display: grid; grid-template-columns: minmax(200px,.75fr) minmax(420px,1.5fr) auto; align-items: center; gap: 14px 18px; padding: 12px 14px; border-block: 1px solid var(--line); }
 .source-quality-panel.untrusted { border-color: #f0cfd1; background: #fff8f7; }
 .source-quality-panel.paused { border-color: #ecd39f; background: #fffaf0; }
 .source-quality-summary { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .source-quality-summary > div { min-width: 0; display: grid; gap: 2px; }
 .source-quality-summary strong { font-size: 12px; }
 .source-quality-summary small { font-size: 10px; }
-.source-quality-panel ul { display: grid; gap: 3px; margin: 0; padding: 0; color: var(--muted); font-size: 11px; list-style: none; }
+.source-stability-metrics { display: grid; grid-template-columns: repeat(4,minmax(76px,1fr)); margin: 0; }
+.source-stability-metrics > div { min-width: 0; display: grid; gap: 1px; padding: 0 12px; border-left: 1px solid var(--line-soft); }
+.source-stability-metrics dt, .source-stability-metrics small { color: var(--muted); font-size: 10px; }
+.source-stability-metrics dd { margin: 0; font-family: var(--mono); font-size: 13px; font-weight: 700; }
+.source-quality-panel ul { grid-column: 1/3; display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px 14px; margin: 0; padding: 0; color: var(--muted); font-size: 11px; list-style: none; }
 .source-quality-panel li::before { margin-right: 6px; color: var(--ink-300); content: '·'; }
 .source-trust-toggle { min-width: 190px; display: grid; grid-template-columns: minmax(0,1fr) 38px; align-items: center; gap: 10px; cursor: pointer; }
 .source-trust-toggle > span { display: grid; gap: 2px; }
@@ -577,7 +581,8 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .search { width: 190px; }
 	.mapping-builder { gap: 14px; }
 	.source-quality-panel { grid-template-columns: 1fr 1fr; }
-	.source-quality-panel ul { grid-column: 1/-1; grid-row: 2; }
+	.source-stability-metrics { grid-column: 1/-1; grid-row: 2; }
+	.source-quality-panel ul { grid-column: 1/-1; grid-row: 3; }
   .schedule-overview { grid-template-columns: repeat(3,1fr); }
   .schedule-overview > div:nth-child(3) { border-right: 0; }
   .schedule-overview > label { grid-column: 1/-1; min-height: 68px; border-top: 1px solid var(--line-soft); }
@@ -610,7 +615,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .source-controls label { min-width: calc(50% - 6px); flex: 1; }
 	.source-controls select { height: 42px; }
 	.source-quality-panel { grid-template-columns: 1fr; gap: 12px; }
-	.source-quality-panel ul { grid-column: auto; grid-row: auto; }
+	.source-stability-metrics { grid-column: auto; grid-row: auto; grid-template-columns: 1fr 1fr; gap: 10px 0; }
+	.source-stability-metrics > div:nth-child(odd) { border-left: 0; padding-left: 0; }
+	.source-quality-panel ul { grid-column: auto; grid-row: auto; grid-template-columns: 1fr; }
 	.source-trust-toggle { width: 100%; }
   .source-result-count { width: 100%; margin: 0; }
   .schedule-overview { grid-template-columns: 1fr 1fr; }
