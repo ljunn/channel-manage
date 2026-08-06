@@ -168,7 +168,7 @@ func (a *App) createSource(w http.ResponseWriter, r *http.Request) error {
 		credential.Password = input.Password
 		credentialHint = mask(input.Username)
 	}
-	baseURL, err := validateRemoteURL(input.BaseURL)
+	baseURL, err := validateSourceURL(input.BaseURL)
 	if err != nil {
 		return err
 	}

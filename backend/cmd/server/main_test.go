@@ -60,6 +60,27 @@ func TestValidateRemoteURLRejectsUnsafeTargets(t *testing.T) {
 	}
 }
 
+func TestValidateSourceURLAllowsPublicHTTPIPOnly(t *testing.T) {
+	t.Setenv("ALLOW_INSECURE_UPSTREAMS", "false")
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "false")
+
+	value, err := validateSourceURL("http://1.1.1.1:8080/path?q=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "http://1.1.1.1:8080" {
+		t.Fatalf("got %q", value)
+	}
+	if _, err := validateRemoteURL("http://1.1.1.1"); err == nil {
+		t.Error("expected a non-source HTTP endpoint to be rejected")
+	}
+	for _, value := range []string{"http://127.0.0.1:8080", "http://10.0.0.2", "http://100.64.0.1"} {
+		if _, err := validateSourceURL(value); err == nil {
+			t.Errorf("expected %q to be rejected", value)
+		}
+	}
+}
+
 func TestValidateRemoteURLNormalizesOrigin(t *testing.T) {
 	if os.Getenv("CI") == "" {
 		t.Skip("requires external DNS")

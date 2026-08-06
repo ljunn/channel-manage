@@ -37,9 +37,12 @@ func newRemoteHTTPClient() *http.Client {
 			if envBool("ALLOW_PRIVATE_UPSTREAMS", false) {
 				return dialer.DialContext(ctx, network, address)
 			}
-			addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil {
-				return nil, err
+			addresses := []net.IPAddr{{IP: net.ParseIP(host)}}
+			if addresses[0].IP == nil {
+				addresses, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, err
+				}
 			}
 			for _, resolved := range addresses {
 				if unsafeRemoteIP(resolved.IP) {
@@ -69,21 +72,44 @@ func newRemoteHTTPClient() *http.Client {
 }
 
 func unsafeRemoteIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	// Shared address space is not publicly routable and must not bypass SSRF protection.
+	if ipv4 := ip.To4(); ipv4 != nil && ipv4[0] == 100 && ipv4[1]&0xc0 == 0x40 {
+		return true
+	}
+	return false
 }
 
 func validateRemoteURL(raw string) (string, error) {
+	return validateRemoteURLWithOptions(raw, false)
+}
+
+// validateSourceURL permits an explicit public IP address over HTTP. Sources
+// often expose a direct IP endpoint, while every other upstream remains HTTPS-only.
+func validateSourceURL(raw string) (string, error) {
+	return validateRemoteURLWithOptions(raw, true)
+}
+
+func validateRemoteURLWithOptions(raw string, allowPublicIPHTTP bool) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Hostname() == "" || parsed.User != nil {
 		return "", &apiError{Status: 400, Code: "INVALID_REMOTE_URL", Message: "平台地址无效"}
 	}
-	if parsed.Scheme != "https" && !(envBool("ALLOW_INSECURE_UPSTREAMS", false) && parsed.Scheme == "http") {
+	literalIP := net.ParseIP(parsed.Hostname())
+	httpAllowed := envBool("ALLOW_INSECURE_UPSTREAMS", false) || (allowPublicIPHTTP && literalIP != nil && !unsafeRemoteIP(literalIP))
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && httpAllowed) {
 		return "", &apiError{Status: 400, Code: "REMOTE_URL_BLOCKED", Message: "平台地址必须使用 HTTPS"}
 	}
 	if !envBool("ALLOW_PRIVATE_UPSTREAMS", false) {
-		addresses, lookupErr := net.DefaultResolver.LookupIPAddr(context.Background(), parsed.Hostname())
-		if lookupErr != nil {
-			return "", &apiError{Status: 400, Code: "REMOTE_UNAVAILABLE", Message: "无法解析平台地址"}
+		addresses := []net.IPAddr{{IP: literalIP}}
+		if literalIP == nil {
+			var lookupErr error
+			addresses, lookupErr = net.DefaultResolver.LookupIPAddr(context.Background(), parsed.Hostname())
+			if lookupErr != nil {
+				return "", &apiError{Status: 400, Code: "REMOTE_UNAVAILABLE", Message: "无法解析平台地址"}
+			}
 		}
 		for _, address := range addresses {
 			if unsafeRemoteIP(address.IP) {

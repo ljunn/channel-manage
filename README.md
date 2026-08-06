@@ -103,10 +103,10 @@ Go 服务默认监听 `8080`，Vite 开发服务会将 `/api` 代理到该端口
 | `POSTGRES_USER` | `channel_manage` | PostgreSQL 用户 |
 | `POSTGRES_PASSWORD` | 无 | PostgreSQL 密码 |
 | `POSTGRES_DB` | `channel_manage` | PostgreSQL 数据库 |
-| `ALLOW_INSECURE_UPSTREAMS` | `false` | 是否允许 HTTP 上游 |
+| `ALLOW_INSECURE_UPSTREAMS` | `false` | 是否额外允许域名和目标节点使用 HTTP（公网 IP 数据源默认可直连） |
 | `ALLOW_PRIVATE_UPSTREAMS` | `false` | 是否允许内网或本机上游 |
 
-默认拒绝 HTTP、环回、私网、链路本地和未指定地址，降低 SSRF 风险。仅在封闭网络部署且已确认边界时开启对应选项。
+数据源可使用 `http://公网 IP:端口` 直连；域名和目标节点默认仍拒绝 HTTP。环回、私网、共享地址空间、链路本地和未指定地址始终受 SSRF 防护限制；仅在封闭网络部署且已确认边界时开启对应选项。
 
 ## 业务流程
 
