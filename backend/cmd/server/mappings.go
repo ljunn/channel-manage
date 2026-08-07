@@ -30,6 +30,7 @@ type existingMappingAccount struct {
 type mappingChannel struct {
 	ID, SourceGroupName, ModelsJSON string
 	EncryptedKey                    []byte
+	SourceMultiplier                float64
 }
 
 func mappingDifference(current []existingMappingAccount, desired []deploymentTargetGroup) (kept []existingMappingAccount, removed []existingMappingAccount, added []deploymentTargetGroup) {
@@ -133,7 +134,7 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 		return err
 	}
 	priority, concurrency := current[0].Priority, current[0].Concurrency
-	created, err := a.createRemoteManagedAccounts(r.Context(), target.BaseURL, targetSession, sourceAPIBase, source.Name, channel.SourceGroupName, string(key), models, added, priority, concurrency)
+	created, err := a.createRemoteManagedAccounts(r.Context(), target.BaseURL, targetSession, sourceAPIBase, source.Name, channel.SourceGroupName, string(key), models, added, channel.SourceMultiplier, priority, concurrency)
 	if err != nil {
 		for _, account := range created {
 			a.deleteRemoteManagedAccount(context.Background(), target.BaseURL, targetSession, account.RemoteID)
@@ -152,7 +153,7 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 	deleted := make([]existingMappingAccount, 0, len(removed))
 	for _, account := range removed {
 		if err = a.deleteRemoteManagedAccountChecked(r.Context(), target.BaseURL, targetSession, account.RemoteID); err != nil {
-			rollbackErr := a.restoreDeletedMappingAccounts(r.Context(), target, targetSession, sourceAPIBase, string(key), models, deleted)
+			rollbackErr := a.restoreDeletedMappingAccounts(r.Context(), target, targetSession, sourceAPIBase, string(key), models, channel.SourceMultiplier, deleted)
 			a.cleanupNewMappingAccounts(target, targetSession, created)
 			a.restoreMappingScheduling(target, targetSession, removed[len(deleted):])
 			if rollbackErr != nil {
@@ -165,7 +166,7 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 	}
 
 	if err = a.commitSourceGroupMapping(r.Context(), input.TargetID, channel, models, created, removed, priority, concurrency); err != nil {
-		rollbackErr := a.restoreDeletedMappingAccounts(r.Context(), target, targetSession, sourceAPIBase, string(key), models, deleted)
+		rollbackErr := a.restoreDeletedMappingAccounts(r.Context(), target, targetSession, sourceAPIBase, string(key), models, channel.SourceMultiplier, deleted)
 		a.cleanupNewMappingAccounts(target, targetSession, created)
 		if rollbackErr != nil {
 			a.reportMappingRollbackFailure(source, sourceGroupID, input.TargetID, channel.SourceGroupName, rollbackErr)
@@ -183,7 +184,8 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 
 func (a *App) loadSourceGroupMapping(ctx context.Context, sourceID, sourceGroupID, targetID string) (mappingChannel, []existingMappingAccount, error) {
 	var channel mappingChannel
-	err := a.db.QueryRowContext(ctx, `SELECT c.id,sg.name,k.key_cipher,k.models FROM channels c JOIN source_groups sg ON sg.id=c.source_group_id JOIN source_keys k ON k.id=c.source_key_id WHERE c.source_id=$1 AND c.source_group_id=$2 AND EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id AND m.target_id=$3) ORDER BY k.auto_generated DESC,c.created_at LIMIT 1`, sourceID, sourceGroupID, targetID).Scan(&channel.ID, &channel.SourceGroupName, &channel.EncryptedKey, &channel.ModelsJSON)
+	var sourceMultiplier sql.NullFloat64
+	err := a.db.QueryRowContext(ctx, `SELECT c.id,sg.name,k.key_cipher,k.models,sg.multiplier FROM channels c JOIN source_groups sg ON sg.id=c.source_group_id JOIN source_keys k ON k.id=c.source_key_id WHERE c.source_id=$1 AND c.source_group_id=$2 AND EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id AND m.target_id=$3) ORDER BY k.auto_generated DESC,c.created_at LIMIT 1`, sourceID, sourceGroupID, targetID).Scan(&channel.ID, &channel.SourceGroupName, &channel.EncryptedKey, &channel.ModelsJSON, &sourceMultiplier)
 	if err == sql.ErrNoRows {
 		var name string
 		if groupErr := a.db.QueryRowContext(ctx, `SELECT name FROM source_groups WHERE id=$1 AND source_id=$2`, sourceGroupID, sourceID).Scan(&name); groupErr == sql.ErrNoRows {
@@ -197,6 +199,10 @@ func (a *App) loadSourceGroupMapping(ctx context.Context, sourceID, sourceGroupI
 	if err != nil {
 		return channel, nil, err
 	}
+	if !sourceMultiplier.Valid || sourceMultiplier.Float64 < 0 {
+		return channel, nil, &apiError{409, "SOURCE_MULTIPLIER_UNAVAILABLE", channel.SourceGroupName + " 尚未获取有效倍率，请先重新扫描数据源"}
+	}
+	channel.SourceMultiplier = sourceMultiplier.Float64
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,tg.id,tg.name,tg.platform,tg.remote_id,COALESCE((
 		SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
 		WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
@@ -240,7 +246,7 @@ func (a *App) commitSourceGroupMapping(ctx context.Context, targetID string, cha
 	for _, account := range created {
 		managedID := uuid.NewString()
 		mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels))
-		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, "channel-manage:"+managedID, mappingHash); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, channel.SourceMultiplier, "channel-manage:"+managedID, mappingHash); err != nil {
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, account.TargetGroup.ID); err != nil {
@@ -295,10 +301,10 @@ func (a *App) restoreMappingScheduling(target Target, session remoteSession, acc
 	}
 }
 
-func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, session remoteSession, sourceAPIBase, key string, models []string, accounts []existingMappingAccount) error {
+func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, session remoteSession, sourceAPIBase, key string, models []string, rateMultiplier float64, accounts []existingMappingAccount) error {
 	var failures []string
 	for _, account := range accounts {
-		remoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, account.TargetGroup.Platform, key, models, account.TargetGroup.DisabledModels, []int{account.TargetGroup.RemoteID}, account.RemoteName, account.Priority, account.Concurrency)
+		remoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, account.TargetGroup.Platform, key, models, account.TargetGroup.DisabledModels, []int{account.TargetGroup.RemoteID}, account.RemoteName, rateMultiplier, account.Priority, account.Concurrency)
 		if err != nil {
 			failures = append(failures, account.TargetGroup.Name+": "+userErrorMessage(err))
 			continue
@@ -308,7 +314,7 @@ func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, 
 				failures = append(failures, account.TargetGroup.Name+": 恢复调度失败")
 			}
 		}
-		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels))); err != nil {
+		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,rate_multiplier=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels)), rateMultiplier); err != nil {
 			failures = append(failures, account.TargetGroup.Name+": 保存恢复账号失败")
 		}
 	}

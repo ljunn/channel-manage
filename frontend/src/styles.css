@@ -184,6 +184,10 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .source-controls select:focus { border-color: var(--teal-500); box-shadow: 0 0 0 3px rgba(53,181,170,.12); }
 .source-result-count { margin: 0 2px 8px auto; color: var(--ink-400); font-size: 11px; white-space: nowrap; }
 .binding-progress strong { font-variant-numeric: tabular-nums; }
+.source-binding-button { color: var(--teal-700); }
+.account-rate { min-width: 120px; font-family: var(--mono); }
+.account-rate .rate-ok { color: var(--green); }
+.account-rate .rate-drift { color: var(--amber); }
 .balance-forecast { min-width: 150px; }
 .balance-forecast strong { font-family: var(--mono); }
 .balance-forecast small:last-child { color: var(--teal-700); }

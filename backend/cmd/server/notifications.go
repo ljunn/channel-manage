@@ -343,7 +343,7 @@ func eventEmailSetting(category string) string {
 		return "email_alert_group_availability"
 	case "ACTION_EXECUTION":
 		return "email_alert_action_execution"
-	case "ACCOUNT_PLATFORM_SYNC", "ACCOUNT_MODEL_SYNC":
+	case "ACCOUNT_PLATFORM_SYNC", "ACCOUNT_MODEL_SYNC", "ACCOUNT_RATE_SYNC":
 		return "email_alert_platform_sync"
 	default:
 		return ""
@@ -393,6 +393,8 @@ func eventEmailGuidanceFor(category string, recovered bool) eventEmailGuidance {
 		return eventEmailGuidance{"账号平台校正失败", "托管账号的平台格式可能与目标分组不一致，该账号不会可靠参与调度。", "请检查目标分组的平台类型以及目标节点的账号创建权限，不要手动删除旧账号。", "系统会安全重建格式正确的账号，成功后切换绑定并清理旧账号。"}
 	case "ACCOUNT_MODEL_SYNC":
 		return eventEmailGuidance{"账号模型映射校正失败", "托管账号的模型映射没有按目标分组策略完整更新，相关模型可能无法正确调度。", "请检查目标节点的账号写入权限和远端返回错误，不要手动覆盖托管账号配置。", "系统会在下一轮目标同步时重试模型映射，成功后自动关闭事件。"}
+	case "ACCOUNT_RATE_SYNC":
+		return eventEmailGuidance{"账号倍率校正失败", "托管账号倍率与源分组不一致，目标节点上的计费和成本核算可能出现偏差。", "请检查目标节点是否在线，以及管理员账号和账号写入权限是否有效。", "系统会在下一轮目标同步时重试倍率校正，成功后自动关闭事件。"}
 	default:
 		return eventEmailGuidance{"生产运行异常", "相关业务可能受到影响，具体范围请查看邮件中的事件详情。", "请打开事件中心定位对应事件，并按详情中的对象和错误信息处理。", "系统会继续监控并在满足恢复条件后自动关闭事件。"}
 	}

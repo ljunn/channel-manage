@@ -260,21 +260,22 @@ func insufficientBalanceError(err error) bool {
 }
 
 func (a *App) listManagedAccounts(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,m.remote_id,m.remote_name,m.platform,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name,'platform',tg.platform)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name ORDER BY m.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,COALESCE(sg.name,''),sg.multiplier,m.rate_multiplier,m.remote_id,m.remote_name,m.platform,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name,'platform',tg.platform)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name,sg.name,sg.multiplier ORDER BY m.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, targetID, targetName, channelID, sourceName, keyName, remoteID, remoteName, platform, status, lastError, groups string
+		var id, targetID, targetName, channelID, sourceName, keyName, sourceGroupName, remoteID, remoteName, platform, status, lastError, groups string
+		var sourceMultiplier, rateMultiplier sql.NullFloat64
 		var priority, concurrency int
 		var schedulable bool
 		var created time.Time
-		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &remoteID, &remoteName, &platform, &priority, &concurrency, &schedulable, &status, &lastError, &created, &groups); err != nil {
+		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &sourceGroupName, &sourceMultiplier, &rateMultiplier, &remoteID, &remoteName, &platform, &priority, &concurrency, &schedulable, &status, &lastError, &created, &groups); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "remoteId": remoteID, "remoteName": remoteName, "platform": platform, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "targetGroups": json.RawMessage(groups), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "sourceGroupName": sourceGroupName, "sourceMultiplier": nullableFloat(sourceMultiplier), "rateMultiplier": nullableFloat(rateMultiplier), "remoteId": remoteID, "remoteName": remoteName, "platform": platform, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "targetGroups": json.RawMessage(groups), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -440,8 +441,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	}
 	remoteName := "[托管] " + input.Name
 	var sourceBase, encryptedKey, keyModels, targetBase string
+	var sourceMultiplier sql.NullFloat64
 	var targetWrite, manuallyUntrusted bool
-	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,k.models,t.base_url,t.write_enabled,s.manually_untrusted FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &keyModels, &targetBase, &targetWrite, &manuallyUntrusted)
+	err := a.db.QueryRowContext(r.Context(), `SELECT s.base_url,k.key_cipher,k.models,t.base_url,t.write_enabled,s.manually_untrusted,sg.multiplier FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id JOIN source_groups sg ON sg.id=c.source_group_id JOIN targets t ON t.id=$2 WHERE c.id=$1 AND k.production_authorized=true`, input.ChannelID, input.TargetID).Scan(&sourceBase, &encryptedKey, &keyModels, &targetBase, &targetWrite, &manuallyUntrusted, &sourceMultiplier)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在或尚未授权生产使用"}
 	}
@@ -450,6 +452,9 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	}
 	if manuallyUntrusted {
 		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能创建新的托管账号"}
+	}
+	if !sourceMultiplier.Valid || sourceMultiplier.Float64 < 0 {
+		return &apiError{409, "SOURCE_MULTIPLIER_UNAVAILABLE", "渠道尚未获取有效倍率，请先重新扫描数据源"}
 	}
 	if !targetWrite {
 		return &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入"}
@@ -506,7 +511,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 	if len(modelMap) == 0 {
 		return &apiError{409, "NO_ALLOWED_MODELS", "源渠道在应用分组禁用清单后没有可用模型"}
 	}
-	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
+	payload := map[string]any{"name": remoteName, "platform": targetPlatform, "type": "apikey", "credentials": map[string]any{"api_key": string(key), "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": groupRemoteIDs, "rate_multiplier": sourceMultiplier.Float64, "priority": input.Priority, "concurrency": input.Concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(requestCtx, targetBase, http.MethodPost, "/api/v1/admin/accounts", session, payload)
 	if err != nil {
 		return err
@@ -531,7 +536,7 @@ func (a *App) createManagedAccount(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, "channel-manage:"+id, managedAccountConfigHash(targetPlatform, modelMap))
+	_, err = tx.ExecContext(r.Context(), `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11)`, id, input.TargetID, input.ChannelID, remoteID, remoteName, targetPlatform, input.Priority, input.Concurrency, sourceMultiplier.Float64, "channel-manage:"+id, managedAccountConfigHash(targetPlatform, modelMap))
 	if err != nil {
 		return err
 	}

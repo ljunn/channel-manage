@@ -98,7 +98,7 @@ func (a *App) scanDueSources(ctx context.Context) {
 }
 
 func (a *App) syncDueTargets(ctx context.Context) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id FROM targets WHERE last_sync_at IS NULL OR last_sync_at<now()-interval '15 minutes'`)
+	rows, err := a.db.QueryContext(ctx, `SELECT id FROM targets t WHERE last_sync_at IS NULL OR last_sync_at<now()-interval '15 minutes' OR EXISTS(SELECT 1 FROM managed_accounts m WHERE m.target_id=t.id AND m.rate_multiplier IS NULL)`)
 	if err != nil {
 		return
 	}

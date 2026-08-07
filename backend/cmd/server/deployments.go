@@ -27,6 +27,7 @@ type sourceDeploymentRequest struct {
 
 type deploymentSourceGroup struct {
 	ID, RemoteID, Name string
+	Multiplier         float64
 }
 
 type deploymentTargetGroup struct {
@@ -237,7 +238,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		if len(models) == 0 {
 			return nil, &apiError{409, "SOURCE_MODELS_UNAVAILABLE", group.Name + " 未返回可用模型"}
 		}
-		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Name, group.Name, remoteKey.Key, models, targetGroups, input.Priority, input.Concurrency)
+		accounts, accountErr := a.createRemoteManagedAccounts(requestCtx, target.BaseURL, targetSession, sourceAPIBase, source.Name, group.Name, remoteKey.Key, models, targetGroups, group.Multiplier, input.Priority, input.Concurrency)
 		created[len(created)-1].Models = models
 		created[len(created)-1].Accounts = accounts
 		if accountErr != nil {
@@ -272,7 +273,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
 			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, item.Models, account.TargetGroup.DisabledModels))
-			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,false,$9,'SYNCED',$10)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, "channel-manage:"+managedID, mappingHash)
+			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, item.SourceGroup.Multiplier, "channel-manage:"+managedID, mappingHash)
 			if err != nil {
 				return nil, err
 			}
@@ -313,13 +314,18 @@ func (a *App) validateDeploymentSourceGroups(ctx context.Context, sourceID, targ
 		}
 		seen[id] = true
 		var group deploymentSourceGroup
-		err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name FROM source_groups WHERE id=$1 AND source_id=$2`, id, sourceID).Scan(&group.ID, &group.RemoteID, &group.Name)
+		var multiplier sql.NullFloat64
+		err := a.db.QueryRowContext(ctx, `SELECT id,remote_id,name,multiplier FROM source_groups WHERE id=$1 AND source_id=$2`, id, sourceID).Scan(&group.ID, &group.RemoteID, &group.Name, &multiplier)
 		if err == sql.ErrNoRows {
 			return nil, &apiError{400, "INVALID_SOURCE_GROUP_IDS", "源分组不存在或不属于该数据源"}
 		}
 		if err != nil {
 			return nil, err
 		}
+		if !multiplier.Valid || multiplier.Float64 < 0 {
+			return nil, &apiError{409, "SOURCE_MULTIPLIER_UNAVAILABLE", group.Name + " 尚未获取有效倍率，请先重新扫描数据源"}
+		}
+		group.Multiplier = multiplier.Float64
 		var existing int
 		if err = a.db.QueryRowContext(ctx, `SELECT count(*) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE m.target_id=$1 AND c.source_group_id=$2`, targetID, id).Scan(&existing); err != nil {
 			return nil, err
@@ -509,12 +515,12 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 	return normalized, nil
 }
 
-func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, priority, concurrency int) (string, error) {
+func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, rateMultiplier float64, priority, concurrency int) (string, error) {
 	modelMap := modelMappingForPolicy(targetPlatform, models, disabledModels)
 	if len(modelMap) == 0 {
 		return "", &apiError{409, "NO_ALLOWED_MODELS", "源渠道在应用分组禁用清单后没有可用模型"}
 	}
-	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "priority": priority, "concurrency": concurrency, "schedulable": false}
+	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "rate_multiplier": rateMultiplier, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)
 	if err != nil {
 		return "", err
@@ -536,7 +542,7 @@ func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string,
 	return remoteIDText, nil
 }
 
-func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, priority, concurrency int) ([]createdRemoteAccount, error) {
+func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, sourceName, sourceGroupName, key string, models []string, targetGroups []deploymentTargetGroup, rateMultiplier float64, priority, concurrency int) ([]createdRemoteAccount, error) {
 	type accountResult struct {
 		index   int
 		account createdRemoteAccount
@@ -553,7 +559,7 @@ func (a *App) createRemoteManagedAccounts(ctx context.Context, targetBase string
 			for index := range jobs {
 				targetGroup := targetGroups[index]
 				remoteName := managedAccountName(sourceName, sourceGroupName, targetGroup.Name, targetGroup.RemoteID)
-				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, targetGroup.Platform, key, models, targetGroup.DisabledModels, []int{targetGroup.RemoteID}, remoteName, priority, concurrency)
+				remoteID, err := a.createRemoteManagedAccount(ctx, targetBase, targetSession, sourceBase, targetGroup.Platform, key, models, targetGroup.DisabledModels, []int{targetGroup.RemoteID}, remoteName, rateMultiplier, priority, concurrency)
 				results <- accountResult{index: index, account: createdRemoteAccount{RemoteID: remoteID, RemoteName: remoteName, TargetGroup: targetGroup}, err: err}
 			}
 		}()

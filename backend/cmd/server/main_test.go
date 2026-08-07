@@ -161,7 +161,7 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		{ID: "local-1", Name: "低倍率", Platform: "anthropic", RemoteID: 11, DisabledModels: []string{"claude-test"}},
 		{ID: "local-2", Name: "高质量", Platform: "grok", RemoteID: 22},
 	}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"claude-test", "claude-allowed", "grok-test"}, targetGroups, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"claude-test", "claude-allowed", "grok-test"}, targetGroups, .37, 1000, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +195,9 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 		}
 		if int(request["concurrency"].(float64)) != 1000 {
 			t.Fatalf("account %d concurrency=%v, want 1000", index, request["concurrency"])
+		}
+		if request["rate_multiplier"].(float64) != .37 {
+			t.Fatalf("account %d rate_multiplier=%v, want 0.37", index, request["rate_multiplier"])
 		}
 		if request["platform"] != targetGroup.Platform {
 			t.Fatalf("account %d platform=%v, want target group platform %s", index, request["platform"], targetGroup.Platform)
@@ -258,7 +261,7 @@ func TestCreateRemoteManagedAccountsReturnsSuccessesWhenOneTargetFails(t *testin
 	defer server.Close()
 
 	app := &App{httpClient: server.Client()}
-	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"gpt-test"}, []deploymentTargetGroup{{ID: "local-1", Name: "成功", Platform: "openai", RemoteID: 11}, {ID: "local-2", Name: "失败", Platform: "openai", RemoteID: 22}}, 1000, 1000)
+	accounts, err := app.createRemoteManagedAccounts(context.Background(), server.URL, remoteSession{}, "https://source.example", "源站", "分组 A", "sk-test", []string{"gpt-test"}, []deploymentTargetGroup{{ID: "local-1", Name: "成功", Platform: "openai", RemoteID: 11}, {ID: "local-2", Name: "失败", Platform: "openai", RemoteID: 22}}, .5, 1000, 1000)
 	if err == nil || !strings.Contains(err.Error(), "失败") {
 		t.Fatalf("expected target-specific failure, got %v", err)
 	}
@@ -281,6 +284,18 @@ func TestManagedPlatformUsesTargetGroupType(t *testing.T) {
 		if actual := managedPlatform(input); actual != expected {
 			t.Fatalf("managedPlatform(%q)=%q, want %q", input, actual, expected)
 		}
+	}
+}
+
+func TestRateMultiplierNeedsSync(t *testing.T) {
+	if rateMultiplierNeedsSync(.32, true, .32) {
+		t.Fatal("matching account rate was treated as drift")
+	}
+	if !rateMultiplierNeedsSync(1, true, .32) {
+		t.Fatal("default account rate was not treated as drift")
+	}
+	if !rateMultiplierNeedsSync(0, false, .32) {
+		t.Fatal("missing account rate was not treated as drift")
 	}
 }
 
@@ -391,6 +406,9 @@ func TestEventEmailGuidanceIsActionable(t *testing.T) {
 	if eventEmailSetting("ACCOUNT_MODEL_SYNC") != "email_alert_platform_sync" {
 		t.Fatal("model mapping correction must use the account configuration setting")
 	}
+	if eventEmailSetting("ACCOUNT_RATE_SYNC") != "email_alert_platform_sync" {
+		t.Fatal("rate correction must use the account configuration setting")
+	}
 	if eventEmailSetting("TARGET_LOG") != "" {
 		t.Fatal("unconfigured event category unexpectedly has an email setting")
 	}
@@ -400,6 +418,10 @@ func TestEventEmailGuidanceIsActionable(t *testing.T) {
 	modelGuidance := eventEmailGuidanceFor("ACCOUNT_MODEL_SYNC", false)
 	if modelGuidance.Scene != "账号模型映射校正失败" || !strings.Contains(modelGuidance.Action, "写入权限") {
 		t.Fatalf("model correction guidance is incomplete: %#v", modelGuidance)
+	}
+	rateGuidance := eventEmailGuidanceFor("ACCOUNT_RATE_SYNC", false)
+	if rateGuidance.Scene != "账号倍率校正失败" || !strings.Contains(rateGuidance.Action, "写入权限") {
+		t.Fatalf("rate correction guidance is incomplete: %#v", rateGuidance)
 	}
 	if emailDeliveryKind("恢复") != "recovery" || emailDeliveryKind("P0") != "p0" {
 		t.Fatal("email delivery idempotency keys must use stable ASCII kinds")

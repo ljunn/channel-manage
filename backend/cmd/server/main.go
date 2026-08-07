@@ -48,6 +48,8 @@ type App struct {
 	targetPlatformSyncs       map[string]struct{}
 	targetModelMu             sync.Mutex
 	targetModelSyncs          map[string]struct{}
+	targetRateMu              sync.Mutex
+	targetRateSyncs           map[string]struct{}
 	targetSchedulableMu       sync.Mutex
 	targetSchedulableSyncs    map[string]struct{}
 }

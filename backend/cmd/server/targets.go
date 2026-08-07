@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -158,6 +159,7 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		defer platformCancel()
 		a.syncManagedAccountSchedulableStates(platformCtx, target, session)
 		a.syncManagedAccountPlatforms(platformCtx, target, session)
+		a.syncManagedAccountRateMultipliers(platformCtx, target, session)
 		a.syncManagedAccountModelMappings(platformCtx, target, session)
 	}()
 	return nil
@@ -276,6 +278,135 @@ func (a *App) syncManagedAccountSchedulableStates(ctx context.Context, target Ta
 	}
 }
 
+func (a *App) syncManagedAccountRateMultipliers(ctx context.Context, target Target, session remoteSession) {
+	if !target.WriteEnabled {
+		return
+	}
+	a.targetRateMu.Lock()
+	if a.targetRateSyncs == nil {
+		a.targetRateSyncs = make(map[string]struct{})
+	}
+	if _, running := a.targetRateSyncs[target.ID]; running {
+		a.targetRateMu.Unlock()
+		return
+	}
+	a.targetRateSyncs[target.ID] = struct{}{}
+	a.targetRateMu.Unlock()
+	defer func() {
+		a.targetRateMu.Lock()
+		delete(a.targetRateSyncs, target.ID)
+		a.targetRateMu.Unlock()
+	}()
+
+	type managedRate struct {
+		id, remoteID string
+		desired      float64
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,sg.multiplier
+		FROM managed_accounts m
+		JOIN channels c ON c.id=m.channel_id
+		JOIN source_groups sg ON sg.id=c.source_group_id
+		JOIN sources s ON s.id=c.source_id
+		WHERE m.target_id=$1 AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'
+		AND s.manually_untrusted=false AND sg.multiplier IS NOT NULL`, target.ID)
+	if err != nil {
+		log.Printf("读取托管账号倍率失败 [%s]: %v", target.ID, err)
+		return
+	}
+	items := map[string]managedRate{}
+	for rows.Next() {
+		var item managedRate
+		if err = rows.Scan(&item.id, &item.remoteID, &item.desired); err != nil {
+			break
+		}
+		items[item.remoteID] = item
+	}
+	_ = rows.Close()
+	if err != nil || len(items) == 0 {
+		return
+	}
+
+	accounts, err := a.fetchPaged(ctx, target.BaseURL, "/api/v1/admin/accounts?search="+url.QueryEscape("[托管]"), session)
+	if err != nil {
+		log.Printf("读取远端托管账号倍率失败 [%s]: %v", target.ID, err)
+		detail := target.Name + " 无法读取托管账号倍率，自动校正未执行：" + userErrorMessage(err)
+		a.openEvent(context.Background(), "P1", "ACCOUNT_RATE_SYNC", "账号倍率同步失败", detail, "target-rate-sync:"+target.ID)
+		return
+	}
+	actualRates := map[string]float64{}
+	for _, account := range accounts {
+		id, ok := number(account["id"])
+		if !ok {
+			continue
+		}
+		remoteID := strconv.Itoa(int(id))
+		if _, managed := items[remoteID]; !managed {
+			continue
+		}
+		if rate, ok := number(account["rate_multiplier"]); ok {
+			actualRates[remoteID] = rate
+		}
+	}
+
+	corrected, failed := 0, 0
+	for remoteID, item := range items {
+		actual, found := actualRates[remoteID]
+		if !rateMultiplierNeedsSync(actual, found, item.desired) {
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET rate_multiplier=$2 WHERE id=$1`, item.id, actual)
+			continue
+		}
+		if err = a.syncTargetAccountFields(ctx, target.BaseURL, remoteID, session, map[string]any{"rate_multiplier": item.desired}); err != nil {
+			failed++
+			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate("账号倍率校正失败: "+err.Error(), 500))
+			continue
+		}
+		corrected++
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET rate_multiplier=$2,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, item.id, item.desired)
+		a.audit(context.Background(), "RECONCILE_RATE_MULTIPLIER", "managed_account", item.id, map[string]any{"remote_id": remoteID, "remote_before": actual, "remote_value_found": found, "desired": item.desired})
+	}
+	if corrected > 0 {
+		log.Printf("已校正目标节点 %s 的托管账号倍率: %d 个", target.Name, corrected)
+	}
+	if failed > 0 {
+		detail := fmt.Sprintf("%s 有 %d 个托管账号的倍率未能按源分组同步，系统会自动重试。", target.Name, failed)
+		a.openEvent(context.Background(), "P1", "ACCOUNT_RATE_SYNC", "账号倍率同步失败", detail, "target-rate-sync:"+target.ID)
+	} else {
+		a.resolveEvent(context.Background(), "target-rate-sync:"+target.ID)
+	}
+}
+
+func rateMultiplierNeedsSync(actual float64, found bool, desired float64) bool {
+	return !found || math.Abs(actual-desired) > multiplierComparisonTolerance
+}
+
+func (a *App) syncSourceManagedAccountRateMultipliers(sourceID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	rows, err := a.db.QueryContext(ctx, `SELECT DISTINCT m.target_id FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1`, sourceID)
+	if err != nil {
+		return
+	}
+	var targetIDs []string
+	for rows.Next() {
+		var targetID string
+		if rows.Scan(&targetID) == nil {
+			targetIDs = append(targetIDs, targetID)
+		}
+	}
+	_ = rows.Close()
+	for _, targetID := range targetIDs {
+		target, _, targetErr := a.targetCredentials(ctx, targetID)
+		if targetErr != nil || !target.WriteEnabled {
+			continue
+		}
+		session, authErr := a.authenticateTarget(ctx, target, true)
+		if authErr != nil {
+			continue
+		}
+		a.syncManagedAccountRateMultipliers(ctx, target, session)
+	}
+}
+
 func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, session remoteSession) {
 	if !target.WriteEnabled {
 		return
@@ -296,7 +427,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		a.targetPlatformMu.Unlock()
 	}()
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.priority,m.concurrency,m.schedulable,
-		tg.platform,tg.remote_id,s.id,s.name,s.platform,s.base_url,k.key_cipher,k.models,COALESCE((
+		tg.platform,tg.remote_id,s.id,s.name,s.platform,s.base_url,k.key_cipher,k.models,sg.multiplier,COALESCE((
 			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
 			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
 		),'{}'::jsonb)
@@ -304,9 +435,10 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
 		JOIN target_groups tg ON tg.id=mg.target_group_id
 		JOIN channels c ON c.id=m.channel_id
+		JOIN source_groups sg ON sg.id=c.source_group_id
 		JOIN sources s ON s.id=c.source_id
 		JOIN source_keys k ON k.id=c.source_key_id
-		WHERE m.target_id=$1 AND s.manually_untrusted=false AND m.platform<>tg.platform AND m.remote_id<>''`, target.ID)
+		WHERE m.target_id=$1 AND s.manually_untrusted=false AND m.platform<>tg.platform AND m.remote_id<>'' AND sg.multiplier IS NOT NULL`, target.ID)
 	if err != nil {
 		log.Printf("读取托管账号平台失败 [%s]: %v", target.ID, err)
 		return
@@ -318,6 +450,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		source                                                  Source
 		encryptedKey                                            []byte
 		modelsJSON                                              string
+		rateMultiplier                                          float64
 		disabledModels                                          []string
 	}
 	items := []accountPlatform{}
@@ -326,7 +459,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 		var configData string
 		if err = rows.Scan(&item.id, &item.remoteID, &item.remoteName, &item.priority, &item.concurrency, &item.schedulable,
 			&item.platform, &item.targetGroupRemoteID, &item.source.ID, &item.source.Name, &item.source.Platform, &item.source.BaseURL,
-			&item.encryptedKey, &item.modelsJSON, &configData); err != nil {
+			&item.encryptedKey, &item.modelsJSON, &item.rateMultiplier, &configData); err != nil {
 			break
 		}
 		var config policyConfig
@@ -342,7 +475,7 @@ func (a *App) syncManagedAccountPlatforms(ctx context.Context, target Target, se
 	}
 	failed := 0
 	for _, item := range items {
-		if err = a.replaceManagedAccountPlatform(ctx, target, session, item.id, item.remoteID, item.remoteName, item.platform, item.targetGroupRemoteID, item.priority, item.concurrency, item.schedulable, item.source, item.encryptedKey, item.modelsJSON, item.disabledModels); err != nil {
+		if err = a.replaceManagedAccountPlatform(ctx, target, session, item.id, item.remoteID, item.remoteName, item.platform, item.targetGroupRemoteID, item.rateMultiplier, item.priority, item.concurrency, item.schedulable, item.source, item.encryptedKey, item.modelsJSON, item.disabledModels); err != nil {
 			failed++
 			_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, item.id, truncate(err.Error(), 500))
 		}
@@ -488,7 +621,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	}
 }
 
-func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string, disabledModels []string) error {
+func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, session remoteSession, managedID, oldRemoteID, remoteName, platform, targetGroupRemoteID string, rateMultiplier float64, priority, concurrency int, schedulable bool, source Source, encryptedKey []byte, modelsJSON string, disabledModels []string) error {
 	groupID, err := strconv.Atoi(targetGroupRemoteID)
 	if err != nil {
 		return fmt.Errorf("目标分组 ID 不兼容: %w", err)
@@ -505,7 +638,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 	if err != nil {
 		return fmt.Errorf("读取源站 API 地址失败: %w", err)
 	}
-	newRemoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, platform, string(key), models, disabledModels, []int{groupID}, remoteName, priority, concurrency)
+	newRemoteID, err := a.createRemoteManagedAccount(ctx, target.BaseURL, session, sourceAPIBase, platform, string(key), models, disabledModels, []int{groupID}, remoteName, rateMultiplier, priority, concurrency)
 	if err != nil {
 		return fmt.Errorf("创建正确类型账号失败: %w", err)
 	}
@@ -528,7 +661,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
 		}
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPolicy(platform, models, disabledModels)))
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,rate_multiplier=$6,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPolicy(platform, models, disabledModels)), rateMultiplier)
 	if err != nil {
 		return fmt.Errorf("保存新账号关联失败: %w", err)
 	}

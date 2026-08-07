@@ -414,6 +414,7 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 			a.resolveEvent(ctx, "source-scan:"+id)
 			a.evaluateSourceBalance(ctx, id)
 		}
+		go a.syncSourceManagedAccountRateMultipliers(id)
 	}
 	return err
 }

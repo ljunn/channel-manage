@@ -126,6 +126,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS model_mapping_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS rate_multiplier NUMERIC(14,6)`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS business_first_token_ms INT`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS business_latency_samples INT NOT NULL DEFAULT 0`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS business_latency_at TIMESTAMPTZ`,
