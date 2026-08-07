@@ -451,7 +451,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
     </aside>
     <section class="workspace">
       <header class="topbar"><button class="icon-btn mobile-menu" title="打开导航" aria-controls="mobile-navigation" :aria-expanded="mobileOpen" @click="mobileOpen=true"><Menu :size="19" /></button><div class="topbar-title"><component :is="pageIcon" :size="18"/><strong>{{ pageTitle }}</strong></div><label v-if="showSearch" class="search"><Search :size="16"/><input v-model="search" :placeholder="`筛选${pageTitle}`" :aria-label="`筛选${pageTitle}`" /></label><div class="top-actions"><button class="icon-btn" title="刷新" :disabled="loading" @click="loadPage"><RefreshCw :class="{spinning:loading}" :size="18" /></button><button class="account-button" title="修改账号与密码" @click="open('account',{email:operator?.email||''})"><span class="account-avatar">{{ (operator?.email||'管').slice(0,1).toUpperCase() }}</span><span class="account-copy"><strong>{{ operator?.email||'账号设置' }}</strong><small>管理员</small></span><ChevronRight :size="14"/></button></div></header>
-      <main>
+      <main :class="`route-${route.slice(1)}`">
         <div v-if="notice" class="message success" role="status" aria-live="polite"><Check :size="16"/>{{ notice }}</div><div v-if="error" class="message error" role="alert"><AlertTriangle :size="16"/>{{ error }}</div>
         <template v-if="route==='/overview'">
           <div class="page-head"><div><span class="eyebrow">TODAY</span><h1>运营总览</h1></div><button class="btn" @click="runAutomation"><Play :size="16"/>立即运行</button></div>

@@ -583,6 +583,8 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .overview-grid, .overview-ops-grid, .settings-layout { grid-template-columns: 1fr; }
   .policy-list { grid-template-columns: 1fr; }
   .search { width: 190px; }
+	.source-controls { flex-wrap: wrap; }
+	.source-result-count { width: 100%; margin: 0; }
 	.mapping-builder { gap: 14px; }
 	.source-quality-panel { grid-template-columns: 1fr 1fr; }
 	.source-stability-metrics { grid-column: 1/-1; grid-row: 2; }
@@ -593,7 +595,7 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .schedule-columns, .schedule-account { grid-template-columns: 82px minmax(190px,1.5fr) minmax(170px,1.1fr) 120px minmax(140px,.8fr); }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 820px) {
 	.probe-model-list { grid-template-columns: 1fr; }
 	.probe-model-list label { grid-template-columns: 1fr; gap: 6px; }
   .app-shell { display: block; }
@@ -609,8 +611,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .account-button { width: 42px; height: 42px; padding: 2px; justify-content: center; }
   .row-actions { gap: 8px; }
   .account-copy, .account-button > svg { display: none; }
-  .page-head { margin-bottom: 15px; }
+  .page-head { align-items: flex-start; flex-wrap: wrap; margin-bottom: 15px; }
   .page-head h1 { font-size: 18px; }
+  .page-head > .btn { width: 100%; }
   .metric-strip { grid-template-columns: 1fr 1fr; gap: 10px; }
   .metric-strip article { min-height: 96px; padding: 14px; }
   .metric-strip strong { font-size: 22px; }
@@ -622,7 +625,8 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 	.source-stability-metrics { grid-column: auto; grid-row: auto; grid-template-columns: 1fr 1fr; gap: 10px 0; }
 	.source-stability-metrics > div:nth-child(odd) { border-left: 0; padding-left: 0; }
 	.source-quality-panel ul { grid-column: auto; grid-row: auto; grid-template-columns: 1fr; }
-	.source-trust-toggle { width: 100%; }
+	.source-management-actions { align-items: stretch; flex-direction: column; }
+	.source-trust-toggle { width: 100%; min-width: 0; }
   .source-result-count { width: 100%; margin: 0; }
   .schedule-overview { grid-template-columns: 1fr 1fr; }
   .schedule-overview > div { min-height: 72px; padding: 11px 13px; }
@@ -665,13 +669,122 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .market-channel-list article { grid-template-columns: 30px minmax(0,1fr) auto; gap: 9px 12px; }
   .market-channel-list article > div:not(.channel-identity) { grid-column: 2; display: flex; align-items: baseline; gap: 7px; }
   .market-channel-list article > .badge { grid-column: 3; grid-row: 1; }
-  .table-wrap table { min-width: 720px; }
-  .table-wrap th:first-child, .table-wrap td:first-child { position: sticky; left: 0; }
-  .table-wrap th:first-child { z-index: 4; }
-  .table-wrap td:first-child { z-index: 1; background: var(--paper); box-shadow: 8px 0 10px -12px rgba(28,43,51,.7); }
-  .table-wrap .has-actions th:last-child, .table-wrap .has-actions td:last-child { position: sticky; right: 0; }
-  .table-wrap .has-actions th:last-child { z-index: 4; }
-  .table-wrap .has-actions td:last-child { z-index: 1; background: var(--paper); box-shadow: -8px 0 10px -12px rgba(28,43,51,.7); }
+  .table-wrap { overflow: visible; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .table-wrap table, .table-wrap tbody { width: 100%; min-width: 0; display: block; }
+  .table-wrap thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; clip-path: inset(50%); }
+  .table-wrap tbody { display: grid; gap: 12px; }
+  .table-wrap tr { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); box-shadow: var(--shadow-card); }
+  .table-wrap td { min-width: 0; min-height: 64px; display: grid; align-content: start; gap: 4px; padding: 10px 12px; border: 0; border-bottom: 1px solid var(--line-soft); font-size: 12px; overflow-wrap: anywhere; }
+  .table-wrap td:nth-child(odd) { border-right: 1px solid var(--line-soft); }
+  .table-wrap td::before { min-height: 16px; color: var(--ink-400); font-size: 10px; font-weight: 600; line-height: 1.35; }
+  .table-wrap td:first-child { grid-column: 1/-1; min-height: 68px; border-right: 0; background: var(--soft); }
+  .table-wrap td:last-child { border-bottom: 0; }
+  .table-wrap td strong, .table-wrap td small { max-width: none; overflow: visible; text-overflow: clip; white-space: normal; }
+  .table-wrap td small { font-size: 11px; overflow-wrap: anywhere; }
+  .table-wrap .has-actions td:last-child { grid-column: 1/-1; min-height: 58px; border-right: 0; background: var(--paper); }
+  .table-wrap .row-actions { align-self: end; flex-wrap: wrap; gap: 6px; }
+  .table-wrap .icon-btn { min-height: 44px; flex: 0 0 44px; }
+  .source-quality-cell, .balance-forecast, .account-rate { min-width: 0; }
+
+  .route-sources td:nth-child(1)::before { content: "数据源"; }
+  .route-sources td:nth-child(2)::before { content: "平台类型"; }
+  .route-sources td:nth-child(3)::before { content: "连接状态"; }
+  .route-sources td:nth-child(4)::before { content: "稳定性"; }
+  .route-sources td:nth-child(5)::before { content: "余额预测"; }
+  .route-sources td:nth-child(6)::before { content: "绑定覆盖"; }
+  .route-sources td:nth-child(7)::before { content: "上次扫描"; }
+  .route-sources td:nth-child(8)::before { content: "操作"; }
+  .route-sources td:nth-child(1) { order: 1; }
+  .route-sources td:nth-child(3) { order: 2; }
+  .route-sources td:nth-child(4) { order: 3; }
+  .route-sources td:nth-child(5) { order: 4; }
+  .route-sources td:nth-child(6) { order: 5; }
+  .route-sources td:nth-child(2) { order: 6; }
+  .route-sources td:nth-child(7) { order: 7; }
+  .route-sources td:nth-child(8) { order: 8; }
+  .route-sources td:first-child .link { width: 100%; }
+  .route-sources td:last-child .source-binding-button { width: 100%; min-height: 44px; flex: 0 0 100%; }
+
+  .route-channels td:nth-child(1)::before { content: "数据源 / Key"; }
+  .route-channels td:nth-child(2)::before { content: "分组"; }
+  .route-channels td:nth-child(3)::before { content: "倍率"; }
+  .route-channels td:nth-child(4)::before { content: "主动探测"; }
+  .route-channels td:nth-child(5)::before { content: "真实业务"; }
+  .route-channels td:nth-child(6)::before { content: "速度基准"; }
+  .route-channels td:nth-child(7)::before { content: "状态"; }
+  .route-channels td:nth-child(8)::before { content: "状态原因"; }
+  .route-channels td:nth-child(9)::before { content: "操作"; }
+  .route-channels td:nth-child(1) { order: 1; }
+  .route-channels td:nth-child(2) { order: 2; grid-column: 1/-1; border-right: 0; }
+  .route-channels td:nth-child(7) { order: 3; }
+  .route-channels td:nth-child(3) { order: 4; }
+  .route-channels td:nth-child(4) { order: 5; }
+  .route-channels td:nth-child(5) { order: 6; }
+  .route-channels td:nth-child(6) { order: 7; }
+  .route-channels td:nth-child(8) { order: 8; grid-column: 1/-1; border-right: 0; }
+  .route-channels td:nth-child(9) { order: 9; }
+
+  .route-managed td:nth-child(1)::before { content: "托管账号"; }
+  .route-managed td:nth-child(2)::before { content: "账号类型"; }
+  .route-managed td:nth-child(3)::before { content: "目标节点"; }
+  .route-managed td:nth-child(4)::before { content: "来源渠道"; }
+  .route-managed td:nth-child(5)::before { content: "目标分组"; }
+  .route-managed td:nth-child(6)::before { content: "倍率校验"; }
+  .route-managed td:nth-child(7)::before { content: "优先级"; }
+  .route-managed td:nth-child(8)::before { content: "并发"; }
+  .route-managed td:nth-child(9)::before { content: "调度状态"; }
+  .route-managed td:nth-child(10)::before { content: "同步状态"; }
+  .route-managed td:nth-child(1) { order: 1; }
+  .route-managed td:nth-child(10) { order: 2; }
+  .route-managed td:nth-child(9) { order: 3; }
+  .route-managed td:nth-child(4) { order: 4; }
+  .route-managed td:nth-child(3) { order: 5; }
+  .route-managed td:nth-child(5) { order: 6; grid-column: 1/-1; border-right: 0; }
+  .route-managed td:nth-child(6) { order: 7; }
+  .route-managed td:nth-child(2) { order: 8; }
+  .route-managed td:nth-child(7) { order: 9; }
+  .route-managed td:nth-child(8) { order: 10; }
+
+  .route-scheduling .table-wrap td:nth-child(1)::before { content: "托管账号"; }
+  .route-scheduling .table-wrap td:nth-child(2)::before { content: "来源 → 目标分组"; }
+  .route-scheduling .table-wrap td:nth-child(3)::before { content: "调度动作"; }
+  .route-scheduling .table-wrap td:nth-child(4)::before { content: "变更"; }
+  .route-scheduling .table-wrap td:nth-child(5)::before { content: "判定依据"; }
+  .route-scheduling .table-wrap td:nth-child(6)::before { content: "同步结果"; }
+  .route-scheduling .table-wrap td:nth-child(7)::before { content: "执行时间"; }
+  .route-scheduling .table-wrap td:nth-child(1) { order: 1; }
+  .route-scheduling .table-wrap td:nth-child(3) { order: 2; }
+  .route-scheduling .table-wrap td:nth-child(4) { order: 3; }
+  .route-scheduling .table-wrap td:nth-child(2) { order: 4; grid-column: 1/-1; border-right: 0; }
+  .route-scheduling .table-wrap td:nth-child(5) { order: 5; grid-column: 1/-1; border-right: 0; }
+  .route-scheduling .table-wrap td:nth-child(6) { order: 6; }
+  .route-scheduling .table-wrap td:nth-child(7) { order: 7; }
+
+  .route-audit .table-wrap td:nth-child(1)::before { content: "时间"; }
+  .route-audit .table-wrap td:nth-child(2)::before { content: "动作"; }
+  .route-audit .table-wrap td:nth-child(3)::before { content: "对象"; }
+  .route-audit .table-wrap td:nth-child(4)::before { content: "对象 ID"; }
+  .route-audit .table-wrap td:nth-child(5)::before { content: "详情"; }
+  .route-audit .table-wrap td:nth-child(2) { order: 1; grid-column: 1/-1; border-right: 0; background: var(--soft); }
+  .route-audit .table-wrap td:nth-child(1) { order: 2; grid-column: auto; background: var(--paper); }
+  .route-audit .table-wrap td:nth-child(3) { order: 3; }
+  .route-audit .table-wrap td:nth-child(4) { order: 4; grid-column: 1/-1; border-right: 0; }
+  .route-audit .table-wrap td:nth-child(5) { order: 5; grid-column: 1/-1; border-right: 0; }
+  .route-audit .table-wrap td:nth-child(5) code { max-height: 132px; display: block; overflow: auto; white-space: pre-wrap; }
+
+  .simulation-table td:nth-child(1)::before { content: "托管账号"; }
+  .simulation-table td:nth-child(2)::before { content: "来源"; }
+  .simulation-table td:nth-child(3)::before { content: "倍率比较"; }
+  .simulation-table td:nth-child(4)::before { content: "7 天验证"; }
+  .simulation-table td:nth-child(5)::before { content: "模拟判定"; }
+  .simulation-table td:nth-child(6)::before { content: "具体原因"; }
+  .simulation-table td:nth-child(1) { order: 1; }
+  .simulation-table td:nth-child(5) { order: 2; }
+  .simulation-table td:nth-child(2) { order: 3; }
+  .simulation-table td:nth-child(3) { order: 4; }
+  .simulation-table td:nth-child(4) { order: 5; }
+  .simulation-table td:nth-child(6) { order: 6; grid-column: 1/-1; border-right: 0; }
+  .simulation-table { max-height: none; overflow: visible; }
   .form-grid, .modal-form { grid-template-columns: 1fr; }
   .form-grid.three, .alert-policy-summary { grid-template-columns: 1fr; }
   .version-grid { grid-template-columns: 1fr; }
@@ -687,7 +800,9 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .mapping-context > div { max-width: calc(50% - 24px); }
   .mapping-cardinality { width: 100%; margin: 0; text-align: center; }
   .mapping-builder { grid-template-columns: 1fr; }
-  .source-option-list, .target-option-list { max-height: 250px; }
+  .source-option-list, .target-option-list, .mapping-preview-list { max-height: none; overflow: visible; }
+  .source-option { grid-template-columns: 20px minmax(0,1fr); }
+  .source-option-meta { grid-column: 2; max-width: none; justify-items: start; text-align: left; }
   .target-node-select select, .mapping-options input { height: 44px; }
   .mapping-preview-row { grid-template-columns: minmax(90px,130px) 20px minmax(0,1fr); }
   .mapping-submit { align-items: stretch; flex-direction: column; }
@@ -706,6 +821,16 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .event > .row-actions { grid-column: 2; }
   .policy dl { grid-template-columns: 1fr 1fr; gap: 14px; }
   .policy dl div:nth-child(2) { border-right: 0; }
+  .policy dl div:last-child { grid-column: 1/-1; padding-left: 0; }
+  .policy header, .target-tile header { align-items: flex-start; flex-wrap: wrap; }
+  .policy header > .badge, .target-tile header > .badge { margin-left: 0; }
+  .policy footer { justify-content: flex-start; }
+  .toggle-row > div { min-width: 0; }
+  .toggle-row > span { flex: 0 0 40px; }
+  .settings-section > header { align-items: flex-start; flex-wrap: wrap; }
+  .settings-section > header > div { min-width: 0; flex: 1; }
+  .route-settings { padding-bottom: 82px!important; }
+  .route-settings .page-head > .btn { position: fixed; right: 16px; bottom: calc(12px + env(safe-area-inset-bottom)); left: 16px; z-index: 20; width: auto; height: 48px; box-shadow: var(--shadow-pop); }
   .email-scene-grid { grid-template-columns: 1fr; }
   .email-scene-grid .toggle-row:nth-last-child(2) { border-bottom: 1px solid var(--line-soft); }
   .notification-list > div { grid-template-columns: minmax(0,1fr) auto; }
