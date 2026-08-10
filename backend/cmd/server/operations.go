@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -213,6 +214,97 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	// Only a whole target group losing all eligible accounts creates an alert.
 	a.resolveEvent(ctx, "channel-probe:"+id)
 	return requestErr
+}
+
+func quickValidationProbeLimit(state, reason string) int {
+	if isSlowFirstTokenQuarantine(state, reason) {
+		return recoverySuccessSamples
+	}
+	return 1
+}
+
+func (a *App) startQuickChannelValidation(ctx context.Context, id string) error {
+	var state, reason string
+	err := a.db.QueryRowContext(ctx, `SELECT lifecycle_state,state_reason FROM channels WHERE id=$1`, id).Scan(&state, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
+	}
+	if err != nil {
+		return err
+	}
+	if state == "MANUAL_HOLD" {
+		return &apiError{409, "CHANNEL_ON_HOLD", "人工暂停的渠道请先恢复，再执行快速验证"}
+	}
+
+	a.quickValidationMu.Lock()
+	if a.quickValidations == nil {
+		a.quickValidations = map[string]struct{}{}
+	}
+	if _, running := a.quickValidations[id]; running {
+		a.quickValidationMu.Unlock()
+		return &apiError{409, "QUICK_VALIDATION_RUNNING", "该渠道正在快速验证，请等待本轮完成"}
+	}
+	a.quickValidations[id] = struct{}{}
+	a.quickValidationMu.Unlock()
+
+	probeLimit := quickValidationProbeLimit(state, reason)
+	a.audit(ctx, "QUICK_VALIDATION_START", "channel", id, map[string]any{"probe_limit": probeLimit})
+	go a.runQuickChannelValidation(id, probeLimit)
+	return nil
+}
+
+func (a *App) runQuickChannelValidation(id string, probeLimit int) {
+	defer func() {
+		a.quickValidationMu.Lock()
+		delete(a.quickValidations, id)
+		a.quickValidationMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	attempts := 0
+	var probeErr error
+	for attempts < probeLimit {
+		attempts++
+		probeErr = a.probeChannel(ctx, id)
+		if probeErr != nil {
+			break
+		}
+		var state, reason string
+		if err := a.db.QueryRowContext(ctx, `SELECT lifecycle_state,state_reason FROM channels WHERE id=$1`, id).Scan(&state, &reason); err != nil {
+			probeErr = err
+			break
+		}
+		if state == "HEALTHY" || !isSlowFirstTokenQuarantine(state, reason) {
+			break
+		}
+		if attempts < probeLimit {
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				probeErr = ctx.Err()
+				attempts = probeLimit
+			case <-timer.C:
+			}
+		}
+	}
+
+	if probeErr == nil {
+		if err := a.evaluateManagedAccounts(ctx); err != nil {
+			probeErr = err
+		}
+	}
+	result := map[string]any{"attempts": attempts, "success": probeErr == nil}
+	if probeErr != nil {
+		result["error"] = truncate(userErrorMessage(probeErr), 500)
+	}
+	var finalState, finalReason string
+	if err := a.db.QueryRowContext(context.Background(), `SELECT lifecycle_state,state_reason FROM channels WHERE id=$1`, id).Scan(&finalState, &finalReason); err == nil {
+		result["state"] = finalState
+		result["reason"] = finalReason
+	}
+	a.audit(context.Background(), "QUICK_VALIDATION_FINISH", "channel", id, result)
 }
 
 func (a *App) managedChannelNeedsActiveProbe(ctx context.Context, channelID string) (bool, error) {
@@ -571,6 +663,12 @@ func (a *App) updateChannelState(w http.ResponseWriter, r *http.Request, id, act
 	switch action {
 	case "probe":
 		go a.probeChannel(context.Background(), id)
+		writeData(w, map[string]any{"id": id, "status": "ACCEPTED"})
+		return nil
+	case "quick-validate":
+		if err := a.startQuickChannelValidation(r.Context(), id); err != nil {
+			return err
+		}
 		writeData(w, map[string]any{"id": id, "status": "ACCEPTED"})
 		return nil
 	case "manual-hold":

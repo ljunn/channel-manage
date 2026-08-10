@@ -860,6 +860,15 @@ func TestRankManagedAccountsBySpeedPutsUnknownBusinessLatencyLast(t *testing.T) 
 	}
 }
 
+func TestQuickValidationUsesConsecutiveRecoverySamplesForSlowQuarantine(t *testing.T) {
+	if got := quickValidationProbeLimit("QUARANTINED", slowFirstTokenReason(maxFirstTokenMs+1)); got != recoverySuccessSamples {
+		t.Fatalf("slow quarantine probe limit=%d, want %d", got, recoverySuccessSamples)
+	}
+	if got := quickValidationProbeLimit("SUSPECT", "上游暂时失败"); got != 1 {
+		t.Fatalf("ordinary validation probe limit=%d, want 1", got)
+	}
+}
+
 func TestSlowFirstTokenQuarantineUsesSampledRecovery(t *testing.T) {
 	candidate := eligiblePolicyCandidate("slow", .2, maxFirstTokenMs+1)
 	candidate.State = "QUARANTINED"
