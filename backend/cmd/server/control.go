@@ -186,14 +186,25 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
+	plans := map[string]managedPolicyPlan{}
+	for scopeID, policy := range policies {
+		plans[scopeID] = planManagedAccounts(candidatesForTargetGroup(candidates, scopeID), policy.Config)
+	}
 	items := make([]map[string]any, 0, len(candidates))
 	for _, candidate := range candidates {
 		policy, configured := policies[candidate.TargetGroupID]
 		reasons := []string{"目标分组未配置启用策略"}
 		eligible := false
+		fallback := false
+		plannedPriority := 0
 		if configured {
 			reasons = policyRejectionReasons(candidate, policy.Config)
-			eligible = len(reasons) == 0
+			plan := plans[candidate.TargetGroupID]
+			plannedPriority, eligible = plan.Priorities[candidate.ID]
+			fallback = plan.Fallback[candidate.ID]
+			if fallback {
+				reasons = append(reasons, fmt.Sprintf("常规可用渠道仅 %d/%d，当前作为低优先级兜底", plan.NormalCount, policy.Config.MinAvailableChannels))
+			}
 		}
 		fastValidation := configured && !eligible && candidateCanRecoverWithProbe(candidate, policy.Config)
 		fastInterval := fastProbeIntervalFor(candidate)
@@ -217,11 +228,11 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName,
 			"sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup,
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
-			"schedulable": candidate.Schedulable, "eligible": eligible, "priority": candidate.Priority, "syncStatus": candidate.SyncStatus,
+			"schedulable": candidate.Schedulable, "eligible": eligible, "fallback": fallback, "priority": candidate.Priority, "plannedPriority": plannedPriority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
-			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "recentSuccesses": displayedSuccesses,
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "maxFirstTokenMs": policy.Config.MaxFirstTokenMs, "recentSuccesses": displayedSuccesses,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
-			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate,
+			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate, "minAvailableChannels": policy.Config.MinAvailableChannels,
 			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,
 			"reasons": reasons,
 		})
@@ -282,16 +293,25 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if json.Unmarshal([]byte(after), &state) != nil {
 		return a.failAction(ctx, id, "动作状态不可读")
 	}
-	path := "/api/v1/admin/accounts/" + remoteID
-	method := http.MethodPut
-	payload := state
-	if action == "SET_SCHEDULABLE" {
-		path += "/schedulable"
-		method = http.MethodPost
-	}
-	value, _, err := a.remoteJSON(requestCtx, targetBase, method, path, session, payload)
-	if err == nil {
-		_, err = unwrapEnvelope(value, "SUB2API")
+	if action == "APPLY_SCHEDULING_PLAN" {
+		priority, ok := number(state["priority"])
+		if !ok {
+			return a.failAction(ctx, id, "调度计划缺少有效优先级")
+		}
+		err = a.syncTargetSchedulingPlan(requestCtx, targetBase, remoteID, session, int(priority))
+	} else {
+		path := "/api/v1/admin/accounts/" + remoteID
+		method := http.MethodPut
+		payload := state
+		if action == "SET_SCHEDULABLE" {
+			path += "/schedulable"
+			method = http.MethodPost
+		}
+		var value any
+		value, _, err = a.remoteJSON(requestCtx, targetBase, method, path, session, payload)
+		if err == nil {
+			_, err = unwrapEnvelope(value, "SUB2API")
+		}
 	}
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
@@ -318,10 +338,16 @@ type policyConfig struct {
 	Mode                 string   `json:"mode"`
 	MinSuccessRate       float64  `json:"minSuccessRate"`
 	MinSamples           int      `json:"minSamples"`
+	MaxFirstTokenMs      int      `json:"maxFirstTokenMs"`
+	MinAvailableChannels int      `json:"minAvailableChannels"`
+	PriorityStart        int      `json:"priorityStart"`
+	PriorityStep         int      `json:"priorityStep"`
 	AllowEqualMultiplier bool     `json:"allowEqualMultiplier"`
 	ProbeModel           string   `json:"probeModel"`
 	DisabledModels       []string `json:"disabledModels"`
 }
+
+const defaultPolicyMaxFirstTokenMs = 10_000
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.Mode != "SPEED" {
@@ -333,12 +359,36 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.MinSamples < 1 {
 		config.MinSamples = 5
 	}
+	if config.MaxFirstTokenMs <= 0 {
+		config.MaxFirstTokenMs = defaultPolicyMaxFirstTokenMs
+	}
+	if config.MinAvailableChannels < 1 {
+		config.MinAvailableChannels = 5
+	}
+	if config.PriorityStart < 1 {
+		config.PriorityStart = 1000
+	}
+	if config.PriorityStep < 1000 {
+		config.PriorityStep = 1000
+	}
 	config.ProbeModel = strings.TrimSpace(config.ProbeModel)
 	config.DisabledModels = normalizeModelNames(config.DisabledModels)
 	return config
 }
 
 func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, config policyConfig) (policyConfig, error) {
+	if config.MaxFirstTokenMs < 1_000 || config.MaxFirstTokenMs > maxFirstTokenMs {
+		return config, &apiError{400, "INVALID_FIRST_TOKEN_LIMIT", "首 Token 上限需要设置为 1 至 60 秒"}
+	}
+	if config.MinAvailableChannels < 1 || config.MinAvailableChannels > 100 {
+		return config, &apiError{400, "INVALID_MIN_AVAILABLE_CHANNELS", "最低可用渠道数需要设置为 1 至 100"}
+	}
+	if config.PriorityStart < 1 || config.PriorityStart > 1_000_000 {
+		return config, &apiError{400, "INVALID_PRIORITY_START", "优先级起点需要设置为 1 至 1000000"}
+	}
+	if config.PriorityStep < 1000 || config.PriorityStep > 1_000_000 {
+		return config, &apiError{400, "INVALID_PRIORITY_STEP", "优先级间隔需要设置为 1000 至 1000000"}
+	}
 	var platform, defaultModel string
 	if err := a.db.QueryRowContext(ctx, `SELECT platform,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &defaultModel); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -637,9 +687,20 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		return err
 	}
 	preview := []map[string]any{}
-	for _, candidate := range candidatesForTargetGroup(candidates, scopeID) {
+	groupCandidates := candidatesForTargetGroup(candidates, scopeID)
+	plan := planManagedAccounts(groupCandidates, config)
+	for _, candidate := range groupCandidates {
 		reasons := policyRejectionReasons(candidate, config)
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "decision": map[bool]string{true: "REJECTED", false: "ELIGIBLE"}[len(reasons) > 0], "reasons": reasons})
+		priority, selected := plan.Priorities[candidate.ID]
+		fallback := plan.Fallback[candidate.ID]
+		decision := "REJECTED"
+		if fallback {
+			decision = "FALLBACK"
+			reasons = append(reasons, fmt.Sprintf("常规可用渠道仅 %d/%d，按优先级 %d 兜底", plan.NormalCount, config.MinAvailableChannels, priority))
+		} else if selected {
+			decision = "ELIGIBLE"
+		}
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "plannedPriority": priority, "decision": decision, "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

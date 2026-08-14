@@ -753,6 +753,40 @@ func TestSyncTargetAccountSchedulableUsesDedicatedEndpoint(t *testing.T) {
 	}
 }
 
+func TestSyncTargetSchedulingPlanStopsThenLowersPriorityThenRestores(t *testing.T) {
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/42/schedulable":
+			var payload map[string]bool
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			requests = append(requests, fmt.Sprintf("schedulable:%t", payload["schedulable"]))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/admin/accounts/42":
+			var payload map[string]int
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			requests = append(requests, fmt.Sprintf("priority:%d", payload["priority"]))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	if err := app.syncTargetSchedulingPlan(context.Background(), server.URL, "42", remoteSession{}, 7000); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"schedulable:false", "priority:7000", "schedulable:true"}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("scheduling transition=%#v, want %#v", requests, want)
+	}
+}
+
 func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5})
 	eligible := managedPolicyCandidate{
@@ -787,6 +821,19 @@ func TestPolicyRecoveryAcceptsThreeRecentSuccesses(t *testing.T) {
 	recovering.RecentSuccesses--
 	if reasons := policyRejectionReasons(recovering, config); len(reasons) != 1 || !strings.Contains(reasons[0], "最近探测成功") {
 		t.Fatalf("insufficient recovery successes should remain rejected: %#v", reasons)
+	}
+}
+
+func TestPolicyRejectsFirstTokenAboveStrategyLimit(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000})
+	candidate := eligiblePolicyCandidate("slow", .2, 10_001)
+	reasons := policyRejectionReasons(candidate, config)
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "首 Token 10.00 秒超过策略上限 10.00 秒") {
+		t.Fatalf("slow first-token candidate should be rejected by policy: %#v", reasons)
+	}
+	candidate.FirstTokenP95.Float64 = 9_999
+	if reasons := policyRejectionReasons(candidate, config); len(reasons) != 0 {
+		t.Fatalf("candidate below first-token limit should remain eligible: %#v", reasons)
 	}
 }
 
@@ -833,7 +880,7 @@ func TestRankManagedAccountsByPriceFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 120),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["cheap"] != 1000 || priorities["middle"] != 1100 || priorities["expensive"] != 1200 {
+	if priorities["cheap"] != 1000 || priorities["middle"] != 2000 || priorities["expensive"] != 3000 {
 		t.Fatalf("unexpected price ranking: %#v", priorities)
 	}
 }
@@ -845,8 +892,83 @@ func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 240),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["fast"] != 1000 || priorities["middle"] != 1100 || priorities["slow"] != 1200 {
+	if priorities["fast"] != 1000 || priorities["middle"] != 2000 || priorities["slow"] != 3000 {
 		t.Fatalf("unexpected speed ranking: %#v", priorities)
+	}
+}
+
+func TestRankManagedAccountsExcludesFirstTokenAboveStrategyLimit(t *testing.T) {
+	items := []managedPolicyCandidate{
+		eligiblePolicyCandidate("fast-1", .2, 1_000),
+		eligiblePolicyCandidate("fast-2", .2, 2_000),
+		eligiblePolicyCandidate("fast-3", .2, 3_000),
+		eligiblePolicyCandidate("fast-4", .2, 4_000),
+		eligiblePolicyCandidate("fast-5", .2, 5_000),
+	}
+	for index := range items {
+		items[index].Schedulable = true
+	}
+	slow := eligiblePolicyCandidate("slow", .1, 12_000)
+	items = append(items, slow)
+	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000, MinAvailableChannels: 5})
+	if priorities["fast-1"] != 1000 || priorities["fast-5"] != 5000 {
+		t.Fatalf("unexpected normal priorities: %#v", priorities)
+	}
+	if _, exists := priorities["slow"]; exists {
+		t.Fatalf("slow candidate must not receive a scheduling priority: %#v", priorities)
+	}
+}
+
+func TestPlanManagedAccountsAddsOnlyEnoughFastestSlowFallbacks(t *testing.T) {
+	items := []managedPolicyCandidate{
+		eligiblePolicyCandidate("normal-1", .2, 1_000),
+		eligiblePolicyCandidate("normal-2", .2, 2_000),
+		eligiblePolicyCandidate("normal-3", .2, 3_000),
+		eligiblePolicyCandidate("slowest", .2, 30_000),
+		eligiblePolicyCandidate("fallback-2", .2, 12_000),
+		eligiblePolicyCandidate("fallback-1", .2, 11_000),
+	}
+	for index := 0; index < 3; index++ {
+		items[index].Schedulable = true
+	}
+	plan := planManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000, MinAvailableChannels: 5, PriorityStart: 1000, PriorityStep: 1000})
+	if plan.NormalCount != 3 {
+		t.Fatalf("normal count=%d, want 3", plan.NormalCount)
+	}
+	if plan.Priorities["fallback-1"] != 4000 || plan.Priorities["fallback-2"] != 5000 {
+		t.Fatalf("unexpected fallback priorities: %#v", plan.Priorities)
+	}
+	if !plan.Fallback["fallback-1"] || !plan.Fallback["fallback-2"] {
+		t.Fatalf("selected slow channels were not marked as fallback: %#v", plan.Fallback)
+	}
+	if _, exists := plan.Priorities["slowest"]; exists {
+		t.Fatalf("fallback should only fill the group to five channels: %#v", plan.Priorities)
+	}
+}
+
+func TestPlanManagedAccountsKeepsFallbackUntilFiveNormalChannelsAreActuallyScheduled(t *testing.T) {
+	items := []managedPolicyCandidate{
+		eligiblePolicyCandidate("normal-1", .2, 1_000),
+		eligiblePolicyCandidate("normal-2", .2, 2_000),
+		eligiblePolicyCandidate("normal-3", .2, 3_000),
+		eligiblePolicyCandidate("normal-pending-1", .2, 4_000),
+		eligiblePolicyCandidate("normal-pending-2", .2, 5_000),
+		eligiblePolicyCandidate("fallback-1", .2, 11_000),
+		eligiblePolicyCandidate("fallback-2", .2, 12_000),
+	}
+	for index := 0; index < 3; index++ {
+		items[index].Schedulable = true
+	}
+	config := policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000, MinAvailableChannels: 5, PriorityStart: 1000, PriorityStep: 1000}
+	plan := planManagedAccounts(items, config)
+	if plan.NormalCount != 3 || !plan.Fallback["fallback-1"] || !plan.Fallback["fallback-2"] {
+		t.Fatalf("fallback was removed before five normal channels were scheduled: %#v", plan)
+	}
+	items[3].Schedulable = true
+	items[4].Schedulable = true
+	plan = planManagedAccounts(items, config)
+	if plan.NormalCount != 5 || len(plan.Fallback) != 0 {
+		t.Fatalf("fallback remained after five normal channels were scheduled: %#v", plan)
 	}
 }
 
@@ -855,7 +977,7 @@ func TestRankManagedAccountsBySpeedPutsUnknownBusinessLatencyLast(t *testing.T) 
 	unknown := eligiblePolicyCandidate("unknown", .2, 100)
 	unknown.FirstTokenP95 = sql.NullFloat64{}
 	priorities := rankManagedAccounts([]managedPolicyCandidate{unknown, known}, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["known"] != 1000 || priorities["unknown"] != 1100 {
+	if priorities["known"] != 1000 || priorities["unknown"] != 2000 {
 		t.Fatalf("unknown real-business latency was not ranked last: %#v", priorities)
 	}
 }

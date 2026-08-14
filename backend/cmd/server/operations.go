@@ -438,6 +438,16 @@ func (a *App) syncTargetAccountPriority(ctx context.Context, targetBase, remoteI
 	return a.syncTargetAccountNumbers(ctx, targetBase, remoteID, session, map[string]int{"priority": priority})
 }
 
+func (a *App) syncTargetSchedulingPlan(ctx context.Context, targetBase, remoteID string, session remoteSession, priority int) error {
+	if err := a.syncTargetAccountSchedulable(ctx, targetBase, remoteID, session, false); err != nil {
+		return err
+	}
+	if err := a.syncTargetAccountPriority(ctx, targetBase, remoteID, session, priority); err != nil {
+		return err
+	}
+	return a.syncTargetAccountSchedulable(ctx, targetBase, remoteID, session, true)
+}
+
 func (a *App) updateManagedAccountConcurrency(w http.ResponseWriter, r *http.Request, id string) error {
 	var input struct {
 		Concurrency int `json:"concurrency"`

@@ -18,8 +18,6 @@ const (
 	fastProbeIntervalSeconds = 15
 	recoverySuccessSamples   = 3
 	maxConcurrentProbes      = 6
-	managedPriorityStart     = 1000
-	managedPriorityStep      = 100
 	maxFirstTokenMs          = 60_000
 	businessLatencyFreshness = 15 * time.Minute
 )
@@ -318,7 +316,8 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 	}
 	for _, policy := range policies {
 		groupItems := candidatesForTargetGroup(items, policy.ScopeID)
-		desiredPriority := rankManagedAccounts(groupItems, policy.Config)
+		plan := planManagedAccounts(groupItems, policy.Config)
+		desiredPriority := plan.Priorities
 		if len(groupItems) > 0 && len(desiredPriority) == 0 && groupNeedsAvailabilityAlert(groupItems, policy.Config) {
 			detail := fmt.Sprintf("%s / %s 当前没有任何符合策略的托管账号。系统仍在快速复检可恢复渠道，请检查源站余额、渠道状态和倍率。", groupItems[0].TargetName, groupItems[0].TargetGroup)
 			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
@@ -327,18 +326,28 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		}
 		for _, item := range groupItems {
 			reasons := policyRejectionReasons(item, policy.Config)
-			desired := len(reasons) == 0
+			priority, desired := desiredPriority[item.ID]
+			fallback := plan.Fallback[item.ID]
+			if desired && priority != item.Priority {
+				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
+				if fallback || !item.Schedulable {
+					if fallback {
+						reason = fmt.Sprintf("常规可用渠道仅 %d/%d，慢渠道作为低优先级兜底：先停用、调整为优先级 %d，再恢复调度", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
+					}
+					a.enqueueManagedAction(ctx, item.ID, "APPLY_SCHEDULING_PLAN", map[string]any{"schedulable": item.Schedulable, "priority": item.Priority}, map[string]any{"schedulable": true, "priority": priority}, reason)
+				} else {
+					a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
+				}
+				continue
+			}
 			if desired != item.Schedulable {
 				reason := "渠道与目标分组倍率均符合策略，自动恢复参与调度"
 				if !desired {
 					reason = strings.Join(reasons, "；")
+				} else if fallback {
+					reason = fmt.Sprintf("常规可用渠道仅 %d/%d，慢渠道以优先级 %d 作为兜底恢复调度", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
 				}
 				a.enqueueManagedAction(ctx, item.ID, "SET_SCHEDULABLE", map[string]bool{"schedulable": item.Schedulable}, map[string]bool{"schedulable": desired}, reason)
-			}
-			priority, ranked := desiredPriority[item.ID]
-			if ranked && priority != item.Priority {
-				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
-				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
 			}
 		}
 	}
@@ -446,14 +455,53 @@ func candidatesForTargetGroup(items []managedPolicyCandidate, targetGroupID stri
 	return result
 }
 
-func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) map[string]int {
-	eligible := []managedPolicyCandidate{}
+type managedPolicyPlan struct {
+	Priorities  map[string]int
+	Fallback    map[string]bool
+	NormalCount int
+}
+
+func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) managedPolicyPlan {
+	normal := []managedPolicyCandidate{}
+	slowFallback := []managedPolicyCandidate{}
+	availableNormalCount := 0
 	config = normalizePolicyConfig(config)
 	for _, item := range items {
 		if len(policyRejectionReasons(item, config)) == 0 {
-			eligible = append(eligible, item)
+			normal = append(normal, item)
+			if item.Schedulable {
+				availableNormalCount++
+			}
+		} else if policySlowFallbackCandidate(item, config) {
+			slowFallback = append(slowFallback, item)
 		}
 	}
+	sortPolicyCandidates(normal, config)
+	sort.SliceStable(slowFallback, func(i, j int) bool {
+		if slowFallback[i].FirstTokenP95.Float64 != slowFallback[j].FirstTokenP95.Float64 {
+			return slowFallback[i].FirstTokenP95.Float64 < slowFallback[j].FirstTokenP95.Float64
+		}
+		return slowFallback[i].ID < slowFallback[j].ID
+	})
+	selected := append([]managedPolicyCandidate{}, normal...)
+	fallback := map[string]bool{}
+	needed := max(0, config.MinAvailableChannels-availableNormalCount)
+	for index := 0; index < min(needed, len(slowFallback)); index++ {
+		selected = append(selected, slowFallback[index])
+		fallback[slowFallback[index].ID] = true
+	}
+	priorities := map[string]int{}
+	for index, item := range selected {
+		priorities[item.ID] = config.PriorityStart + index*config.PriorityStep
+	}
+	return managedPolicyPlan{Priorities: priorities, Fallback: fallback, NormalCount: availableNormalCount}
+}
+
+func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) map[string]int {
+	return planManagedAccounts(items, config).Priorities
+}
+
+func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig) {
 	sort.SliceStable(eligible, func(i, j int) bool {
 		if config.Mode == "SPEED" {
 			if eligible[i].FirstTokenP95.Valid != eligible[j].FirstTokenP95.Valid {
@@ -467,11 +515,16 @@ func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 		}
 		return eligible[i].ID < eligible[j].ID
 	})
-	result := map[string]int{}
-	for index, item := range eligible {
-		result[item.ID] = managedPriorityStart + index*managedPriorityStep
+}
+
+func policySlowFallbackCandidate(item managedPolicyCandidate, config policyConfig) bool {
+	config = normalizePolicyConfig(config)
+	if !item.FirstTokenP95.Valid || item.FirstTokenP95.Float64 <= float64(config.MaxFirstTokenMs) {
+		return false
 	}
-	return result
+	withoutLatency := item
+	withoutLatency.FirstTokenP95 = sql.NullFloat64{}
+	return len(policyRejectionReasons(withoutLatency, config)) == 0
 }
 
 func policyModeText(mode string) string {
@@ -496,6 +549,9 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	}
 	if !policyHasAllowedModels(item, config) {
 		reasons = append(reasons, "源渠道在应用分组禁用清单后没有可用模型")
+	}
+	if item.FirstTokenP95.Valid && item.FirstTokenP95.Float64 > float64(config.MaxFirstTokenMs) {
+		reasons = append(reasons, fmt.Sprintf("首 Token %.2f 秒超过策略上限 %.2f 秒", item.FirstTokenP95.Float64/1000, float64(config.MaxFirstTokenMs)/1000))
 	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
 		reasons = append(reasons, "源分组或目标分组倍率缺失")
