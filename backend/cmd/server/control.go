@@ -199,6 +199,9 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 		plannedPriority := 0
 		if configured {
 			reasons = policyRejectionReasons(candidate, policy.Config)
+			if observation := policyLatencyObservationReason(candidate, policy.Config); observation != "" {
+				reasons = append(reasons, observation)
+			}
 			plan := plans[candidate.TargetGroupID]
 			plannedPriority, eligible = plan.Priorities[candidate.ID]
 			fallback = plan.Fallback[candidate.ID]
@@ -218,6 +221,9 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			if !candidate.Schedulable || candidate.State != "HEALTHY" || !policySuccessQualified(candidate, policy.Config) {
 				remainingProbes = max(remainingProbes, max(0, recoverySuccessSamples-recentSuccesses))
 			}
+			if candidate.LatencyState == latencyStateSlow {
+				remainingProbes = max(remainingProbes, max(0, latencyGoodSnapshots-candidate.LatencyGoodSnapshots))
+			}
 			estimatedValidationSeconds = remainingProbes * fastInterval
 		}
 		displayedSuccesses := candidate.RecentSuccesses
@@ -228,9 +234,10 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName,
 			"sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup,
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
-			"schedulable": candidate.Schedulable, "eligible": eligible, "fallback": fallback, "priority": candidate.Priority, "plannedPriority": plannedPriority, "syncStatus": candidate.SyncStatus,
+			"schedulable": candidate.Schedulable, "eligible": eligible, "fallback": fallback, "fallbackActive": candidate.FallbackActive, "priority": candidate.Priority, "plannedPriority": plannedPriority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
-			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "maxFirstTokenMs": policy.Config.MaxFirstTokenMs, "recentSuccesses": displayedSuccesses,
+			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP50), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "maxFirstTokenMs": policy.Config.MaxFirstTokenMs, "recentSuccesses": displayedSuccesses,
+			"latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, policy.Config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
 			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate, "minAvailableChannels": policy.Config.MinAvailableChannels,
 			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,
@@ -274,18 +281,18 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if frozen || shadow {
 		return a.failAction(ctx, id, "安全冻结或影子模式禁止执行写动作")
 	}
-	var managedID, action, after, targetID, targetBase, remoteID, marker string
+	var managedID, action, before, after, idempotencyKey, targetID, targetBase, remoteID, remoteName, marker string
 	var writeEnabled bool
-	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.after_state,t.id,t.base_url,t.write_enabled,m.remote_id,m.ownership_marker FROM action_intents i JOIN managed_accounts m ON m.id=i.managed_account_id JOIN targets t ON t.id=m.target_id WHERE i.id=$1 AND i.status='APPROVED'`, id).Scan(&managedID, &action, &after, &targetID, &targetBase, &writeEnabled, &remoteID, &marker)
+	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.before_state,i.after_state,i.idempotency_key,t.id,t.base_url,t.write_enabled,m.remote_id,m.remote_name,m.ownership_marker FROM action_intents i JOIN managed_accounts m ON m.id=i.managed_account_id JOIN targets t ON t.id=m.target_id WHERE i.id=$1 AND i.status='APPROVED'`, id).Scan(&managedID, &action, &before, &after, &idempotencyKey, &targetID, &targetBase, &writeEnabled, &remoteID, &remoteName, &marker)
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
 	}
 	if !writeEnabled || !strings.HasPrefix(marker, "channel-manage:") {
 		return a.failAction(ctx, id, "目标写入未授权或托管所有权无效")
 	}
-	requestCtx, cancel := timeoutContext(ctx)
-	defer cancel()
-	session, err := a.authenticateTarget(requestCtx, Target{ID: targetID, BaseURL: targetBase}, true)
+	authCtx, authCancel := timeoutContext(ctx)
+	session, err := a.authenticateTarget(authCtx, Target{ID: targetID, BaseURL: targetBase}, true)
+	authCancel()
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
 	}
@@ -293,12 +300,26 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if json.Unmarshal([]byte(after), &state) != nil {
 		return a.failAction(ctx, id, "动作状态不可读")
 	}
+	var previous map[string]any
+	_ = json.Unmarshal([]byte(before), &previous)
+	if action == "ROTATE_FALLBACK" {
+		err = a.executeFallbackRotation(ctx, id, managedID, targetID, targetBase, remoteID, remoteName, idempotencyKey, session, previous, state)
+		if err != nil {
+			return a.failAction(ctx, id, err.Error())
+		}
+		return nil
+	}
+	requestCtx, cancel := timeoutContext(ctx)
+	defer cancel()
 	if action == "APPLY_SCHEDULING_PLAN" {
 		priority, ok := number(state["priority"])
 		if !ok {
 			return a.failAction(ctx, id, "调度计划缺少有效优先级")
 		}
-		err = a.syncTargetSchedulingPlan(requestCtx, targetBase, remoteID, session, int(priority))
+		err = a.syncTargetAccountPriority(requestCtx, targetBase, remoteID, session, int(priority))
+		if err == nil {
+			err = a.syncTargetAccountSchedulable(requestCtx, targetBase, remoteID, session, true)
+		}
 	} else {
 		path := "/api/v1/admin/accounts/" + remoteID
 		method := http.MethodPut
@@ -319,13 +340,81 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	_, err = a.db.ExecContext(ctx, `UPDATE action_intents SET status='EXECUTED',executed_at=now(),error='' WHERE id=$1`, id)
 	if err == nil {
 		if schedulable, ok := state["schedulable"].(bool); ok {
-			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET schedulable=$2,updated_at=now() WHERE id=$1`, managedID, schedulable)
+			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET schedulable=$2,fallback_active=CASE WHEN $2 THEN fallback_active ELSE false END,updated_at=now() WHERE id=$1`, managedID, schedulable)
 		}
 		if priority, ok := number(state["priority"]); ok {
-			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,updated_at=now() WHERE id=$1`, managedID, int(priority))
+			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1`, managedID, int(priority))
 		}
 	}
 	return err
+}
+
+func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, targetID, targetBase, oldRemoteID, oldRemoteName, idempotencyKey string, session remoteSession, previous, state map[string]any) (resultErr error) {
+	priority, ok := number(state["priority"])
+	if !ok {
+		return fmt.Errorf("慢速兜底动作缺少有效优先级")
+	}
+	wasSchedulable, _ := previous["schedulable"].(bool)
+	rotationCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	newRemoteID, newRemoteName, err := a.duplicateTargetAccount(rotationCtx, targetBase, oldRemoteID, session, idempotencyKey)
+	if err != nil {
+		return err
+	}
+	if newRemoteName == "" {
+		newRemoteName = oldRemoteName
+	}
+	oldDisabled := false
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = a.syncTargetAccountSchedulable(cleanupCtx, targetBase, newRemoteID, session, false)
+		if oldDisabled && wasSchedulable {
+			_ = a.syncTargetAccountSchedulable(cleanupCtx, targetBase, oldRemoteID, session, true)
+		}
+	}()
+	if err = a.syncTargetAccountPriority(rotationCtx, targetBase, newRemoteID, session, int(priority)); err != nil {
+		return err
+	}
+	if err = a.syncTargetAccountSchedulable(rotationCtx, targetBase, newRemoteID, session, false); err != nil {
+		return err
+	}
+	if err = a.syncTargetAccountSchedulable(rotationCtx, targetBase, oldRemoteID, session, false); err != nil {
+		return err
+	}
+	oldDisabled = true
+	if err = a.syncTargetAccountSchedulable(rotationCtx, targetBase, newRemoteID, session, true); err != nil {
+		return err
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_remote_history(managed_account_id,target_id,remote_id,remote_name,reason) VALUES($1,$2,$3,$4,'慢速兜底替换') ON CONFLICT(target_id,remote_id) DO NOTHING`, managedID, targetID, oldRemoteID, oldRemoteName); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,remote_name=$3,priority=$4,schedulable=true,fallback_active=true,priority_synced_at=now(),sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$5`, managedID, newRemoteID, newRemoteName, int(priority), oldRemoteID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return fmt.Errorf("托管账号在替换过程中已发生变化")
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE action_intents SET status='EXECUTED',executed_at=now(),error='' WHERE id=$1 AND status='APPROVED'`, actionID); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	a.audit(ctx, "ROTATE_FALLBACK", "managed_account", managedID, map[string]any{"old_remote_id": oldRemoteID, "new_remote_id": newRemoteID, "priority": int(priority)})
+	return nil
 }
 
 func (a *App) failAction(ctx context.Context, id, message string) error {
@@ -691,6 +780,9 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	plan := planManagedAccounts(groupCandidates, config)
 	for _, candidate := range groupCandidates {
 		reasons := policyRejectionReasons(candidate, config)
+		if observation := policyLatencyObservationReason(candidate, config); observation != "" {
+			reasons = append(reasons, observation)
+		}
 		priority, selected := plan.Priorities[candidate.ID]
 		fallback := plan.Fallback[candidate.ID]
 		decision := "REJECTED"
@@ -700,7 +792,7 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		} else if selected {
 			decision = "ELIGIBLE"
 		}
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP95), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP95), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricSamples": candidate.SpeedMetricSamples, "plannedPriority": priority, "decision": decision, "reasons": reasons})
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples, "plannedPriority": priority, "decision": decision, "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

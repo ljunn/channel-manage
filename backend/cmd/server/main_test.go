@@ -753,37 +753,29 @@ func TestSyncTargetAccountSchedulableUsesDedicatedEndpoint(t *testing.T) {
 	}
 }
 
-func TestSyncTargetSchedulingPlanStopsThenLowersPriorityThenRestores(t *testing.T) {
-	requests := []string{}
+func TestDuplicateTargetAccountUsesStableIdempotencyKey(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/42/schedulable":
-			var payload map[string]bool
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatal(err)
-			}
-			requests = append(requests, fmt.Sprintf("schedulable:%t", payload["schedulable"]))
-		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/admin/accounts/42":
-			var payload map[string]int
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatal(err)
-			}
-			requests = append(requests, fmt.Sprintf("priority:%d", payload["priority"]))
-		default:
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/42/duplicate" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
+		if r.Header.Get("Idempotency-Key") != "managed/fallback/42" {
+			t.Fatalf("idempotency key=%q", r.Header.Get("Idempotency-Key"))
+		}
+		if r.Header.Get("X-Admin-UI-Request") != "1" {
+			t.Fatal("admin UI request header missing")
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":0,"data":{"id":42}}`))
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":84,"name":"[托管] 慢渠道 - 副本"}}`))
 	}))
 	defer server.Close()
 
 	app := &App{httpClient: server.Client()}
-	if err := app.syncTargetSchedulingPlan(context.Background(), server.URL, "42", remoteSession{}, 7000); err != nil {
+	id, name, err := app.duplicateTargetAccount(context.Background(), server.URL, "42", remoteSession{}, "managed/fallback/42")
+	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"schedulable:false", "priority:7000", "schedulable:true"}
-	if !reflect.DeepEqual(requests, want) {
-		t.Fatalf("scheduling transition=%#v, want %#v", requests, want)
+	if id != "84" || name != "[托管] 慢渠道 - 副本" {
+		t.Fatalf("duplicate result id=%q name=%q", id, name)
 	}
 }
 
@@ -824,16 +816,16 @@ func TestPolicyRecoveryAcceptsThreeRecentSuccesses(t *testing.T) {
 	}
 }
 
-func TestPolicyRejectsFirstTokenAboveStrategyLimit(t *testing.T) {
+func TestPolicyRejectsConfirmedSlowLatencyState(t *testing.T) {
 	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000})
 	candidate := eligiblePolicyCandidate("slow", .2, 10_001)
 	reasons := policyRejectionReasons(candidate, config)
-	if len(reasons) != 1 || !strings.Contains(reasons[0], "首 Token 10.00 秒超过策略上限 10.00 秒") {
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "持续偏慢") {
 		t.Fatalf("slow first-token candidate should be rejected by policy: %#v", reasons)
 	}
-	candidate.FirstTokenP95.Float64 = 9_999
+	candidate.LatencyState = latencyStateNormal
 	if reasons := policyRejectionReasons(candidate, config); len(reasons) != 0 {
-		t.Fatalf("candidate below first-token limit should remain eligible: %#v", reasons)
+		t.Fatalf("normal latency state should remain eligible: %#v", reasons)
 	}
 }
 
@@ -887,9 +879,9 @@ func TestRankManagedAccountsByPriceFromPriority1000(t *testing.T) {
 
 func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 	items := []managedPolicyCandidate{
-		eligiblePolicyCandidate("slow", .1, 900),
-		eligiblePolicyCandidate("fast", .8, 120),
-		eligiblePolicyCandidate("middle", .5, 240),
+		eligiblePolicyCandidate("slow", .1, 9_000),
+		eligiblePolicyCandidate("fast", .8, 1_000),
+		eligiblePolicyCandidate("middle", .5, 5_000),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
 	if priorities["fast"] != 1000 || priorities["middle"] != 2000 || priorities["slow"] != 3000 {
@@ -935,7 +927,7 @@ func TestPlanManagedAccountsAddsOnlyEnoughFastestSlowFallbacks(t *testing.T) {
 	if plan.NormalCount != 3 {
 		t.Fatalf("normal count=%d, want 3", plan.NormalCount)
 	}
-	if plan.Priorities["fallback-1"] != 4000 || plan.Priorities["fallback-2"] != 5000 {
+	if plan.Priorities["fallback-1"] != fallbackPriorityStart || plan.Priorities["fallback-2"] != fallbackPriorityStart+1000 {
 		t.Fatalf("unexpected fallback priorities: %#v", plan.Priorities)
 	}
 	if !plan.Fallback["fallback-1"] || !plan.Fallback["fallback-2"] {
@@ -975,10 +967,24 @@ func TestPlanManagedAccountsKeepsFallbackUntilFiveNormalChannelsAreActuallySched
 func TestRankManagedAccountsBySpeedPutsUnknownBusinessLatencyLast(t *testing.T) {
 	known := eligiblePolicyCandidate("known", .5, 900)
 	unknown := eligiblePolicyCandidate("unknown", .2, 100)
-	unknown.FirstTokenP95 = sql.NullFloat64{}
+	unknown.FirstTokenP50 = sql.NullFloat64{}
+	unknown.FirstTokenP90 = sql.NullFloat64{}
 	priorities := rankManagedAccounts([]managedPolicyCandidate{unknown, known}, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
 	if priorities["known"] != 1000 || priorities["unknown"] != 2000 {
 		t.Fatalf("unknown real-business latency was not ranked last: %#v", priorities)
+	}
+}
+
+func TestPlanManagedAccountsSeparatesObservingAndFallbackPriorityBands(t *testing.T) {
+	normal := eligiblePolicyCandidate("normal", .2, 1_000)
+	normal.Schedulable = true
+	observing := eligiblePolicyCandidate("observing", .2, 9_000)
+	observing.LatencyState = latencyStateObserving
+	observing.Schedulable = true
+	fallback := eligiblePolicyCandidate("fallback", .2, 11_000)
+	plan := planManagedAccounts([]managedPolicyCandidate{fallback, observing, normal}, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000, MinAvailableChannels: 3, PriorityStart: 1000, PriorityStep: 1000})
+	if plan.Priorities["normal"] != 1000 || plan.Priorities["observing"] != observingPriorityStart || plan.Priorities["fallback"] != fallbackPriorityStart {
+		t.Fatalf("priority bands overlap: %#v", plan.Priorities)
 	}
 }
 
@@ -1182,13 +1188,18 @@ func TestGroupAvailabilityAlertSuppressesOnlyColdStart(t *testing.T) {
 	}
 }
 
-func eligiblePolicyCandidate(id string, sourceMultiplier, firstTokenP95 float64) managedPolicyCandidate {
+func eligiblePolicyCandidate(id string, sourceMultiplier, firstTokenP50 float64) managedPolicyCandidate {
+	latencyState := latencyStateNormal
+	if firstTokenP50 > defaultPolicyMaxFirstTokenMs {
+		latencyState = latencyStateSlow
+	}
 	return managedPolicyCandidate{
-		ID: id, State: "HEALTHY", Samples: 5, RecentSuccesses: recoverySuccessSamples,
+		ID: id, State: "HEALTHY", LatencyState: latencyState, Samples: 5, RecentSuccesses: recoverySuccessSamples,
 		SourceMultiplier: sql.NullFloat64{Float64: sourceMultiplier, Valid: true},
 		TargetMultiplier: sql.NullFloat64{Float64: 1, Valid: true},
 		SuccessRate:      sql.NullFloat64{Float64: 100, Valid: true},
-		FirstTokenP95:    sql.NullFloat64{Float64: firstTokenP95, Valid: true},
+		FirstTokenP50:    sql.NullFloat64{Float64: firstTokenP50, Valid: true},
+		FirstTokenP90:    sql.NullFloat64{Float64: firstTokenP50, Valid: true},
 	}
 }
 
@@ -1251,16 +1262,173 @@ func TestMedianInt(t *testing.T) {
 	}
 }
 
-func TestFetchRecentBusinessLatencyUsesTenLatestStreamingRecords(t *testing.T) {
+func TestManagedLatencyStateConfirmsSlowAndRecoversWithHysteresis(t *testing.T) {
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	config := policyConfig{MaxFirstTokenMs: 10_000}
+	candidate := eligiblePolicyCandidate("latency", .2, 11_000)
+	candidate.LatencyState = latencyStateNormal
+	candidate.SpeedMetricSamples = 20
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 11_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 14_000, Valid: true}
+	candidate.BusinessLatencyAt = sql.NullTime{Time: base, Valid: true}
+	candidate.LatencyStateChangedAt = sql.NullTime{Time: base.Add(-time.Minute), Valid: true}
+
+	updated, changed := nextManagedLatencyState(candidate, config, base.Add(time.Second))
+	if !changed || updated.LatencyState != latencyStateObserving || updated.LatencyBadSnapshots != 1 {
+		t.Fatalf("first slow snapshot=%#v, want observing 1/2", updated)
+	}
+	duplicate, changed := nextManagedLatencyState(updated, config, base.Add(30*time.Second))
+	if changed || duplicate.LatencyBadSnapshots != 1 {
+		t.Fatalf("same business snapshot was counted twice: %#v", duplicate)
+	}
+
+	updated.BusinessLatencyAt = sql.NullTime{Time: base.Add(time.Minute), Valid: true}
+	updated, changed = nextManagedLatencyState(updated, config, base.Add(time.Minute+time.Second))
+	if !changed || updated.LatencyState != latencyStateSlow || updated.LatencyBadSnapshots != 2 {
+		t.Fatalf("second slow snapshot=%#v, want confirmed slow", updated)
+	}
+
+	for index := 2; index <= 4; index++ {
+		updated.LatestProbeFirstToken = sql.NullFloat64{Float64: 6_000, Valid: true}
+		updated.LatestProbeAt = sql.NullTime{Time: base.Add(time.Duration(index) * time.Minute), Valid: true}
+		updated, changed = nextManagedLatencyState(updated, config, base.Add(time.Duration(index)*time.Minute+time.Second))
+		if !changed || updated.LatencyState != latencyStateSlow {
+			t.Fatalf("recovery sample %d changed state too early: %#v", index-1, updated)
+		}
+	}
+	if updated.LatencyGoodSnapshots != latencyGoodSnapshots {
+		t.Fatalf("good snapshots=%d, want %d", updated.LatencyGoodSnapshots, latencyGoodSnapshots)
+	}
+	updated, changed = nextManagedLatencyState(updated, config, base.Add(7*time.Minute))
+	if !changed || updated.LatencyState != latencyStateNormal {
+		t.Fatalf("confirmed recovery did not clear slow state: %#v", updated)
+	}
+}
+
+func TestManagedLatencyStateNeedsEnoughBusinessSamples(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := eligiblePolicyCandidate("sparse", .2, 12_000)
+	candidate.LatencyState = latencyStateNormal
+	candidate.SpeedMetricSamples = businessLatencyMinSamples - 1
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 12_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 25_000, Valid: true}
+	candidate.BusinessLatencyAt = sql.NullTime{Time: now, Valid: true}
+	updated, changed := nextManagedLatencyState(candidate, policyConfig{MaxFirstTokenMs: 10_000}, now)
+	if changed || updated.LatencyState != latencyStateNormal {
+		t.Fatalf("sparse business window affected scheduling: %#v", updated)
+	}
+}
+
+func TestManagedLatencyStateProtectsTailExperience(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := eligiblePolicyCandidate("tail", .2, 5_000)
+	candidate.SpeedMetricSamples = businessLatencyMinSamples
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 5_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 21_000, Valid: true}
+	candidate.BusinessLatencyAt = sql.NullTime{Time: now, Valid: true}
+	updated, changed := nextManagedLatencyState(candidate, policyConfig{MaxFirstTokenMs: 10_000}, now)
+	if !changed || updated.LatencyState != latencyStateSlow || updated.LatencyBadSnapshots != 1 {
+		t.Fatalf("severely slow P90 tail was not stopped immediately: %#v", updated)
+	}
+}
+
+func TestManagedLatencyStateUsesP90AsDirectSLA(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := eligiblePolicyCandidate("tail-sla", .2, 5_000)
+	candidate.SpeedMetricSamples = businessLatencyMinSamples
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 5_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 11_000, Valid: true}
+	candidate.BusinessLatencyAt = sql.NullTime{Time: now, Valid: true}
+	updated, changed := nextManagedLatencyState(candidate, policyConfig{MaxFirstTokenMs: 10_000}, now)
+	if !changed || updated.LatencyState != latencyStateObserving || updated.LatencyBadSnapshots != 1 {
+		t.Fatalf("P90 above SLA did not enter observation: %#v", updated)
+	}
+}
+
+func TestManagedLatencyStateStopsImmediatelyOnSevereSlowdown(t *testing.T) {
+	now := time.Now().UTC()
+	candidate := eligiblePolicyCandidate("severe", .2, 20_000)
+	candidate.SpeedMetricSamples = businessLatencyMinSamples
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 20_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 25_000, Valid: true}
+	candidate.BusinessLatencyAt = sql.NullTime{Time: now, Valid: true}
+	updated, changed := nextManagedLatencyState(candidate, policyConfig{MaxFirstTokenMs: 10_000}, now)
+	if !changed || updated.LatencyState != latencyStateSlow || updated.LatencyBadSnapshots != 1 {
+		t.Fatalf("severe slowdown was not stopped immediately: %#v", updated)
+	}
+}
+
+func TestManagedLatencyStateRequiresExtraConfirmationForMixedModels(t *testing.T) {
+	base := time.Now().UTC().Add(-time.Minute)
+	candidate := eligiblePolicyCandidate("mixed", .2, 12_000)
+	candidate.LatencyState = latencyStateNormal
+	candidate.SpeedMetricModel = "ALL"
+	candidate.SpeedMetricSamples = businessLatencyMinSamples
+	candidate.BusinessFirstToken = sql.NullFloat64{Float64: 12_000, Valid: true}
+	candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: 18_000, Valid: true}
+	config := policyConfig{MaxFirstTokenMs: 10_000, ProbeModel: "gpt-test"}
+	for index := 0; index < 3; index++ {
+		candidate.BusinessLatencyAt = sql.NullTime{Time: base.Add(time.Duration(index) * time.Second), Valid: true}
+		candidate, _ = nextManagedLatencyState(candidate, config, base.Add(time.Duration(index+1)*time.Second))
+		if index < 2 && candidate.LatencyState != latencyStateObserving {
+			t.Fatalf("mixed-model snapshot %d confirmed too early: %#v", index+1, candidate)
+		}
+	}
+	if candidate.LatencyState != latencyStateSlow || candidate.LatencyBadSnapshots != 3 {
+		t.Fatalf("third mixed-model snapshot did not confirm slow state: %#v", candidate)
+	}
+}
+
+func TestManagedLatencyStateDoesNotFlapAroundTenSecondBoundary(t *testing.T) {
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	candidate := eligiblePolicyCandidate("boundary", .2, 12_027)
+	candidate.LatencyState = latencyStateNormal
+	candidate.LatencyStateChangedAt = sql.NullTime{Time: base.Add(-time.Minute), Valid: true}
+	sequence := []struct {
+		p50     float64
+		p90     float64
+		samples int
+		state   string
+		bad     int
+	}{
+		{12_027, 13_000, 10, latencyStateObserving, 1},
+		{9_400, 9_800, 10, latencyStateObserving, 0},
+		{11_029, 12_000, 10, latencyStateObserving, 1},
+		{9_818, 9_900, 7, latencyStateObserving, 0},
+	}
+	for index, sample := range sequence {
+		candidate.BusinessFirstToken = sql.NullFloat64{Float64: sample.p50, Valid: true}
+		candidate.BusinessFirstTokenP90 = sql.NullFloat64{Float64: sample.p90, Valid: true}
+		candidate.SpeedMetricSamples = sample.samples
+		candidate.BusinessLatencyAt = sql.NullTime{Time: base.Add(time.Duration(index) * time.Minute), Valid: true}
+		updated, _ := nextManagedLatencyState(candidate, policyConfig{MaxFirstTokenMs: 10_000}, base.Add(time.Duration(index)*time.Minute+time.Second))
+		candidate = updated
+		if candidate.LatencyState != sample.state || candidate.LatencyBadSnapshots != sample.bad {
+			t.Fatalf("snapshot %d produced %#v, want state=%s bad=%d", index+1, candidate, sample.state, sample.bad)
+		}
+	}
+}
+
+func TestPercentileIntDoesNotMutateInput(t *testing.T) {
+	values := []int{1000, 100, 900, 200, 800, 300, 700, 400, 600, 500}
+	if got := percentileInt(values, .9); got != 900 {
+		t.Fatalf("p90=%d, want 900", got)
+	}
+	if values[0] != 1000 || values[1] != 100 {
+		t.Fatalf("percentileInt mutated input: %#v", values)
+	}
+}
+
+func TestFetchRecentBusinessLatencyUsesRecentStreamingRecords(t *testing.T) {
 	requested := 0
-	latest := time.Date(2026, 7, 30, 12, 0, 0, 123000000, time.UTC)
+	latest := time.Now().UTC().Add(-time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requested++
 		if r.URL.Path != "/api/v1/admin/usage" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		query := r.URL.Query()
-		if query.Get("account_id") != "42" || query.Get("page") != "1" || query.Get("page_size") != "10" {
+		if query.Get("account_id") != "42" || query.Get("page") != "1" || query.Get("page_size") != "50" {
 			t.Fatalf("unexpected pagination query: %s", r.URL.RawQuery)
 		}
 		if query.Get("stream") != "true" || query.Get("sort_by") != "created_at" || query.Get("sort_order") != "desc" {
@@ -1281,15 +1449,44 @@ func TestFetchRecentBusinessLatencyUsesTenLatestStreamingRecords(t *testing.T) {
 	defer server.Close()
 
 	app := &App{httpClient: server.Client()}
-	snapshot, err := app.fetchRecentBusinessLatency(context.Background(), server.URL, "42", remoteSession{})
+	snapshot, err := app.fetchRecentBusinessLatency(context.Background(), server.URL, "42", "", remoteSession{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if requested != 1 {
 		t.Fatalf("usage requests=%d, want 1", requested)
 	}
-	if snapshot.Samples != 10 || snapshot.FirstTokenMs != 550 || !snapshot.LatestAt.Equal(latest) {
+	if snapshot.Samples != 10 || snapshot.FirstTokenP50Ms != 550 || snapshot.FirstTokenP90Ms != 900 || !snapshot.LatestAt.Equal(latest) {
 		t.Fatalf("unexpected snapshot: %#v", snapshot)
+	}
+}
+
+func TestFetchRecentBusinessLatencyPrefersConfiguredModelWithEnoughSamples(t *testing.T) {
+	latest := time.Now().UTC().Add(-time.Second)
+	policySamples := 10
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		items := make([]map[string]any, 0, 20)
+		for index := 0; index < 20; index++ {
+			model := "slow-model"
+			firstToken := 30_000
+			if index < policySamples {
+				model = "policy-model"
+				firstToken = (index + 1) * 1_000
+			}
+			items = append(items, map[string]any{"account_id": 42, "model": model, "first_token_ms": firstToken, "created_at": latest.Add(-time.Duration(index) * time.Second).Format(time.RFC3339Nano)})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"items": items, "pages": 1}})
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	snapshot, err := app.fetchRecentBusinessLatency(context.Background(), server.URL, "42", "policy-model", remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Model != "policy-model" || snapshot.Samples != policySamples || snapshot.FirstTokenP50Ms != 5_500 || snapshot.FirstTokenP90Ms != 9_000 {
+		t.Fatalf("configured model was not isolated: %#v", snapshot)
 	}
 }
 

@@ -16,11 +16,12 @@ import (
 )
 
 type remoteSession struct {
-	Authorization string
-	RefreshToken  string
-	Cookie        string
-	UserID        string
-	SessionID     string
+	Authorization  string
+	RefreshToken   string
+	Cookie         string
+	UserID         string
+	SessionID      string
+	IdempotencyKey string
 }
 
 const maxRemoteResponseBytes = 8 << 20
@@ -153,6 +154,9 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 	}
 	if session.SessionID != "" {
 		request.Header.Set("X-Auth-Session", session.SessionID)
+	}
+	if session.IdempotencyKey != "" {
+		request.Header.Set("Idempotency-Key", session.IdempotencyKey)
 	}
 	response, err := a.httpClient.Do(request)
 	if err != nil {

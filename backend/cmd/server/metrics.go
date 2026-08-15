@@ -11,36 +11,35 @@ import (
 	"time"
 )
 
-const recentBusinessLatencySamples = 10
+const (
+	recentBusinessLatencySamples = 50
+	businessLatencyWindow        = 5 * time.Minute
+)
 
 type businessMetricBucket struct {
-	ChannelID        string
-	Window           time.Time
-	Requests         int
-	Errors           int
-	Timeouts         int
-	RateLimits       int
-	Durations        []int
-	FirstToken       []int
-	SlowFirstToken   int
-	SlowFirstTokenAt time.Time
-}
-
-type slowFirstTokenSample struct {
-	FirstTokenMs int
-	CreatedAt    time.Time
+	ChannelID  string
+	Window     time.Time
+	Requests   int
+	Errors     int
+	Timeouts   int
+	RateLimits int
+	Durations  []int
+	FirstToken []int
 }
 
 type businessLatencySnapshot struct {
-	FirstTokenMs int
-	Samples      int
-	LatestAt     time.Time
+	FirstTokenP50Ms int
+	FirstTokenP90Ms int
+	Samples         int
+	LatestAt        time.Time
+	Model           string
 }
 
 type targetMetricBinding struct {
-	ManagedID string
-	RemoteID  string
-	ChannelID string
+	ManagedID  string
+	RemoteID   string
+	ChannelID  string
+	ProbeModel string
 }
 
 func (a *App) syncDueTargetMetrics(ctx context.Context) {
@@ -77,7 +76,12 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	if err != nil {
 		return err
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT id,remote_id,channel_id FROM managed_accounts WHERE target_id=$1 AND remote_id<>''`, targetID)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.channel_id,COALESCE(min(v.config->>'probeModel'),'')
+		FROM managed_accounts m
+		LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id
+		LEFT JOIN policies p ON p.scope_type='TARGET_GROUP' AND p.scope_id=mg.target_group_id AND p.status='ACTIVE'
+		LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
+		WHERE m.target_id=$1 AND m.remote_id<>'' GROUP BY m.id`, targetID)
 	if err != nil {
 		return err
 	}
@@ -85,7 +89,7 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	bindings := []targetMetricBinding{}
 	for rows.Next() {
 		var binding targetMetricBinding
-		if err := rows.Scan(&binding.ManagedID, &binding.RemoteID, &binding.ChannelID); err != nil {
+		if err := rows.Scan(&binding.ManagedID, &binding.RemoteID, &binding.ChannelID, &binding.ProbeModel); err != nil {
 			return err
 		}
 		bindings = append(bindings, binding)
@@ -96,7 +100,7 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	latencySnapshots := map[string]businessLatencySnapshot{}
 	for _, binding := range bindings {
 		latencyCtx, latencyCancel := timeoutContext(ctx)
-		snapshot, snapshotErr := a.fetchRecentBusinessLatency(latencyCtx, target.BaseURL, binding.RemoteID, session)
+		snapshot, snapshotErr := a.fetchRecentBusinessLatency(latencyCtx, target.BaseURL, binding.RemoteID, binding.ProbeModel, session)
 		latencyCancel()
 		if snapshotErr != nil {
 			return snapshotErr
@@ -144,12 +148,7 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 				bucket.Durations = append(bucket.Durations, int(value))
 			}
 			if value, ok := number(item["first_token_ms"]); ok && value >= 0 {
-				firstTokenMs := int(value)
-				bucket.FirstToken = append(bucket.FirstToken, firstTokenMs)
-				if firstTokenMs > maxFirstTokenMs && created.After(bucket.SlowFirstTokenAt) {
-					bucket.SlowFirstToken = firstTokenMs
-					bucket.SlowFirstTokenAt = created
-				}
+				bucket.FirstToken = append(bucket.FirstToken, int(value))
 			}
 		}
 	}
@@ -160,43 +159,19 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	defer tx.Rollback()
 	for managedID, snapshot := range latencySnapshots {
 		if snapshot.Samples == 0 {
-			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=NULL,business_latency_samples=0,business_latency_at=NULL WHERE id=$1`, managedID)
+			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=NULL,business_first_token_p90_ms=NULL,business_latency_samples=0,business_latency_at=NULL,business_latency_model='' WHERE id=$1`, managedID)
 		} else {
-			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=$2,business_latency_samples=$3,business_latency_at=$4 WHERE id=$1`, managedID, snapshot.FirstTokenMs, snapshot.Samples, snapshot.LatestAt)
+			_, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET business_first_token_ms=$2,business_first_token_p90_ms=$3,business_latency_samples=$4,business_latency_at=$5,business_latency_model=$6 WHERE id=$1`, managedID, snapshot.FirstTokenP50Ms, snapshot.FirstTokenP90Ms, snapshot.Samples, snapshot.LatestAt, snapshot.Model)
 		}
 		if err != nil {
 			return err
 		}
 	}
-	slowSamples := map[string]slowFirstTokenSample{}
 	for _, bucket := range buckets {
 		firstTokenP95 := percentile(bucket.FirstToken, .95)
 		_, err = tx.ExecContext(ctx, `INSERT INTO metric_buckets(channel_id,window_start,requests,errors,timeouts,rate_limited,p50_ms,p95_ms,first_token_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(channel_id,window_start) DO UPDATE SET requests=excluded.requests,errors=excluded.errors,timeouts=excluded.timeouts,rate_limited=excluded.rate_limited,p50_ms=excluded.p50_ms,p95_ms=excluded.p95_ms,first_token_p95_ms=excluded.first_token_p95_ms`, bucket.ChannelID, bucket.Window, bucket.Requests, bucket.Errors, bucket.Timeouts, bucket.RateLimits, percentile(bucket.Durations, .5), percentile(bucket.Durations, .95), firstTokenP95)
 		if err != nil {
 			return err
-		}
-		if !bucket.SlowFirstTokenAt.IsZero() {
-			current := slowSamples[bucket.ChannelID]
-			if bucket.SlowFirstTokenAt.After(current.CreatedAt) {
-				slowSamples[bucket.ChannelID] = slowFirstTokenSample{FirstTokenMs: bucket.SlowFirstToken, CreatedAt: bucket.SlowFirstTokenAt}
-			}
-		}
-	}
-	slowChannels := map[string]int{}
-	for channelID, sample := range slowSamples {
-		reason := slowFirstTokenReason(sample.FirstTokenMs)
-		result, updateErr := tx.ExecContext(ctx, `UPDATE channels SET
-			lifecycle_state=CASE WHEN lifecycle_state='MANUAL_HOLD' THEN lifecycle_state ELSE 'QUARANTINED' END,
-			state_reason=CASE WHEN lifecycle_state='MANUAL_HOLD' THEN state_reason ELSE $2 END,
-			score=0,consecutive_failures=0,last_probe_at=now(),last_slow_sample_at=$3,
-			state_changed_at=CASE WHEN lifecycle_state='MANUAL_HOLD' THEN state_changed_at ELSE now() END
-			WHERE id=$1 AND $3>COALESCE(last_slow_sample_at,'epoch'::timestamptz)`, channelID, reason, sample.CreatedAt)
-		err = updateErr
-		if err != nil {
-			return err
-		}
-		if affected, affectedErr := result.RowsAffected(); affectedErr == nil && affected > 0 {
-			slowChannels[channelID] = sample.FirstTokenMs
 		}
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE targets SET last_metrics_at=now() WHERE id=$1`, targetID)
@@ -206,16 +181,10 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	for channelID, firstTokenMs := range slowChannels {
-		reason := slowFirstTokenReason(firstTokenMs)
-		if err = a.disableSlowChannelAccounts(ctx, channelID, reason); err != nil {
-			logDatabaseError("禁用慢首响渠道", err)
-		}
-	}
 	return nil
 }
 
-func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID string, session remoteSession) (businessLatencySnapshot, error) {
+func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID, probeModel string, session remoteSession) (businessLatencySnapshot, error) {
 	path := "/api/v1/admin/usage?account_id=" + url.QueryEscape(remoteID) +
 		"&stream=true&sort_by=created_at&sort_order=desc&page=1&page_size=" + strconv.Itoa(recentBusinessLatencySamples)
 	raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, path, session, nil)
@@ -235,7 +204,10 @@ func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID 
 		return businessLatencySnapshot{}, &apiError{502, "SCHEMA_CHANGED", "目标节点用量列表格式不兼容"}
 	}
 	values := make([]int, 0, recentBusinessLatencySamples)
+	modelValues := make([]int, 0, recentBusinessLatencySamples)
 	latest := time.Time{}
+	modelLatest := time.Time{}
+	cutoff := time.Now().Add(-businessLatencyWindow)
 	for _, rawItem := range items {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
@@ -250,18 +222,30 @@ func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID 
 			continue
 		}
 		created, parseErr := parseRemoteTimestamp(text(item["created_at"], ""))
-		if parseErr != nil {
+		if parseErr != nil || created.Before(cutoff) {
 			continue
 		}
 		values = append(values, int(firstToken))
 		if created.After(latest) {
 			latest = created
 		}
+		if probeModel != "" && text(item["model"], "") == probeModel {
+			modelValues = append(modelValues, int(firstToken))
+			if created.After(modelLatest) {
+				modelLatest = created
+			}
+		}
 	}
 	if len(values) == 0 {
 		return businessLatencySnapshot{}, nil
 	}
-	return businessLatencySnapshot{FirstTokenMs: medianInt(values), Samples: len(values), LatestAt: latest}, nil
+	model := "ALL"
+	if len(modelValues) >= businessLatencyMinSamples {
+		values = modelValues
+		latest = modelLatest
+		model = probeModel
+	}
+	return businessLatencySnapshot{FirstTokenP50Ms: medianInt(values), FirstTokenP90Ms: percentileInt(values, .90), Samples: len(values), LatestAt: latest, Model: model}, nil
 }
 
 func parseRemoteTimestamp(value string) (time.Time, error) {
@@ -282,6 +266,22 @@ func medianInt(values []int) int {
 		return sorted[middle]
 	}
 	return sorted[middle-1] + (sorted[middle]-sorted[middle-1])/2
+}
+
+func percentileInt(values []int, ratio float64) int {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]int(nil), values...)
+	sort.Ints(sorted)
+	index := int(float64(len(sorted))*ratio+.999999) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
 }
 
 func (a *App) disableSlowChannelAccounts(ctx context.Context, channelID, reason string) error {

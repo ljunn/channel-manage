@@ -172,7 +172,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if modelsLoaded && len(models) > 0 {
 		_, _ = tx.ExecContext(ctx, `UPDATE source_keys SET models=$2::jsonb,updated_at=now() WHERE id=(SELECT source_key_id FROM channels WHERE id=$1)`, id, jsonValue(models))
 	}
-	if slowFirstToken {
+	if slowFirstToken && !managed {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,score=0,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, slowFirstTokenReason(latency))
 	} else if success && skippedActiveProbe {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
@@ -199,7 +199,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	if slowFirstToken {
+	if slowFirstToken && !managed {
 		if disableErr := a.disableSlowChannelAccounts(ctx, id, slowFirstTokenReason(latency)); disableErr != nil {
 			logDatabaseError("禁用慢首响渠道", disableErr)
 		}
@@ -310,10 +310,10 @@ func (a *App) runQuickChannelValidation(id string, probeLimit int) {
 func (a *App) managedChannelNeedsActiveProbe(ctx context.Context, channelID string) (bool, error) {
 	var needsProbe bool
 	err := a.db.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM managed_accounts m
-		WHERE m.channel_id=$1 AND (
-			m.business_first_token_ms IS NULL OR m.business_latency_at IS NULL OR
-			m.business_latency_at<=now()-$2*interval '1 second'
+			SELECT 1 FROM managed_accounts m
+			WHERE m.channel_id=$1 AND (
+				m.latency_state='SLOW' OR m.business_first_token_ms IS NULL OR m.business_latency_at IS NULL OR
+				m.business_latency_at<=now()-$2*interval '1 second'
 		)
 	)`, channelID, int(businessLatencyFreshness/time.Second)).Scan(&needsProbe)
 	return needsProbe, err
@@ -426,7 +426,7 @@ func (a *App) updateManagedAccountPriority(w http.ResponseWriter, r *http.Reques
 	if err = a.syncTargetAccountPriority(requestCtx, targetBase, remoteID, session, input.Priority); err != nil {
 		return err
 	}
-	if _, err = a.db.ExecContext(r.Context(), `UPDATE managed_accounts SET priority=$2,updated_at=now() WHERE id=$1`, id, input.Priority); err != nil {
+	if _, err = a.db.ExecContext(r.Context(), `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1`, id, input.Priority); err != nil {
 		return err
 	}
 	a.audit(r.Context(), "SET_PRIORITY", "managed_account", id, map[string]any{"priority": input.Priority, "remote_id": remoteID})
@@ -438,14 +438,25 @@ func (a *App) syncTargetAccountPriority(ctx context.Context, targetBase, remoteI
 	return a.syncTargetAccountNumbers(ctx, targetBase, remoteID, session, map[string]int{"priority": priority})
 }
 
-func (a *App) syncTargetSchedulingPlan(ctx context.Context, targetBase, remoteID string, session remoteSession, priority int) error {
-	if err := a.syncTargetAccountSchedulable(ctx, targetBase, remoteID, session, false); err != nil {
-		return err
+func (a *App) duplicateTargetAccount(ctx context.Context, targetBase, remoteID string, session remoteSession, idempotencyKey string) (string, string, error) {
+	session.IdempotencyKey = idempotencyKey
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts/"+remoteID+"/duplicate", session, nil)
+	if err != nil {
+		return "", "", err
 	}
-	if err := a.syncTargetAccountPriority(ctx, targetBase, remoteID, session, priority); err != nil {
-		return err
+	data, err := unwrapEnvelope(value, "SUB2API")
+	if err != nil {
+		return "", "", err
 	}
-	return a.syncTargetAccountSchedulable(ctx, targetBase, remoteID, session, true)
+	record, ok := data.(map[string]any)
+	if !ok {
+		return "", "", &apiError{502, "SCHEMA_CHANGED", "目标节点复制账号响应格式不兼容"}
+	}
+	idNumber, ok := number(record["id"])
+	if !ok || idNumber <= 0 {
+		return "", "", &apiError{502, "SCHEMA_CHANGED", "目标节点复制账号响应缺少账号 ID"}
+	}
+	return strconv.Itoa(int(idNumber)), text(record["name"], ""), nil
 }
 
 func (a *App) updateManagedAccountConcurrency(w http.ResponseWriter, r *http.Request, id string) error {

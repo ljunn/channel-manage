@@ -15,11 +15,22 @@ import (
 )
 
 const (
-	fastProbeIntervalSeconds = 15
-	recoverySuccessSamples   = 3
-	maxConcurrentProbes      = 6
-	maxFirstTokenMs          = 60_000
-	businessLatencyFreshness = 15 * time.Minute
+	fastProbeIntervalSeconds  = 15
+	recoverySuccessSamples    = 3
+	maxConcurrentProbes       = 6
+	maxFirstTokenMs           = 60_000
+	businessLatencyFreshness  = 15 * time.Minute
+	businessLatencyMinSamples = 5
+	latencyBadSnapshots       = 2
+	latencyGoodSnapshots      = 3
+	latencyRecoveryHold       = 5 * time.Minute
+	priorityChangeCooldown    = 5 * time.Minute
+)
+
+const (
+	latencyStateNormal    = "NORMAL"
+	latencyStateObserving = "OBSERVING"
+	latencyStateSlow      = "SLOW"
 )
 
 func (a *App) runScheduler(ctx context.Context) {
@@ -216,7 +227,7 @@ func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConf
 	if item.SourceUntrusted || item.SourcePaused || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
-	return item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
+	return item.LatencyState == latencyStateSlow || item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
 }
 
 func (a *App) probeChannels(ctx context.Context, ids []string) {
@@ -316,6 +327,10 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 	}
 	for _, policy := range policies {
 		groupItems := candidatesForTargetGroup(items, policy.ScopeID)
+		groupItems, err = a.advanceManagedLatencyStates(ctx, groupItems, policy.Config, time.Now())
+		if err != nil {
+			return err
+		}
 		plan := planManagedAccounts(groupItems, policy.Config)
 		desiredPriority := plan.Priorities
 		if len(groupItems) > 0 && len(desiredPriority) == 0 && groupNeedsAvailabilityAlert(groupItems, policy.Config) {
@@ -328,16 +343,20 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 			reasons := policyRejectionReasons(item, policy.Config)
 			priority, desired := desiredPriority[item.ID]
 			fallback := plan.Fallback[item.ID]
+			if fallback && !item.FallbackActive {
+				reason := fmt.Sprintf("常规可用渠道仅 %d/%d，复制慢账号为优先级 %d 的末档兜底；旧账号停用并保留历史，强制已有请求重新选路", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
+				a.enqueueManagedAction(ctx, item.ID, "ROTATE_FALLBACK", map[string]any{"schedulable": item.Schedulable, "priority": item.Priority, "remoteId": item.RemoteID}, map[string]any{"schedulable": true, "priority": priority, "fallbackActive": true}, reason)
+				continue
+			}
 			if desired && priority != item.Priority {
-				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
-				if fallback || !item.Schedulable {
-					if fallback {
-						reason = fmt.Sprintf("常规可用渠道仅 %d/%d，慢渠道作为低优先级兜底：先停用、调整为优先级 %d，再恢复调度", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
-					}
-					a.enqueueManagedAction(ctx, item.ID, "APPLY_SCHEDULING_PLAN", map[string]any{"schedulable": item.Schedulable, "priority": item.Priority}, map[string]any{"schedulable": true, "priority": priority}, reason)
-				} else {
-					a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
+				if !fallback && item.Schedulable && item.PrioritySyncedAt.Valid && time.Since(item.PrioritySyncedAt.Time) < priorityChangeCooldown {
+					continue
 				}
+				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
+				if item.LatencyState == latencyStateObserving {
+					reason = fmt.Sprintf("首响处于观察期，先降到常规队列末档：%s 调整为优先级 %d", item.SourceGroup, priority)
+				}
+				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
 				continue
 			}
 			if desired != item.Schedulable {
@@ -380,29 +399,36 @@ func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string
 }
 
 type managedPolicyCandidate struct {
-	ID, ChannelID, TargetGroupID, RemoteName, SourceName, TargetName string
-	State, StateReason, SourceGroup, TargetGroup, SyncStatus         string
-	Platform, ModelsJSON                                             string
-	SpeedMetricSource                                                string
-	Schedulable                                                      bool
-	SourceUntrusted                                                  bool
-	SourcePaused                                                     bool
-	Priority                                                         int
-	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP95   sql.NullFloat64
-	BusinessFirstToken, ProbeFirstTokenP95                           sql.NullFloat64
-	BusinessLatencyAt                                                sql.NullTime
-	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures int
-	SpeedMetricSamples                                               int
-	ConfirmationFailures                                             int
+	ID, ChannelID, TargetGroupID, RemoteID, RemoteName, SourceName, TargetName string
+	State, StateReason, SourceGroup, TargetGroup, SyncStatus                   string
+	LatencyState                                                               string
+	Platform, ModelsJSON, SpeedMetricModel                                     string
+	SpeedMetricSource                                                          string
+	Schedulable                                                                bool
+	FallbackActive                                                             bool
+	SourceUntrusted                                                            bool
+	SourcePaused                                                               bool
+	Priority                                                                   int
+	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50             sql.NullFloat64
+	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                   sql.NullFloat64
+	ProbeFirstTokenP95, LatestProbeFirstToken                                  sql.NullFloat64
+	BusinessLatencyAt, LatestProbeAt, LatencyEvaluatedAt                       sql.NullTime
+	LatencyStateChangedAt, PrioritySyncedAt                                    sql.NullTime
+	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures           int
+	SpeedMetricSamples, LatencyBadSnapshots, LatencyGoodSnapshots              int
+	ConfirmationFailures                                                       int
 }
 
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_name,min(s.name),min(t.name),m.schedulable,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_id,m.remote_name,min(s.name),min(t.name),m.schedulable,m.fallback_active,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
-		m.business_first_token_ms,m.business_latency_samples,m.business_latency_at,
+		m.business_first_token_ms,m.business_first_token_p90_ms,m.business_latency_samples,m.business_latency_at,m.business_latency_model,
+		m.latency_state,m.latency_bad_snapshots,m.latency_good_snapshots,m.latency_evaluated_at,m.latency_state_changed_at,m.priority_synced_at,
+		(SELECT p.first_token_ms FROM probe_runs p WHERE p.channel_id=c.id AND p.first_token_ms IS NOT NULL ORDER BY p.started_at DESC LIMIT 1),
+		(SELECT p.started_at FROM probe_runs p WHERE p.channel_id=c.id AND p.first_token_ms IS NOT NULL ORDER BY p.started_at DESC LIMIT 1),
 		(SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY p.first_token_ms) FROM probe_runs p WHERE p.channel_id=c.id AND p.success AND p.first_token_ms IS NOT NULL AND p.started_at>now()-interval '1 hour'),
 		(SELECT count(*) FROM (
 			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
@@ -422,12 +448,19 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
-		item.FirstTokenP95, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
+		item.FirstTokenP50, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
+		if item.SpeedMetricSource == "BUSINESS" {
+			item.FirstTokenP90 = item.BusinessFirstTokenP90
+		}
 		if item.SpeedMetricSource != "BUSINESS" {
 			item.SpeedMetricSamples = 0
+			item.SpeedMetricModel = ""
+		}
+		if item.LatencyState == "" {
+			item.LatencyState = latencyStateNormal
 		}
 		item.ConfirmationFailures = confirmationFailures
 		items = append(items, item)
@@ -443,6 +476,106 @@ func effectiveSpeedMetric(business sql.NullFloat64, businessAt sql.NullTime, pro
 		return probe, "PROBE"
 	}
 	return sql.NullFloat64{}, ""
+}
+
+func (a *App) advanceManagedLatencyStates(ctx context.Context, items []managedPolicyCandidate, config policyConfig, now time.Time) ([]managedPolicyCandidate, error) {
+	for index := range items {
+		updated, changed := nextManagedLatencyState(items[index], config, now)
+		if !changed {
+			continue
+		}
+		if updated.LatencyState == latencyStateNormal {
+			updated.FallbackActive = false
+		}
+		_, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET latency_state=$2,latency_bad_snapshots=$3,latency_good_snapshots=$4,latency_evaluated_at=$5,latency_state_changed_at=$6,fallback_active=$7,updated_at=now() WHERE id=$1`, updated.ID, updated.LatencyState, updated.LatencyBadSnapshots, updated.LatencyGoodSnapshots, updated.LatencyEvaluatedAt, updated.LatencyStateChangedAt, updated.FallbackActive)
+		if err != nil {
+			return items, err
+		}
+		items[index] = updated
+	}
+	return items, nil
+}
+
+func nextManagedLatencyState(item managedPolicyCandidate, config policyConfig, now time.Time) (managedPolicyCandidate, bool) {
+	config = normalizePolicyConfig(config)
+	if item.LatencyState == "" {
+		item.LatencyState = latencyStateNormal
+	}
+	before := item
+
+	// Recovery is deliberately delayed even after the third good sample. This
+	// prevents a disabled account from bouncing back on the same short burst.
+	if item.LatencyState == latencyStateSlow && item.LatencyGoodSnapshots >= latencyGoodSnapshots && item.LatencyStateChangedAt.Valid && now.Sub(item.LatencyStateChangedAt.Time) >= latencyRecoveryHold && item.LatencyEvaluatedAt.Valid && now.Sub(item.LatencyEvaluatedAt.Time) <= businessLatencyFreshness {
+		item.LatencyState = latencyStateNormal
+		item.LatencyBadSnapshots = 0
+		item.LatencyGoodSnapshots = 0
+		item.LatencyStateChangedAt = sql.NullTime{Time: now, Valid: true}
+		return item, true
+	}
+
+	observationAt := time.Time{}
+	p50 := 0.0
+	p90 := 0.0
+	useBusiness := item.BusinessFirstToken.Valid && item.BusinessFirstTokenP90.Valid && item.SpeedMetricSamples >= businessLatencyMinSamples && item.BusinessLatencyAt.Valid && now.Sub(item.BusinessLatencyAt.Time) <= businessLatencyFreshness && (!item.LatencyEvaluatedAt.Valid || item.BusinessLatencyAt.Time.After(item.LatencyEvaluatedAt.Time))
+	if useBusiness {
+		observationAt = item.BusinessLatencyAt.Time
+		p50 = item.BusinessFirstToken.Float64
+		p90 = item.BusinessFirstTokenP90.Float64
+	} else if item.LatencyState == latencyStateSlow && item.LatestProbeFirstToken.Valid && item.LatestProbeAt.Valid && now.Sub(item.LatestProbeAt.Time) <= businessLatencyFreshness && (!item.LatencyEvaluatedAt.Valid || item.LatestProbeAt.Time.After(item.LatencyEvaluatedAt.Time)) {
+		observationAt = item.LatestProbeAt.Time
+		p50 = item.LatestProbeFirstToken.Float64
+		p90 = p50
+	} else {
+		return item, false
+	}
+
+	limit := float64(config.MaxFirstTokenMs)
+	requiredBadSnapshots := latencyBadSnapshotLimit(item, config)
+	bad := p50 > limit || p90 > limit
+	severe := requiredBadSnapshots == latencyBadSnapshots && (p50 >= 1.5*limit || p90 >= 1.5*limit)
+	good := p50 < .8*limit && p90 < .8*limit
+	item.LatencyEvaluatedAt = sql.NullTime{Time: observationAt, Valid: true}
+	switch {
+	case bad:
+		item.LatencyBadSnapshots++
+		item.LatencyGoodSnapshots = 0
+		if item.LatencyState != latencyStateSlow {
+			item.LatencyState = latencyStateObserving
+		}
+		if severe || item.LatencyBadSnapshots >= requiredBadSnapshots {
+			item.LatencyState = latencyStateSlow
+		}
+	case good:
+		item.LatencyBadSnapshots = 0
+		if item.LatencyState == latencyStateSlow {
+			item.LatencyGoodSnapshots++
+		} else if item.LatencyState == latencyStateObserving {
+			item.LatencyGoodSnapshots++
+			if item.LatencyGoodSnapshots >= 2 {
+				item.LatencyState = latencyStateNormal
+				item.LatencyGoodSnapshots = 0
+			}
+		} else {
+			item.LatencyGoodSnapshots = 0
+		}
+	default:
+		item.LatencyBadSnapshots = 0
+		item.LatencyGoodSnapshots = 0
+		if item.LatencyState != latencyStateSlow {
+			item.LatencyState = latencyStateObserving
+		}
+	}
+	if item.LatencyState != before.LatencyState {
+		item.LatencyStateChangedAt = sql.NullTime{Time: now, Valid: true}
+	}
+	return item, true
+}
+
+func latencyBadSnapshotLimit(item managedPolicyCandidate, config policyConfig) int {
+	if item.SpeedMetricModel == "ALL" && strings.TrimSpace(normalizePolicyConfig(config).ProbeModel) != "" {
+		return latencyBadSnapshots + 1
+	}
+	return latencyBadSnapshots
 }
 
 func candidatesForTargetGroup(items []managedPolicyCandidate, targetGroupID string) []managedPolicyCandidate {
@@ -461,14 +594,24 @@ type managedPolicyPlan struct {
 	NormalCount int
 }
 
+const (
+	observingPriorityStart = 300_000
+	fallbackPriorityStart  = 900_000
+)
+
 func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) managedPolicyPlan {
 	normal := []managedPolicyCandidate{}
+	observing := []managedPolicyCandidate{}
 	slowFallback := []managedPolicyCandidate{}
 	availableNormalCount := 0
 	config = normalizePolicyConfig(config)
 	for _, item := range items {
 		if len(policyRejectionReasons(item, config)) == 0 {
-			normal = append(normal, item)
+			if item.LatencyState == latencyStateObserving {
+				observing = append(observing, item)
+			} else {
+				normal = append(normal, item)
+			}
 			if item.Schedulable {
 				availableNormalCount++
 			}
@@ -477,22 +620,31 @@ func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 		}
 	}
 	sortPolicyCandidates(normal, config)
+	sortPolicyCandidates(observing, config)
 	sort.SliceStable(slowFallback, func(i, j int) bool {
-		if slowFallback[i].FirstTokenP95.Float64 != slowFallback[j].FirstTokenP95.Float64 {
-			return slowFallback[i].FirstTokenP95.Float64 < slowFallback[j].FirstTokenP95.Float64
+		if slowFallback[i].FirstTokenP50.Float64 != slowFallback[j].FirstTokenP50.Float64 {
+			return slowFallback[i].FirstTokenP50.Float64 < slowFallback[j].FirstTokenP50.Float64
 		}
 		return slowFallback[i].ID < slowFallback[j].ID
 	})
-	selected := append([]managedPolicyCandidate{}, normal...)
 	fallback := map[string]bool{}
 	needed := max(0, config.MinAvailableChannels-availableNormalCount)
 	for index := 0; index < min(needed, len(slowFallback)); index++ {
-		selected = append(selected, slowFallback[index])
 		fallback[slowFallback[index].ID] = true
 	}
 	priorities := map[string]int{}
-	for index, item := range selected {
+	for index, item := range normal {
 		priorities[item.ID] = config.PriorityStart + index*config.PriorityStep
+	}
+	nextNormal := config.PriorityStart + len(normal)*config.PriorityStep
+	observingStart := max(observingPriorityStart, nextNormal)
+	for index, item := range observing {
+		priorities[item.ID] = observingStart + index*config.PriorityStep
+	}
+	nextObserving := observingStart + len(observing)*config.PriorityStep
+	fallbackStart := max(fallbackPriorityStart, nextObserving)
+	for index := 0; index < min(needed, len(slowFallback)); index++ {
+		priorities[slowFallback[index].ID] = fallbackStart + index*config.PriorityStep
 	}
 	return managedPolicyPlan{Priorities: priorities, Fallback: fallback, NormalCount: availableNormalCount}
 }
@@ -503,12 +655,19 @@ func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 
 func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig) {
 	sort.SliceStable(eligible, func(i, j int) bool {
+		leftObserving := eligible[i].LatencyState == latencyStateObserving
+		rightObserving := eligible[j].LatencyState == latencyStateObserving
+		if leftObserving != rightObserving {
+			return !leftObserving
+		}
 		if config.Mode == "SPEED" {
-			if eligible[i].FirstTokenP95.Valid != eligible[j].FirstTokenP95.Valid {
-				return eligible[i].FirstTokenP95.Valid
+			leftBand := policySpeedBand(eligible[i], config)
+			rightBand := policySpeedBand(eligible[j], config)
+			if leftBand != rightBand {
+				return leftBand < rightBand
 			}
-			if eligible[i].FirstTokenP95.Valid && eligible[i].FirstTokenP95.Float64 != eligible[j].FirstTokenP95.Float64 {
-				return eligible[i].FirstTokenP95.Float64 < eligible[j].FirstTokenP95.Float64
+			if eligible[i].Priority != eligible[j].Priority {
+				return eligible[i].Priority < eligible[j].Priority
 			}
 		} else if eligible[i].SourceMultiplier.Valid && eligible[j].SourceMultiplier.Valid && eligible[i].SourceMultiplier.Float64 != eligible[j].SourceMultiplier.Float64 {
 			return eligible[i].SourceMultiplier.Float64 < eligible[j].SourceMultiplier.Float64
@@ -517,13 +676,30 @@ func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig
 	})
 }
 
+func policySpeedBand(item managedPolicyCandidate, config policyConfig) int {
+	if !item.FirstTokenP50.Valid {
+		return 5
+	}
+	score := item.FirstTokenP50.Float64
+	if item.FirstTokenP90.Valid {
+		score = .6*item.FirstTokenP50.Float64 + .4*item.FirstTokenP90.Float64
+	}
+	limit := float64(normalizePolicyConfig(config).MaxFirstTokenMs)
+	for index, ratio := range []float64{.3, .6, .8, 1} {
+		if score <= limit*ratio {
+			return index
+		}
+	}
+	return 4
+}
+
 func policySlowFallbackCandidate(item managedPolicyCandidate, config policyConfig) bool {
 	config = normalizePolicyConfig(config)
-	if !item.FirstTokenP95.Valid || item.FirstTokenP95.Float64 <= float64(config.MaxFirstTokenMs) {
+	if item.LatencyState != latencyStateSlow {
 		return false
 	}
 	withoutLatency := item
-	withoutLatency.FirstTokenP95 = sql.NullFloat64{}
+	withoutLatency.LatencyState = latencyStateNormal
 	return len(policyRejectionReasons(withoutLatency, config)) == 0
 }
 
@@ -550,8 +726,8 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	if !policyHasAllowedModels(item, config) {
 		reasons = append(reasons, "源渠道在应用分组禁用清单后没有可用模型")
 	}
-	if item.FirstTokenP95.Valid && item.FirstTokenP95.Float64 > float64(config.MaxFirstTokenMs) {
-		reasons = append(reasons, fmt.Sprintf("首 Token %.2f 秒超过策略上限 %.2f 秒", item.FirstTokenP95.Float64/1000, float64(config.MaxFirstTokenMs)/1000))
+	if item.LatencyState == latencyStateSlow {
+		reasons = append(reasons, policyLatencyReason(item, config))
 	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
 		reasons = append(reasons, "源分组或目标分组倍率缺失")
@@ -571,6 +747,33 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 		reasons = append(reasons, fmt.Sprintf("7 天成功率 %s 低于 %.1f%%，或最近探测成功 %d/%d", actual, config.MinSuccessRate, item.RecentSuccesses, recoverySuccessSamples))
 	}
 	return reasons
+}
+
+func policyLatencyReason(item managedPolicyCandidate, config policyConfig) string {
+	p50 := "暂无"
+	p90 := "暂无"
+	if item.FirstTokenP50.Valid {
+		p50 = fmt.Sprintf("%.2f 秒", item.FirstTokenP50.Float64/1000)
+	}
+	if item.FirstTokenP90.Valid {
+		p90 = fmt.Sprintf("%.2f 秒", item.FirstTokenP90.Float64/1000)
+	}
+	return fmt.Sprintf("真实业务首响持续偏慢：P50 %s、P90 %s，策略上限 %.2f 秒", p50, p90, float64(normalizePolicyConfig(config).MaxFirstTokenMs)/1000)
+}
+
+func policyLatencyObservationReason(item managedPolicyCandidate, config policyConfig) string {
+	if item.LatencyState != latencyStateObserving {
+		return ""
+	}
+	p50 := "暂无"
+	p90 := "暂无"
+	if item.FirstTokenP50.Valid {
+		p50 = fmt.Sprintf("%.2f 秒", item.FirstTokenP50.Float64/1000)
+	}
+	if item.FirstTokenP90.Valid {
+		p90 = fmt.Sprintf("%.2f 秒", item.FirstTokenP90.Float64/1000)
+	}
+	return fmt.Sprintf("首响进入观察期（慢窗口 %d/%d）：P50 %s、P90 %s，先降到常规队列末档", item.LatencyBadSnapshots, latencyBadSnapshotLimit(item, config), p50, p90)
 }
 
 func policyHasAllowedModels(item managedPolicyCandidate, config policyConfig) bool {
