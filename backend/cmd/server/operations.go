@@ -438,27 +438,6 @@ func (a *App) syncTargetAccountPriority(ctx context.Context, targetBase, remoteI
 	return a.syncTargetAccountNumbers(ctx, targetBase, remoteID, session, map[string]int{"priority": priority})
 }
 
-func (a *App) duplicateTargetAccount(ctx context.Context, targetBase, remoteID string, session remoteSession, idempotencyKey string) (string, string, error) {
-	session.IdempotencyKey = idempotencyKey
-	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts/"+remoteID+"/duplicate", session, nil)
-	if err != nil {
-		return "", "", err
-	}
-	data, err := unwrapEnvelope(value, "SUB2API")
-	if err != nil {
-		return "", "", err
-	}
-	record, ok := data.(map[string]any)
-	if !ok {
-		return "", "", &apiError{502, "SCHEMA_CHANGED", "目标节点复制账号响应格式不兼容"}
-	}
-	idNumber, ok := number(record["id"])
-	if !ok || idNumber <= 0 {
-		return "", "", &apiError{502, "SCHEMA_CHANGED", "目标节点复制账号响应缺少账号 ID"}
-	}
-	return strconv.Itoa(int(idNumber)), text(record["name"], ""), nil
-}
-
 func (a *App) updateManagedAccountConcurrency(w http.ResponseWriter, r *http.Request, id string) error {
 	var input struct {
 		Concurrency int `json:"concurrency"`

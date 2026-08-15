@@ -25,6 +25,7 @@ const (
 	latencyGoodSnapshots      = 3
 	latencyRecoveryHold       = 5 * time.Minute
 	priorityChangeCooldown    = 5 * time.Minute
+	fallbackRebuildCooldown   = 15 * time.Minute
 )
 
 const (
@@ -75,6 +76,56 @@ func (a *App) runMaintenance(ctx context.Context) {
 	a.scanDueSources(ctx)
 	a.syncDueTargets(ctx)
 	a.syncDueTargetMetrics(ctx)
+	a.retryRetiredAccountCleanup(ctx)
+}
+
+func (a *App) retryRetiredAccountCleanup(ctx context.Context) {
+	rows, err := a.db.QueryContext(ctx, `SELECT h.target_id,h.remote_id,t.base_url
+		FROM managed_account_remote_history h
+		JOIN targets t ON t.id=h.target_id
+		WHERE h.reason='慢速兜底重建并删除' AND h.deleted_at IS NULL
+			AND (h.cleanup_attempted_at IS NULL OR h.cleanup_attempted_at<now()-interval '15 minutes')
+		ORDER BY h.retired_at LIMIT 20`)
+	if err != nil {
+		log.Printf("读取待清理旧账号失败: %v", err)
+		return
+	}
+	type retiredAccount struct {
+		targetID, remoteID, baseURL string
+	}
+	var pending []retiredAccount
+	for rows.Next() {
+		var item retiredAccount
+		if rows.Scan(&item.targetID, &item.remoteID, &item.baseURL) == nil {
+			pending = append(pending, item)
+		}
+	}
+	_ = rows.Close()
+	for _, item := range pending {
+		cleanupKey := "retired-account-cleanup:" + item.targetID + ":" + item.remoteID
+		requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		target, _, credentialErr := a.targetCredentials(requestCtx, item.targetID)
+		var cleanupErr error
+		if credentialErr != nil {
+			cleanupErr = credentialErr
+		} else if !target.WriteEnabled {
+			cleanupErr = fmt.Errorf("目标节点未开启托管写入")
+		} else {
+			var session remoteSession
+			session, cleanupErr = a.authenticateTarget(requestCtx, target, true)
+			if cleanupErr == nil {
+				cleanupErr = a.deleteRemoteManagedAccountChecked(requestCtx, item.baseURL, session, item.remoteID)
+			}
+		}
+		cancel()
+		if cleanupErr != nil {
+			_, _ = a.db.ExecContext(ctx, `UPDATE managed_account_remote_history SET cleanup_attempted_at=now(),cleanup_error=$3 WHERE target_id=$1 AND remote_id=$2`, item.targetID, item.remoteID, truncate(cleanupErr.Error(), 500))
+			a.openEvent(ctx, "P1", "RETIRED_ACCOUNT_CLEANUP", "旧兜底账号删除失败", cleanupErr.Error(), cleanupKey)
+			continue
+		}
+		_, _ = a.db.ExecContext(ctx, `UPDATE managed_account_remote_history SET deleted_at=now(),cleanup_attempted_at=now(),cleanup_error='' WHERE target_id=$1 AND remote_id=$2`, item.targetID, item.remoteID)
+		a.resolveEvent(ctx, cleanupKey)
+	}
 }
 
 func (a *App) runPolicyEvaluation(ctx context.Context) {
@@ -344,8 +395,8 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 			priority, desired := desiredPriority[item.ID]
 			fallback := plan.Fallback[item.ID]
 			if fallback && !item.FallbackActive {
-				reason := fmt.Sprintf("常规可用渠道仅 %d/%d，复制慢账号为优先级 %d 的末档兜底；旧账号停用并保留历史，强制已有请求重新选路", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
-				a.enqueueManagedAction(ctx, item.ID, "ROTATE_FALLBACK", map[string]any{"schedulable": item.Schedulable, "priority": item.Priority, "remoteId": item.RemoteID}, map[string]any{"schedulable": true, "priority": priority, "fallbackActive": true}, reason)
+				reason := fmt.Sprintf("常规可用渠道仅 %d/%d，重建慢账号为优先级 %d 的末档兜底；新账号就绪后删除旧账号，强制已有请求重新选路", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
+				a.enqueueManagedActionWithCooldown(ctx, item.ID, "RECREATE_FALLBACK", map[string]any{"schedulable": item.Schedulable, "priority": item.Priority, "remoteId": item.RemoteID}, map[string]any{"schedulable": true, "priority": priority, "fallbackActive": true}, reason, fallbackRebuildCooldown)
 				continue
 			}
 			if desired && priority != item.Priority {
@@ -356,7 +407,11 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 				if item.LatencyState == latencyStateObserving {
 					reason = fmt.Sprintf("首响处于观察期，先降到常规队列末档：%s 调整为优先级 %d", item.SourceGroup, priority)
 				}
-				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, map[string]int{"priority": priority}, reason)
+				after := map[string]any{"priority": priority}
+				if item.FallbackActive && !fallback {
+					after["fallbackActive"] = false
+				}
+				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, after, reason)
 				continue
 			}
 			if desired != item.Schedulable {
@@ -390,9 +445,20 @@ func groupNeedsAvailabilityAlert(items []managedPolicyCandidate, config policyCo
 }
 
 func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string, before, after any, reason string) {
+	a.enqueueManagedActionWithCooldown(ctx, managedID, action, before, after, reason, 0)
+}
+
+func (a *App) enqueueManagedActionWithCooldown(ctx context.Context, managedID, action string, before, after any, reason string, cooldown time.Duration) {
 	key := stableKey(managedID, action, jsonValue(before), jsonValue(after))
 	var id string
-	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at) VALUES($1,$2,$3,$4,$5,'APPROVED',$6,now()) ON CONFLICT DO NOTHING RETURNING id`, managedID, action, jsonValue(before), jsonValue(after), reason, key).Scan(&id)
+	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at)
+		SELECT $1,$2,$3,$4,$5,'APPROVED',$6,now()
+		WHERE $7::bigint<=0 OR NOT EXISTS(
+			SELECT 1 FROM action_intents failed
+			WHERE failed.managed_account_id=$1 AND failed.action_type=$2 AND failed.status='FAILED'
+				AND failed.executed_at>now()-($7::bigint * interval '1 millisecond')
+		)
+		ON CONFLICT DO NOTHING RETURNING id`, managedID, action, jsonValue(before), jsonValue(after), reason, key, cooldown.Milliseconds()).Scan(&id)
 	if err == nil {
 		go a.executeAction(context.Background(), id)
 	}

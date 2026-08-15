@@ -302,11 +302,12 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	}
 	var previous map[string]any
 	_ = json.Unmarshal([]byte(before), &previous)
-	if action == "ROTATE_FALLBACK" {
-		err = a.executeFallbackRotation(ctx, id, managedID, targetID, targetBase, remoteID, remoteName, idempotencyKey, session, previous, state)
+	if action == "ROTATE_FALLBACK" || action == "RECREATE_FALLBACK" {
+		err = a.executeFallbackRecreation(ctx, id, managedID, targetID, targetBase, remoteID, remoteName, idempotencyKey, session, previous, state)
 		if err != nil {
 			return a.failAction(ctx, id, err.Error())
 		}
+		a.resolveEvent(ctx, actionFailureEventKey(managedID, action))
 		return nil
 	}
 	requestCtx, cancel := timeoutContext(ctx)
@@ -345,11 +346,104 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 		if priority, ok := number(state["priority"]); ok {
 			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1`, managedID, int(priority))
 		}
+		if fallbackActive, ok := state["fallbackActive"].(bool); ok {
+			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET fallback_active=$2,updated_at=now() WHERE id=$1`, managedID, fallbackActive)
+		}
+		a.resolveEvent(ctx, actionFailureEventKey(managedID, action))
 	}
 	return err
 }
 
-func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, targetID, targetBase, oldRemoteID, oldRemoteName, idempotencyKey string, session remoteSession, previous, state map[string]any) (resultErr error) {
+type fallbackRebuildSpec struct {
+	Source          Source
+	EncryptedKey    []byte
+	SourceGroupName string
+	TargetGroupName string
+	TargetGroupID   int
+	TargetPlatform  string
+	RateMultiplier  float64
+	Concurrency     int
+}
+
+func (a *App) loadFallbackRebuildSpec(ctx context.Context, managedID, targetID, oldRemoteID string) (fallbackRebuildSpec, error) {
+	var spec fallbackRebuildSpec
+	var targetGroupRemoteID string
+	var multiplier sql.NullFloat64
+	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,k.key_cipher,sg.name,
+		tg.name,tg.remote_id,tg.platform,COALESCE(m.rate_multiplier,sg.multiplier),m.concurrency
+		FROM managed_accounts m
+		JOIN channels c ON c.id=m.channel_id
+		JOIN sources s ON s.id=c.source_id
+		JOIN source_keys k ON k.id=c.source_key_id
+		JOIN source_groups sg ON sg.id=c.source_group_id
+		JOIN managed_account_groups mg ON mg.managed_account_id=m.id
+		JOIN target_groups tg ON tg.id=mg.target_group_id AND tg.target_id=m.target_id
+		WHERE m.id=$1 AND m.target_id=$2 AND m.remote_id=$3
+		LIMIT 1`, managedID, targetID, oldRemoteID).Scan(
+		&spec.Source.ID, &spec.Source.Name, &spec.Source.Platform, &spec.Source.BaseURL,
+		&spec.EncryptedKey, &spec.SourceGroupName, &spec.TargetGroupName,
+		&targetGroupRemoteID, &spec.TargetPlatform, &multiplier, &spec.Concurrency,
+	)
+	if err != nil {
+		return spec, fmt.Errorf("读取重建账号配置失败: %w", err)
+	}
+	if !multiplier.Valid || multiplier.Float64 < 0 {
+		return spec, fmt.Errorf("重建账号缺少有效倍率")
+	}
+	spec.RateMultiplier = multiplier.Float64
+	if spec.Concurrency < 1 {
+		spec.Concurrency = 1000
+	}
+	spec.TargetGroupID, err = strconv.Atoi(targetGroupRemoteID)
+	if err != nil {
+		return spec, fmt.Errorf("目标分组 ID 不兼容: %w", err)
+	}
+	return spec, nil
+}
+
+func (a *App) fetchRemoteAccountModelMapping(ctx context.Context, targetBase, remoteID string, session remoteSession) (map[string]string, error) {
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodGet, "/api/v1/admin/accounts/"+remoteID, session, nil)
+	if err != nil {
+		return nil, err
+	}
+	data, err := unwrapEnvelope(value, "SUB2API")
+	if err != nil {
+		return nil, err
+	}
+	account, _ := data.(map[string]any)
+	credentials, _ := account["credentials"].(map[string]any)
+	rawMapping, _ := credentials["model_mapping"].(map[string]any)
+	mapping := make(map[string]string, len(rawMapping))
+	for sourceModel, rawTargetModel := range rawMapping {
+		targetModel, ok := rawTargetModel.(string)
+		if ok && strings.TrimSpace(sourceModel) != "" && strings.TrimSpace(targetModel) != "" {
+			mapping[sourceModel] = targetModel
+		}
+	}
+	if len(mapping) == 0 {
+		return nil, fmt.Errorf("旧账号没有可复用的模型映射")
+	}
+	return mapping, nil
+}
+
+func (a *App) lowerExistingFallbackPriority(ctx context.Context, managedID, targetBase, remoteID string, session remoteSession, priority int) error {
+	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := a.syncTargetAccountPriority(requestCtx, targetBase, remoteID, session, priority); err != nil {
+		return err
+	}
+	_, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1 AND remote_id=$3`, managedID, priority, remoteID)
+	return err
+}
+
+func (a *App) fallbackRecreationError(ctx context.Context, managedID, targetBase, remoteID string, session remoteSession, priority int, cause error) error {
+	if lowerErr := a.lowerExistingFallbackPriority(ctx, managedID, targetBase, remoteID, session, priority); lowerErr == nil {
+		return fmt.Errorf("重建末档兜底账号失败，旧账号已降至优先级 %d: %w", priority, cause)
+	}
+	return fmt.Errorf("重建末档兜底账号失败: %w", cause)
+}
+
+func (a *App) executeFallbackRecreation(ctx context.Context, actionID, managedID, targetID, targetBase, oldRemoteID, oldRemoteName, idempotencyKey string, session remoteSession, previous, state map[string]any) (resultErr error) {
 	priority, ok := number(state["priority"])
 	if !ok {
 		return fmt.Errorf("慢速兜底动作缺少有效优先级")
@@ -357,12 +451,26 @@ func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, 
 	wasSchedulable, _ := previous["schedulable"].(bool)
 	rotationCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	newRemoteID, newRemoteName, err := a.duplicateTargetAccount(rotationCtx, targetBase, oldRemoteID, session, idempotencyKey)
+	spec, err := a.loadFallbackRebuildSpec(rotationCtx, managedID, targetID, oldRemoteID)
 	if err != nil {
-		return err
+		return a.fallbackRecreationError(ctx, managedID, targetBase, oldRemoteID, session, int(priority), err)
 	}
-	if newRemoteName == "" {
-		newRemoteName = oldRemoteName
+	key, err := a.decryptSecret(spec.EncryptedKey)
+	if err != nil {
+		return a.fallbackRecreationError(ctx, managedID, targetBase, oldRemoteID, session, int(priority), fmt.Errorf("读取重建账号密钥失败: %w", err))
+	}
+	modelMapping, err := a.fetchRemoteAccountModelMapping(rotationCtx, targetBase, oldRemoteID, session)
+	if err != nil {
+		return a.fallbackRecreationError(ctx, managedID, targetBase, oldRemoteID, session, int(priority), fmt.Errorf("读取旧账号模型映射失败: %w", err))
+	}
+	sourceAPIBase, err := a.discoverSourceAPIBaseURL(rotationCtx, spec.Source)
+	if err != nil {
+		return a.fallbackRecreationError(ctx, managedID, targetBase, oldRemoteID, session, int(priority), fmt.Errorf("读取源站 API 地址失败: %w", err))
+	}
+	newRemoteName := managedAccountName(spec.Source.Name, spec.SourceGroupName, spec.TargetGroupName, spec.TargetGroupID)
+	newRemoteID, err := a.createRemoteManagedAccountWithMappingIdempotent(rotationCtx, targetBase, session, sourceAPIBase, spec.TargetPlatform, string(key), modelMapping, []int{spec.TargetGroupID}, newRemoteName, spec.RateMultiplier, int(priority), spec.Concurrency, idempotencyKey)
+	if err != nil {
+		return a.fallbackRecreationError(ctx, managedID, targetBase, oldRemoteID, session, int(priority), err)
 	}
 	oldDisabled := false
 	committed := false
@@ -376,6 +484,8 @@ func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, 
 		if oldDisabled && wasSchedulable {
 			_ = a.syncTargetAccountSchedulable(cleanupCtx, targetBase, oldRemoteID, session, true)
 		}
+		_ = a.lowerExistingFallbackPriority(cleanupCtx, managedID, targetBase, oldRemoteID, session, int(priority))
+		_ = a.deleteRemoteManagedAccountChecked(cleanupCtx, targetBase, session, newRemoteID)
 	}()
 	if err = a.syncTargetAccountPriority(rotationCtx, targetBase, newRemoteID, session, int(priority)); err != nil {
 		return err
@@ -395,7 +505,8 @@ func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, 
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_remote_history(managed_account_id,target_id,remote_id,remote_name,reason) VALUES($1,$2,$3,$4,'慢速兜底替换') ON CONFLICT(target_id,remote_id) DO NOTHING`, managedID, targetID, oldRemoteID, oldRemoteName); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_remote_history(managed_account_id,target_id,remote_id,remote_name,reason) VALUES($1,$2,$3,$4,'慢速兜底重建并删除')
+		ON CONFLICT(target_id,remote_id) DO UPDATE SET reason=EXCLUDED.reason,deleted_at=NULL,cleanup_attempted_at=NULL,cleanup_error=''`, managedID, targetID, oldRemoteID, oldRemoteName); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,remote_name=$3,priority=$4,schedulable=true,fallback_active=true,priority_synced_at=now(),sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$5`, managedID, newRemoteID, newRemoteName, int(priority), oldRemoteID)
@@ -413,13 +524,30 @@ func (a *App) executeFallbackRotation(ctx context.Context, actionID, managedID, 
 		return err
 	}
 	committed = true
-	a.audit(ctx, "ROTATE_FALLBACK", "managed_account", managedID, map[string]any{"old_remote_id": oldRemoteID, "new_remote_id": newRemoteID, "priority": int(priority)})
+	cleanupKey := "retired-account-cleanup:" + targetID + ":" + oldRemoteID
+	if err = a.deleteRemoteManagedAccountChecked(rotationCtx, targetBase, session, oldRemoteID); err != nil {
+		_, _ = a.db.ExecContext(ctx, `UPDATE managed_account_remote_history SET cleanup_attempted_at=now(),cleanup_error=$3 WHERE target_id=$1 AND remote_id=$2`, targetID, oldRemoteID, truncate(err.Error(), 500))
+		a.openEvent(ctx, "P1", "RETIRED_ACCOUNT_CLEANUP", "旧兜底账号删除失败", err.Error(), cleanupKey)
+	} else {
+		_, _ = a.db.ExecContext(ctx, `UPDATE managed_account_remote_history SET deleted_at=now(),cleanup_attempted_at=now(),cleanup_error='' WHERE target_id=$1 AND remote_id=$2`, targetID, oldRemoteID)
+		a.resolveEvent(ctx, cleanupKey)
+	}
+	a.audit(ctx, "RECREATE_FALLBACK", "managed_account", managedID, map[string]any{"old_remote_id": oldRemoteID, "new_remote_id": newRemoteID, "priority": int(priority), "old_deleted": err == nil})
 	return nil
 }
 
+func actionFailureEventKey(managedID, action string) string {
+	return "action-failure:" + managedID + ":" + action
+}
+
 func (a *App) failAction(ctx context.Context, id, message string) error {
+	var managedID, action string
+	if err := a.db.QueryRowContext(ctx, `SELECT COALESCE(managed_account_id::text,''),action_type FROM action_intents WHERE id=$1`, id).Scan(&managedID, &action); err != nil {
+		managedID = id
+		action = "UNKNOWN"
+	}
 	_, _ = a.db.ExecContext(ctx, `UPDATE action_intents SET status='FAILED',error=$2,executed_at=now() WHERE id=$1`, id, truncate(message, 500))
-	a.openEvent(ctx, "P0", "ACTION_EXECUTION", "远程动作执行失败", message, "action:"+id)
+	a.openEvent(ctx, "P0", "ACTION_EXECUTION", "远程动作执行失败", message, actionFailureEventKey(managedID, action))
 	return fmt.Errorf("action failed: %s", message)
 }
 

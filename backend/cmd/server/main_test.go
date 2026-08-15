@@ -753,29 +753,78 @@ func TestSyncTargetAccountSchedulableUsesDedicatedEndpoint(t *testing.T) {
 	}
 }
 
-func TestDuplicateTargetAccountUsesStableIdempotencyKey(t *testing.T) {
+func TestCreateFallbackAccountUsesFreshCreateEndpoint(t *testing.T) {
+	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/admin/accounts/42/duplicate" {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts":
+			if r.Header.Get("Idempotency-Key") != "fallback-create" {
+				t.Fatalf("create idempotency key=%q", r.Header.Get("Idempotency-Key"))
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["name"] != "[托管] 源站 / 慢分组 / Pro #22" {
+				t.Fatalf("fresh account name=%v", payload["name"])
+			}
+			if priority, _ := number(payload["priority"]); int(priority) != 900000 {
+				t.Fatalf("priority=%v", payload["priority"])
+			}
+			credentials, _ := payload["credentials"].(map[string]any)
+			mapping, _ := credentials["model_mapping"].(map[string]any)
+			if len(mapping) != 1 || mapping["original-model"] != "original-target" {
+				t.Fatalf("model mapping was not preserved: %#v", mapping)
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":84}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/admin/accounts/84/schedulable":
+			if r.Header.Get("Idempotency-Key") != "" {
+				t.Fatalf("schedulable request reused create idempotency key")
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"id":84}}`))
+		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
-		if r.Header.Get("Idempotency-Key") != "managed/fallback/42" {
-			t.Fatalf("idempotency key=%q", r.Header.Get("Idempotency-Key"))
-		}
-		if r.Header.Get("X-Admin-UI-Request") != "1" {
-			t.Fatal("admin UI request header missing")
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"code":0,"data":{"id":84,"name":"[托管] 慢渠道 - 副本"}}`))
 	}))
 	defer server.Close()
 
 	app := &App{httpClient: server.Client()}
-	id, name, err := app.duplicateTargetAccount(context.Background(), server.URL, "42", remoteSession{}, "managed/fallback/42")
+	id, err := app.createRemoteManagedAccountWithMappingIdempotent(context.Background(), server.URL, remoteSession{}, "https://source.example", "openai", "sk-test", map[string]string{"original-model": "original-target"}, []int{22}, "[托管] 源站 / 慢分组 / Pro #22", .2, 900000, 1000, "fallback-create")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != "84" || name != "[托管] 慢渠道 - 副本" {
-		t.Fatalf("duplicate result id=%q name=%q", id, name)
+	if id != "84" || requests != 2 {
+		t.Fatalf("id=%q requests=%d", id, requests)
+	}
+}
+
+func TestFetchRemoteAccountModelMapping(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/admin/accounts/42" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"credentials":{"model_mapping":{"model-a":"upstream-a","model-b":"upstream-b"}}}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	mapping, err := app.fetchRemoteAccountModelMapping(context.Background(), server.URL, "42", remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mapping) != 2 || mapping["model-a"] != "upstream-a" || mapping["model-b"] != "upstream-b" {
+		t.Fatalf("unexpected model mapping: %#v", mapping)
+	}
+}
+
+func TestActionFailureEventKeyDeduplicatesByManagedAccountAndAction(t *testing.T) {
+	first := actionFailureEventKey("managed-1", "RECREATE_FALLBACK")
+	second := actionFailureEventKey("managed-1", "RECREATE_FALLBACK")
+	if first != second || first != "action-failure:managed-1:RECREATE_FALLBACK" {
+		t.Fatalf("unexpected failure event keys %q %q", first, second)
 	}
 }
 

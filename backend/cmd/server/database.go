@@ -147,7 +147,11 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			target_id UUID NOT NULL REFERENCES targets(id) ON DELETE RESTRICT, remote_id TEXT NOT NULL, remote_name TEXT NOT NULL DEFAULT '',
 			reason TEXT NOT NULL DEFAULT '', retired_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id,remote_id)
 		)`,
+		`ALTER TABLE managed_account_remote_history ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`,
+		`ALTER TABLE managed_account_remote_history ADD COLUMN IF NOT EXISTS cleanup_attempted_at TIMESTAMPTZ`,
+		`ALTER TABLE managed_account_remote_history ADD COLUMN IF NOT EXISTS cleanup_error TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_managed_account_remote_history_managed ON managed_account_remote_history(managed_account_id,retired_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_managed_account_remote_history_cleanup ON managed_account_remote_history(cleanup_attempted_at) WHERE reason='慢速兜底重建并删除' AND deleted_at IS NULL`,
 		`DELETE FROM channels c USING source_keys k,source_groups g WHERE c.source_key_id=k.id AND c.source_group_id=g.id AND k.auto_generated=true AND (SELECT count(*) FROM channels siblings WHERE siblings.source_key_id=k.id)>1 AND strpos(k.name,g.name)=0 AND NOT EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id)`,
 		`CREATE TABLE IF NOT EXISTS managed_account_groups (
 			managed_account_id UUID NOT NULL REFERENCES managed_accounts(id) ON DELETE CASCADE,
@@ -188,12 +192,14 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)`,
 		`ALTER TABLE action_intents DROP CONSTRAINT IF EXISTS action_intents_idempotency_key_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_action_intents_pending_key ON action_intents(idempotency_key) WHERE status IN ('PENDING','APPROVED')`,
+		`CREATE INDEX IF NOT EXISTS idx_action_intents_failed_cooldown ON action_intents(managed_account_id,action_type,executed_at DESC) WHERE status='FAILED'`,
 		`UPDATE action_intents SET status='REJECTED',error='已由自动策略执行替代',executed_at=now() WHERE status='PENDING'`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), severity TEXT NOT NULL, category TEXT NOT NULL, title TEXT NOT NULL,
 			detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'OPEN', dedupe_key TEXT NOT NULL,
 			acknowledged_at TIMESTAMPTZ, resolved_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		`UPDATE events SET status='RESOLVED',resolved_at=COALESCE(resolved_at,now()) WHERE status<>'RESOLVED' AND category='ACTION_EXECUTION' AND dedupe_key LIKE 'action:%'`,
 		`CREATE TABLE IF NOT EXISTS notification_channels (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'EMAIL',
 			config_cipher BYTEA NOT NULL, recipient_hint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE',

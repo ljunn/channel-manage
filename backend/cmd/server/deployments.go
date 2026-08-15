@@ -516,12 +516,22 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 }
 
 func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, rateMultiplier float64, priority, concurrency int) (string, error) {
+	return a.createRemoteManagedAccountIdempotent(ctx, targetBase, targetSession, sourceBase, targetPlatform, key, models, disabledModels, targetGroupIDs, name, rateMultiplier, priority, concurrency, "")
+}
+
+func (a *App) createRemoteManagedAccountIdempotent(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, rateMultiplier float64, priority, concurrency int, idempotencyKey string) (string, error) {
 	modelMap := modelMappingForPolicy(targetPlatform, models, disabledModels)
+	return a.createRemoteManagedAccountWithMappingIdempotent(ctx, targetBase, targetSession, sourceBase, targetPlatform, key, modelMap, targetGroupIDs, name, rateMultiplier, priority, concurrency, idempotencyKey)
+}
+
+func (a *App) createRemoteManagedAccountWithMappingIdempotent(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, modelMap map[string]string, targetGroupIDs []int, name string, rateMultiplier float64, priority, concurrency int, idempotencyKey string) (string, error) {
 	if len(modelMap) == 0 {
-		return "", &apiError{409, "NO_ALLOWED_MODELS", "源渠道在应用分组禁用清单后没有可用模型"}
+		return "", &apiError{409, "NO_ALLOWED_MODELS", "账号没有可复用的模型映射"}
 	}
 	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "rate_multiplier": rateMultiplier, "priority": priority, "concurrency": concurrency, "schedulable": false}
-	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", targetSession, payload)
+	createSession := targetSession
+	createSession.IdempotencyKey = idempotencyKey
+	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", createSession, payload)
 	if err != nil {
 		return "", err
 	}
