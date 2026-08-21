@@ -277,10 +277,14 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 	}
 	defer tx.Rollback()
 	var oldDivisor float64
-	if err = tx.QueryRowContext(r.Context(), `SELECT value_divisor FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&oldDivisor); err == sql.ErrNoRows {
+	var sourceStatus string
+	if err = tx.QueryRowContext(r.Context(), `SELECT value_divisor,status FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&oldDivisor, &sourceStatus); err == sql.ErrNoRows {
 		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 	} else if err != nil {
 		return err
+	}
+	if sourceStatus != "ACTIVE" {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能修改设置"}
 	}
 	scale := oldDivisor / divisor
 	if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET name=$2,recharge_url=$3,value_divisor=$4,scan_interval_seconds=$5,balance=balance*$6,updated_at=now() WHERE id=$1`, id, strings.TrimSpace(input.Name), rechargeURL, divisor, input.ScanIntervalSeconds, scale); err != nil {
@@ -371,7 +375,7 @@ func (a *App) sourceCredentials(ctx context.Context, id string) (Source, sourceC
 }
 
 func (a *App) scanSource(ctx context.Context, id string) error {
-	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='RUNNING',last_error='',updated_at=now() WHERE id=$1 AND scan_status NOT IN ('RUNNING','AUTH_REQUIRED')`, id)
+	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='RUNNING',last_error='',updated_at=now() WHERE id=$1 AND status='ACTIVE' AND scan_status NOT IN ('RUNNING','AUTH_REQUIRED')`, id)
 	if err != nil {
 		return err
 	}
@@ -431,7 +435,7 @@ func sourceAuthenticationActionError(source Source, err error) error {
 }
 
 func (a *App) retrySourceScan(ctx context.Context, id string) error {
-	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='UNKNOWN',last_error='',updated_at=now() WHERE id=$1`, id)
+	result, err := a.db.ExecContext(ctx, `UPDATE sources SET scan_status='UNKNOWN',last_error='',updated_at=now() WHERE id=$1 AND status='ACTIVE'`, id)
 	if err != nil {
 		return err
 	}

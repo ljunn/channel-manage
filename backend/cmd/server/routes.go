@@ -219,6 +219,9 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		if len(parts) == 2 && method == http.MethodPatch {
 			return a.updateSource(w, r, id)
 		}
+		if len(parts) == 3 && parts[2] == "deletion" && method == http.MethodGet {
+			return a.listSourceDeletionJobs(w, r, id)
+		}
 		if len(parts) == 3 && parts[2] == "trust" && method == http.MethodPatch {
 			return a.updateSourceTrust(w, r, id)
 		}
@@ -309,29 +312,6 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 		return a.activatePolicy(w, r, parts[1])
 	}
 	return &apiError{Status: 404, Code: "NOT_FOUND", Message: "接口不存在"}
-}
-
-func (a *App) deleteSource(w http.ResponseWriter, r *http.Request, id string) error {
-	var count int
-	if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=$1`, id).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		return &apiError{409, "SOURCE_IN_USE", "数据源仍有关联托管账号"}
-	}
-	result, err := a.db.ExecContext(r.Context(), `DELETE FROM sources WHERE id=$1`, id)
-	if err != nil {
-		return err
-	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
-		return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
-	}
-	a.resolveEvent(r.Context(), "source-scan:"+id)
-	a.resolveEvent(r.Context(), "source-balance:"+id)
-	a.audit(r.Context(), "DELETE", "source", id, nil)
-	writeData(w, map[string]bool{"deleted": true})
-	return nil
 }
 
 func (a *App) deleteSourceKey(w http.ResponseWriter, r *http.Request, sourceID, keyID string) error {

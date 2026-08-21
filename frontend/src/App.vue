@@ -31,7 +31,7 @@ const sourceOpening = ref(false)
 const sourceTrustBusy = ref(false)
 const sourceSchedulingBusy = ref('')
 const targetGroupsLoading = ref(false)
-const deploymentBusy = ref(false)
+const deploymentBusyKeys = reactive(new Set())
 const deploymentJobs = ref([])
 const policyTargetGroups = ref([])
 const form = reactive({})
@@ -77,8 +77,12 @@ const keptTargetGroups = computed(() => selectedTargetGroups.value.filter(group=
 const selectedSourceHasMapping = computed(() => originalTargetGroupIDs.value.length>0)
 const unconfiguredMappings = computed(() => (form.originalMappings||[]).filter(item=>item.policyActive===false))
 const selectedTarget = computed(() => writableTargets.value.find(item => item.id===form.targetID))
-const activeDeploymentJob = computed(() => deploymentJobs.value.find(item=>item.status==='QUEUED'||item.status==='RUNNING')||null)
-const latestDeploymentJob = computed(() => deploymentJobs.value[0]||null)
+const currentMappingKey = computed(() => `${selectedSource.value}:${selectedSourceGroup.value?.id||''}`)
+const deploymentBusy = computed(() => deploymentBusyKeys.has(currentMappingKey.value))
+const deploymentJobMatchesSelection = item => item.sourceGroupId===selectedSourceGroup.value?.id
+const activeDeploymentJob = computed(() => deploymentJobs.value.find(item=>(item.status==='QUEUED'||item.status==='RUNNING')&&deploymentJobMatchesSelection(item))||null)
+const hasActiveDeploymentJobs = computed(() => deploymentJobs.value.some(item=>item.status==='QUEUED'||item.status==='RUNNING'))
+const latestDeploymentJob = computed(() => deploymentJobs.value.find(deploymentJobMatchesSelection)||null)
 const filtered = items => !search.value ? items : items.filter(item => JSON.stringify(item).toLowerCase().includes(search.value.toLowerCase()))
 const paged = items => filtered(items).slice((page.value-1)*pageSize.value,page.value*pageSize.value)
 const filteredCount = items => filtered(items).length
@@ -212,7 +216,7 @@ async function viewSource(id){
 		Object.assign(form,{sourceGroupIDs:[],targetGroupIDs:[],originalTargetGroupIDs:[],originalMappings:[],targetID:writableTargets.value[0]?.id||'',priority:1000,concurrency:1000})
 		modal.value='source-detail'
 		if(form.targetID)void loadTargetGroups()
-		if(activeDeploymentJob.value)scheduleDeploymentPoll(id)
+		if(hasActiveDeploymentJobs.value)scheduleDeploymentPoll(id)
 	}catch(reason){showError(reason)}finally{sourceOpening.value=false}
 }
 async function createTarget(){await submit(()=>api('/targets',{method:'POST',body:body({name:form.name,baseURL:form.baseURL,username:form.username,password:form.password,writeEnabled:!!form.writeEnabled})}),'目标节点已保存并开始同步')}
@@ -250,23 +254,26 @@ async function deploySourceGroups(){
 	if(!form.targetID){showError(new Error('请选择目标节点'));return}
 	if(!selectedSourceHasMapping.value&&!form.targetGroupIDs?.length){showError(new Error('首次绑定请至少选择一个目标分组'));return}
 	const sourceID=selectedSource.value
-	deploymentBusy.value=true;clearMessages()
+	const sourceGroupID=selectedSourceGroup.value.id
+	const targetID=form.targetID
+	const requestKey=`${sourceID}:${sourceGroupID}`
+	deploymentBusyKeys.add(requestKey);clearMessages()
 	try{
 		if(selectedSourceHasMapping.value){
-			const result=await api(`/sources/${sourceID}/mappings/${selectedSourceGroup.value.id}`,{method:'PUT',timeout:180000,body:body({targetID:form.targetID,targetGroupIDs:form.targetGroupIDs||[]})})
+			const result=await api(`/sources/${sourceID}/mappings/${sourceGroupID}`,{method:'PUT',timeout:180000,body:body({targetID,targetGroupIDs:form.targetGroupIDs||[]})})
 			const detail=await api(`/sources/${sourceID}`)
 			sourceDetail.value=detail
-			const refreshed=detail.groups.find(group=>group.id===selectedSourceGroup.value?.id)
-			if(refreshed)selectSourceGroup(refreshed)
+			const refreshed=detail.groups.find(group=>group.id===sourceGroupID)
+			if(refreshed&&selectedSourceGroup.value?.id===sourceGroupID&&form.targetID===targetID)selectSourceGroup(refreshed)
 			notice.value=result.changed?`绑定已保存：新增 ${result.created} 个，移除 ${result.removed} 个，保留 ${result.kept} 个`:'绑定没有变化'
 			return
 		}
 		const accountCount=form.targetGroupIDs.length
-		const job=await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID:form.targetID,sourceGroupIDs:form.sourceGroupIDs,targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)})})
-		deploymentJobs.value=[{id:job.jobId,status:job.status,progressDone:job.progressDone,progressTotal:job.progressTotal,error:'',result:{}},...deploymentJobs.value]
+		const job=await api(`/sources/${sourceID}/deploy`,{method:'POST',body:body({targetID,sourceGroupIDs:[sourceGroupID],targetGroupIDs:form.targetGroupIDs,priority:Number(form.priority||1000),concurrency:Number(form.concurrency||1000)})})
+		deploymentJobs.value=[{id:job.jobId,targetId:targetID,sourceGroupId:sourceGroupID,status:job.status,progressDone:job.progressDone,progressTotal:job.progressTotal,error:'',result:{}},...deploymentJobs.value]
 		notice.value=`后台任务已提交：将创建 1 个专用 Key 和 ${accountCount} 个独立托管账号`
 		scheduleDeploymentPoll(sourceID)
-	}catch(reason){showError(reason)}finally{deploymentBusy.value=false}
+	}catch(reason){showError(reason)}finally{deploymentBusyKeys.delete(requestKey)}
 }
 function scheduleDeploymentPoll(sourceID){
 	clearTimeout(deploymentPollTimer)
@@ -285,6 +292,7 @@ async function pollDeploymentJobs(sourceID){
 			if(refreshed)selectSourceGroup(refreshed)
 			notice.value=`后台创建完成：${latest.result?.sourceKeysCreated||0} 个专用 Key，${latest.result?.created||0} 个独立托管账号`
 		}else if(latest?.status==='FAILED')showError(new Error(latest.error||'后台创建失败'))
+		if(hasActiveDeploymentJobs.value)scheduleDeploymentPoll(sourceID)
 	}catch(reason){showError(reason);scheduleDeploymentPoll(sourceID)}
 }
 async function openPolicy(){open('policy',{targetID:writableTargets.value[0]?.id||'',targetGroupID:'',probeModel:'',disabledModelsText:'',mode:'PRICE',allowEqualMultiplier:false,minSuccessRate:95,minSamples:5,maxFirstTokenSeconds:10,minAvailableChannels:5,priorityStart:1000,priorityStep:1000});await loadPolicyTargetGroups()}
@@ -301,7 +309,7 @@ async function deactivatePolicy(policy){if(!confirm(`确认停用“${policy.nam
 async function removePolicy(policy){if(!confirm(`确认删除策略“${policy.name}”？历史版本会一并删除，托管账号和渠道不会被删除。`))return;await action(()=>api(`/policies/${policy.id}`,{method:'DELETE'}),'策略已删除')}
 async function simulatePolicy(policy){if(loading.value)return;loading.value=true;clearMessages();try{simulationResult.value={policy,result:await api(`/policies/${policy.id}/simulate`,{method:'POST'})};modal.value='policy-simulation'}catch(reason){showError(reason)}finally{loading.value=false}}
 async function action(run, success){loading.value=true;clearMessages();try{await run();await loadPage();notice.value=success}catch(reason){showError(reason)}finally{loading.value=false}}
-async function remove(path,label){if(!confirm(`确认删除“${label}”？`))return;await action(()=>api(path,{method:'DELETE'}),'已删除')}
+async function remove(path,label){if(!confirm(`确认删除“${label}”？`))return;const sourceDelete=path.startsWith('/sources/');await action(()=>api(path,{method:'DELETE'}),sourceDelete?'数据源删除任务已提交，托管账号清理完成后会自动删除数据源':'已删除')}
 async function channelAct(row,act){const message=act==='probe'?'探测任务已提交':act==='quick-validate'?'快速恢复验证已开始，通过后会立即恢复调度':'渠道状态已更新';await action(()=>api(`/channels/${row.id}/${act}`,{method:'POST'}),message)}
 async function saveSettings(){const payload={};for(const key of ['shadow_mode','emergency_freeze','email_alert_source_balance','email_alert_source_scan','email_alert_target_sync','email_alert_group_availability','email_alert_action_execution','email_alert_platform_sync','email_alert_recovery'])payload[key]=!!data.settings[key];for(const key of ['probe_interval_seconds','scan_interval_seconds','max_daily_probe_cost_usd','min_healthy_channels','confirmation_failures','metric_window_minutes','min_error_samples','error_rate_threshold','balance_alert_work_hours','balance_alert_night_hours','balance_alert_weekend_hours'])payload[key]=Number(data.settings[key]);await action(()=>api('/settings',{method:'PATCH',body:body(payload)}),'系统设置已保存')}
 async function createNotification(){await submit(()=>api('/notification-channels',{method:'POST',body:body({name:form.name,apiKey:form.apiKey,fromEmail:form.fromEmail,toEmail:form.toEmail})}),'通知渠道已保存')}
@@ -367,7 +375,7 @@ async function setSourceScheduling(source, paused){
   }catch(reason){showError(reason)}finally{sourceSchedulingBusy.value=''}
 }
 
-function statusTone(value){if(['ACTIVE','ONLINE','HEALTHY','SUCCESS','EXECUTED','RESOLVED','SYNCED','COMPLETED','NORMAL'].includes(value))return'success';if(['FAILED','OFFLINE','QUARANTINED','CREDENTIAL_BLOCKED','AUTH_REQUIRED','SLOW','P0','P1'].includes(value))return'danger';if(['UNKNOWN','PENDING','QUEUED','RUNNING','VALIDATING','SUSPECT','OBSERVING','ACKNOWLEDGED','DRAFT'].includes(value))return'warning';return'neutral'}
+function statusTone(value){if(['ACTIVE','ONLINE','HEALTHY','SUCCESS','EXECUTED','RESOLVED','SYNCED','COMPLETED','NORMAL'].includes(value))return'success';if(['FAILED','OFFLINE','QUARANTINED','CREDENTIAL_BLOCKED','AUTH_REQUIRED','SLOW','P0','P1'].includes(value))return'danger';if(['UNKNOWN','PENDING','QUEUED','RUNNING','DELETING','VALIDATING','SUSPECT','OBSERVING','ACKNOWLEDGED','DRAFT'].includes(value))return'warning';return'neutral'}
 function stabilityText(value){return {INSUFFICIENT_DATA:'数据不足',STABLE:'稳定',DEGRADED:'有波动',UNSTABLE:'不稳定'}[value]||'数据不足'}
 function stabilityTone(value){return value==='STABLE'?'success':value==='UNSTABLE'?'danger':value==='DEGRADED'?'warning':'neutral'}
 function confidenceText(value){return {LOW:'低置信度',MEDIUM:'中置信度',HIGH:'高置信度'}[value]||'低置信度'}
@@ -375,7 +383,7 @@ function percent(value){return value==null?'暂无':`${Number(value).toFixed(1)}
 function firstResponse(value){if(value==null)return'暂无';const milliseconds=Number(value);return milliseconds<1000?`${Math.round(milliseconds)} ms`:`${(milliseconds/1000).toFixed(1)} 秒`}
 function firstResponseSource(value){return value==='BUSINESS'?'真实业务':value==='PROBE'?'主动探测':'暂无样本'}
 function latencyStateText(value){return {NORMAL:'首响正常',OBSERVING:'观察降权',SLOW:'持续慢'}[value]||'数据不足'}
-function statusText(value){return {UNKNOWN:'待同步',ACTIVE:'启用',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',OBSERVING:'观察中',SLOW:'持续慢',NORMAL:'正常',PENDING:'待审批',QUEUED:'排队中',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',AUTH_REQUIRED:'需要重新认证',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',SUCCESS:'成功',COMPLETED:'已完成',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
+function statusText(value){return {UNKNOWN:'待同步',ACTIVE:'启用',DELETING:'删除中',ONLINE:'在线',OFFLINE:'离线',HEALTHY:'健康',SUSPECT:'待确认',QUARANTINED:'已隔离',MANUAL_HOLD:'人工暂停',DISCOVERED:'待探测',VALIDATING:'验证中',OBSERVING:'观察中',SLOW:'持续慢',NORMAL:'正常',PENDING:'待审批',QUEUED:'排队中',APPROVED:'已批准',REJECTED:'已拒绝',EXECUTED:'已执行',FAILED:'失败',AUTH_REQUIRED:'需要重新认证',OPEN:'待处理',ACKNOWLEDGED:'已确认',RESOLVED:'已恢复',SUCCESS:'成功',COMPLETED:'已完成',RUNNING:'运行中',IDLE:'待命',SYNCED:'已同步',DRAFT:'草稿'}[value]||value||'--'}
 function date(value){return value?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)):'--'}
 function money(value){return value==null?'--':`$${Number(value).toFixed(2)}`}
 function balanceEta(row){if(row.balanceEtaHours==null)return'正在积累消耗样本';const hours=Number(row.balanceEtaHours);if(hours<1)return`预计可用 ${Math.max(1,Math.round(hours*60))} 分钟`;if(hours<48)return`预计可用 ${hours.toFixed(1)} 小时`;return`预计可用 ${(hours/24).toFixed(1)} 天`}
@@ -467,7 +475,7 @@ function minimumRatio(items){const values=items.map(item=>Number(item.multiplier
         <template v-else-if="route==='/sources'">
           <div class="page-head"><div><h1>数据源</h1><span>{{ data.sources.length }} 个平台</span></div><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></div>
           <div v-if="loading" class="table-loading"><span class="spinner"/>正在读取</div><StateBlock v-else-if="!data.sources.length" title="暂无数据源"><button class="btn primary" @click="open('source',{platform:'SUB2API',authMode:'PASSWORD',valueNumerator:1,valueDenominator:1,interval:900})"><Plus :size="16"/>接入数据源</button></StateBlock>
-          <template v-else><div class="source-controls"><label><span>绑定状态</span><select v-model="sourceBindingFilter"><option value="all">全部</option><option value="unbound">未绑定账号</option><option value="partial">部分绑定</option><option value="complete">已全部绑定</option></select></label><label><span>扫描状态</span><select v-model="sourceStatusFilter"><option value="all">全部状态</option><option value="SUCCESS">扫描成功</option><option value="AUTH_REQUIRED">需要重新认证</option><option value="FAILED">扫描失败</option><option value="RUNNING">扫描中</option></select></label><label><span>排序</span><select v-model="sourceSort"><option value="created">最近接入</option><option value="accountsAsc">托管账号少 → 多</option><option value="accountsDesc">托管账号多 → 少</option><option value="balanceDesc">余额高 → 低</option><option value="balanceAsc">余额低 → 高</option><option value="groupsDesc">源分组多 → 少</option></select></label><span class="source-result-count">{{ sourceRows.length }} 个符合条件</span></div><StateBlock v-if="!sourceRows.length" title="没有符合条件的数据源"/><div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>连接</th><th>稳定性</th><th>余额预测</th><th>绑定覆盖</th><th>上次扫描</th><th>操作</th></tr></thead><tbody><tr v-for="row in sourcePagedRows" :key="row.id" :class="{'source-untrusted-row':row.manuallyUntrusted}"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}<small>{{ valueRatio(row.valueDivisor) }}</small></td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.schedulingPaused" class="danger-text">调度已暂停</small><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td class="source-quality-cell"><span v-if="row.manuallyUntrusted" class="badge danger">人工不可信</span><span v-else :class="['badge',stabilityTone(row.stabilityStatus)]">{{ stabilityText(row.stabilityStatus) }}</span><small>业务 {{ percent(row.businessSuccessRate7d) }} · 首响 {{ firstResponse(row.firstTokenP95Ms7d) }}</small><small>{{ row.businessRequests7d||0 }} 个真实请求</small></td><td class="balance-forecast"><strong>{{ money(row.balance) }}</strong><small>{{ row.manuallyUntrusted?'余额提醒已关闭':balanceEta(row) }}</small><small v-if="row.balanceBurnRate!=null&&!row.manuallyUntrusted">消耗 {{ money(row.balanceBurnRate) }} / 小时</small></td><td class="binding-progress"><strong>{{ row.boundGroupCount||0 }} / {{ row.groupCount||0 }} 个源分组</strong><small>{{ row.managedAccountCount||0 }} 个托管账号 · {{ sourceBindingText(row) }}</small></td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="btn small source-binding-button" @click="viewSource(row.id)"><Workflow :size="14"/>{{ row.manuallyUntrusted?'查看绑定':row.managedAccountCount?'管理绑定':'开始绑定' }}</button><button :class="['icon-btn',{danger:!row.schedulingPaused}]" :disabled="sourceSchedulingBusy===row.id||row.manuallyUntrusted" :title="row.manuallyUntrusted?'人工不可信站点已停止调度':row.schedulingPaused?'恢复该站调度':'暂停该站调度'" @click="setSourceScheduling(row,!row.schedulingPaused)"><Play v-if="row.schedulingPaused" :size="16"/><Pause v-else :size="16"/></button><button class="icon-btn" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" title="删除" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div></template>
+          <template v-else><div class="source-controls"><label><span>绑定状态</span><select v-model="sourceBindingFilter"><option value="all">全部</option><option value="unbound">未绑定账号</option><option value="partial">部分绑定</option><option value="complete">已全部绑定</option></select></label><label><span>扫描状态</span><select v-model="sourceStatusFilter"><option value="all">全部状态</option><option value="SUCCESS">扫描成功</option><option value="AUTH_REQUIRED">需要重新认证</option><option value="FAILED">扫描失败</option><option value="RUNNING">扫描中</option></select></label><label><span>排序</span><select v-model="sourceSort"><option value="created">最近接入</option><option value="accountsAsc">托管账号少 → 多</option><option value="accountsDesc">托管账号多 → 少</option><option value="balanceDesc">余额高 → 低</option><option value="balanceAsc">余额低 → 高</option><option value="groupsDesc">源分组多 → 少</option></select></label><span class="source-result-count">{{ sourceRows.length }} 个符合条件</span></div><StateBlock v-if="!sourceRows.length" title="没有符合条件的数据源"/><div v-else class="table-wrap"><table class="has-actions"><thead><tr><th>平台</th><th>类型</th><th>连接</th><th>状态</th><th>稳定性</th><th>余额预测</th><th>绑定覆盖</th><th>上次扫描</th><th>操作</th></tr></thead><tbody><tr v-for="row in sourcePagedRows" :key="row.id" :class="{'source-untrusted-row':row.manuallyUntrusted}"><td><button class="link" @click="viewSource(row.id)"><strong>{{ row.name }}</strong><small>{{ row.baseUrl }}</small></button></td><td>{{ row.platform }}<small>{{ valueRatio(row.valueDivisor) }}</small></td><td><span :class="['badge',statusTone(row.scanStatus)]">{{ statusText(row.scanStatus) }}</span><small v-if="row.schedulingPaused" class="danger-text">调度已暂停</small><small v-if="row.lastError" class="danger-text">{{ row.lastError }}</small></td><td><span :class="['badge',statusTone(row.status)]">{{ statusText(row.status) }}</span></td><td class="source-quality-cell"><span v-if="row.manuallyUntrusted" class="badge danger">人工不可信</span><span v-else :class="['badge',stabilityTone(row.stabilityStatus)]">{{ stabilityText(row.stabilityStatus) }}</span><small>业务 {{ percent(row.businessSuccessRate7d) }} · 首响 {{ firstResponse(row.firstTokenP95Ms7d) }}</small><small>{{ row.businessRequests7d||0 }} 个真实请求</small></td><td class="balance-forecast"><strong>{{ money(row.balance) }}</strong><small>{{ row.manuallyUntrusted?'余额提醒已关闭':balanceEta(row) }}</small><small v-if="row.balanceBurnRate!=null&&!row.manuallyUntrusted">消耗 {{ money(row.balanceBurnRate) }} / 小时</small></td><td class="binding-progress"><strong>{{ row.boundGroupCount||0 }} / {{ row.groupCount||0 }} 个源分组</strong><small>{{ row.managedAccountCount||0 }} 个托管账号 · {{ sourceBindingText(row) }}</small></td><td>{{ date(row.lastScanAt) }}</td><td><div class="row-actions"><button class="btn small source-binding-button" @click="viewSource(row.id)"><Workflow :size="14"/>{{ row.manuallyUntrusted?'查看绑定':row.managedAccountCount?'管理绑定':'开始绑定' }}</button><button :class="['icon-btn',{danger:!row.schedulingPaused}]" :disabled="sourceSchedulingBusy===row.id||row.manuallyUntrusted||row.status==='DELETING'" :title="row.manuallyUntrusted?'人工不可信站点已停止调度':row.status==='DELETING'?'数据源正在删除':row.schedulingPaused?'恢复该站调度':'暂停该站调度'" @click="setSourceScheduling(row,!row.schedulingPaused)"><Play v-if="row.schedulingPaused" :size="16"/><Pause v-else :size="16"/></button><button class="icon-btn" :disabled="row.status==='DELETING'" title="编辑数据源" @click="editSource(row)"><Pencil :size="16"/></button><button class="icon-btn" :disabled="row.status==='DELETING'" title="立即扫描" @click="rescanSource(row)"><RefreshCw :size="16"/></button><button class="icon-btn danger" :title="row.status==='DELETING'?'重试删除数据源':'删除'" @click="remove(`/sources/${row.id}`,row.name)"><Trash2 :size="16"/></button></div></td></tr></tbody></table></div></template>
           <PaginationBar v-if="!loading&&sourceRows.length" v-model:page="page" v-model:page-size="pageSize" :total="sourceRows.length"/>
         </template>
 

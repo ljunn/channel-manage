@@ -167,9 +167,23 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		)`,
 		`UPDATE deployment_jobs SET status='FAILED',error='服务重启中断了后台创建，请重新提交',finished_at=now()
 		WHERE status IN ('QUEUED','RUNNING')`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_deployment_jobs_active_source ON deployment_jobs(source_id)
-		WHERE status IN ('QUEUED','RUNNING')`,
+		`ALTER TABLE deployment_jobs ADD COLUMN IF NOT EXISTS source_group_id UUID REFERENCES source_groups(id) ON DELETE SET NULL`,
+		`DROP INDEX IF EXISTS idx_deployment_jobs_active_source`,
+		`DROP INDEX IF EXISTS idx_deployment_jobs_active_group`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_deployment_jobs_active_group ON deployment_jobs(source_id,source_group_id)
+		WHERE status IN ('QUEUED','RUNNING') AND source_group_id IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_deployment_jobs_source_time ON deployment_jobs(source_id,created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS source_deletion_jobs (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL, source_name TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'QUEUED', progress_done INT NOT NULL DEFAULT 0, progress_total INT NOT NULL DEFAULT 0,
+			result JSONB NOT NULL DEFAULT '{}'::jsonb, error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
+		)`,
+		`UPDATE source_deletion_jobs SET status='FAILED',error='服务重启中断了后台删除，请重新提交',finished_at=now()
+		WHERE status IN ('QUEUED','RUNNING')`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_deletion_jobs_active_source ON source_deletion_jobs(source_id)
+		WHERE status IN ('QUEUED','RUNNING')`,
+		`CREATE INDEX IF NOT EXISTS idx_source_deletion_jobs_source_time ON source_deletion_jobs(source_id,created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS policies (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL, scope_type TEXT NOT NULL DEFAULT 'GLOBAL', scope_id UUID,
 			status TEXT NOT NULL DEFAULT 'DRAFT', active_version INT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

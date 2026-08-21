@@ -6,7 +6,51 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestSourceGroupMappingLocksAllowDifferentGroups(t *testing.T) {
+	app := &App{}
+	firstRelease := make(chan struct{})
+	firstAcquired := make(chan struct{})
+	go func() {
+		unlock := app.lockSourceGroupMapping("source", "group-a")
+		close(firstAcquired)
+		<-firstRelease
+		unlock()
+	}()
+	<-firstAcquired
+
+	differentAcquired := make(chan struct{})
+	go func() {
+		unlock := app.lockSourceGroupMapping("source", "group-b")
+		close(differentAcquired)
+		unlock()
+	}()
+	select {
+	case <-differentAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("different source groups were serialized")
+	}
+
+	sameAcquired := make(chan struct{})
+	go func() {
+		unlock := app.lockSourceGroupMapping("source", "group-a")
+		close(sameAcquired)
+		unlock()
+	}()
+	select {
+	case <-sameAcquired:
+		t.Fatal("same source group was not serialized")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(firstRelease)
+	select {
+	case <-sameAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("same source group did not resume after release")
+	}
+}
 
 func TestMappingDifference(t *testing.T) {
 	current := []existingMappingAccount{

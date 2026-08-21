@@ -73,12 +73,18 @@ func normalizeDeploymentRequest(input *sourceDeploymentRequest) error {
 }
 
 func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceID string) error {
+	a.mappingMu.RLock()
+	defer a.mappingMu.RUnlock()
 	var input sourceDeploymentRequest
 	if err := decodeJSON(r, &input); err != nil {
 		return err
 	}
 	if err := normalizeDeploymentRequest(&input); err != nil {
 		return err
+	}
+	if len(input.SourceGroupIDs) == 1 {
+		unlockGroup := a.lockSourceGroupMapping(sourceID, input.SourceGroupIDs[0])
+		defer unlockGroup()
 	}
 	frozen, _ := a.settingBool(r.Context(), "emergency_freeze")
 	if frozen {
@@ -91,10 +97,13 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	if _, _, err := a.sourceCredentials(r.Context(), sourceID); err != nil {
 		return err
 	}
-	var scanStatus, sourceError string
+	var sourceStatus, scanStatus, sourceError string
 	var manuallyUntrusted bool
-	if err := a.db.QueryRowContext(r.Context(), `SELECT scan_status,last_error,manually_untrusted FROM sources WHERE id=$1`, sourceID).Scan(&scanStatus, &sourceError, &manuallyUntrusted); err != nil {
+	if err := a.db.QueryRowContext(r.Context(), `SELECT status,scan_status,last_error,manually_untrusted FROM sources WHERE id=$1`, sourceID).Scan(&sourceStatus, &scanStatus, &sourceError, &manuallyUntrusted); err != nil {
 		return err
+	}
+	if sourceStatus != "ACTIVE" {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能创建新的托管账号"}
 	}
 	if manuallyUntrusted {
 		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能创建新的托管账号"}
@@ -117,12 +126,22 @@ func (a *App) deploySourceGroups(w http.ResponseWriter, r *http.Request, sourceI
 	}
 
 	jobID := uuid.NewString()
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO deployment_jobs(id,source_id,target_id,request,progress_total) VALUES($1,$2,$3,$4,$5)`, jobID, sourceID, input.TargetID, jsonValue(input), len(input.SourceGroupIDs))
+	var sourceGroupID any
+	if len(input.SourceGroupIDs) == 1 {
+		sourceGroupID = input.SourceGroupIDs[0]
+	}
+	result, err := a.db.ExecContext(r.Context(), `INSERT INTO deployment_jobs(id,source_id,target_id,source_group_id,request,progress_total)
+		SELECT $1,$2,$3,$4,$5,$6 FROM sources WHERE id=$2 AND status='ACTIVE'`, jobID, sourceID, input.TargetID, sourceGroupID, jsonValue(input), len(input.SourceGroupIDs))
 	if err != nil {
-		if strings.Contains(err.Error(), "idx_deployment_jobs_active_source") || strings.Contains(err.Error(), "duplicate key") {
-			return &apiError{409, "DEPLOYMENT_ALREADY_RUNNING", "该数据源已有后台创建任务，请等待完成后再提交"}
+		if strings.Contains(err.Error(), "idx_deployment_jobs_active_group") || strings.Contains(err.Error(), "duplicate key") {
+			return &apiError{409, "DEPLOYMENT_ALREADY_RUNNING", "该源分组已有后台创建任务，请等待完成后再提交"}
 		}
 		return err
+	}
+	if affected, affectedErr := result.RowsAffected(); affectedErr != nil {
+		return affectedErr
+	} else if affected == 0 {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能创建新的托管账号"}
 	}
 	operator, _ := r.Context().Value(userContextKey).(Operator)
 	go a.runDeploymentJob(jobID, sourceID, input, operator)
@@ -151,21 +170,21 @@ func (a *App) runDeploymentJob(jobID, sourceID string, input sourceDeploymentReq
 }
 
 func (a *App) listDeploymentJobs(w http.ResponseWriter, r *http.Request, sourceID string) error {
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,target_id,status,progress_done,progress_total,result,error,created_at,started_at,finished_at FROM deployment_jobs WHERE source_id=$1 ORDER BY created_at DESC LIMIT 20`, sourceID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,target_id,COALESCE(source_group_id::text,''),status,progress_done,progress_total,result,error,created_at,started_at,finished_at FROM deployment_jobs WHERE source_id=$1 ORDER BY created_at DESC LIMIT 20`, sourceID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, targetID, status, result, jobError string
+		var id, targetID, sourceGroupID, status, result, jobError string
 		var done, total int
 		var created time.Time
 		var started, finished sql.NullTime
-		if err = rows.Scan(&id, &targetID, &status, &done, &total, &result, &jobError, &created, &started, &finished); err != nil {
+		if err = rows.Scan(&id, &targetID, &sourceGroupID, &status, &done, &total, &result, &jobError, &created, &started, &finished); err != nil {
 			return err
 		}
-		items = append(items, map[string]any{"id": id, "targetId": targetID, "status": status, "progressDone": done, "progressTotal": total, "result": json.RawMessage(result), "error": jobError, "createdAt": created, "startedAt": nullableTime(started), "finishedAt": nullableTime(finished)})
+		items = append(items, map[string]any{"id": id, "targetId": targetID, "sourceGroupId": sourceGroupID, "status": status, "progressDone": done, "progressTotal": total, "result": json.RawMessage(result), "error": jobError, "createdAt": created, "startedAt": nullableTime(started), "finishedAt": nullableTime(finished)})
 	}
 	writeData(w, items)
 	return rows.Err()
@@ -179,6 +198,9 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 	source, sourceCredential, err := a.sourceCredentials(ctx, sourceID)
 	if err != nil {
 		return nil, err
+	}
+	if source.Status != "ACTIVE" {
+		return nil, &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能创建新的托管账号"}
 	}
 	target, _, err := a.targetCredentials(ctx, input.TargetID)
 	if err != nil {

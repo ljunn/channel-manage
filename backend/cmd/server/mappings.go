@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,6 +32,16 @@ type mappingChannel struct {
 	ID, SourceGroupName, ModelsJSON string
 	EncryptedKey                    []byte
 	SourceMultiplier                float64
+}
+
+func (a *App) lockSourceGroupMapping(sourceID, sourceGroupID string) func() {
+	key := sourceID + "\x00" + sourceGroupID
+	value, _ := a.mappingGroupLocks.LoadOrStore(key, &sync.Mutex{})
+	groupLock := value.(*sync.Mutex)
+	groupLock.Lock()
+	return func() {
+		groupLock.Unlock()
+	}
 }
 
 func mappingDifference(current []existingMappingAccount, desired []deploymentTargetGroup) (kept []existingMappingAccount, removed []existingMappingAccount, added []deploymentTargetGroup) {
@@ -75,22 +86,27 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被人工标记为不可信，不能新增或修改绑定"}
 	}
 
-	a.mappingMu.Lock()
-	defer a.mappingMu.Unlock()
-	a.recoveryMu.Lock()
-	defer a.recoveryMu.Unlock()
+	a.mappingMu.RLock()
+	defer a.mappingMu.RUnlock()
+	unlockMapping := a.lockSourceGroupMapping(sourceID, sourceGroupID)
+	defer unlockMapping()
 
 	var activeJobs int
-	if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM deployment_jobs WHERE source_id=$1 AND status IN ('QUEUED','RUNNING')`, sourceID).Scan(&activeJobs); err != nil {
+	if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM deployment_jobs
+		WHERE source_id=$1 AND status IN ('QUEUED','RUNNING')
+		AND (source_group_id=$2 OR (source_group_id IS NULL AND request->'sourceGroupIDs' ? $2::text))`, sourceID, sourceGroupID).Scan(&activeJobs); err != nil {
 		return err
 	}
 	if activeJobs > 0 {
-		return &apiError{409, "DEPLOYMENT_ALREADY_RUNNING", "该数据源正在创建绑定，请等待完成后再修改"}
+		return &apiError{409, "DEPLOYMENT_ALREADY_RUNNING", "该源分组正在创建绑定，请等待完成后再修改"}
 	}
 
 	source, _, err := a.sourceCredentials(r.Context(), sourceID)
 	if err != nil {
 		return err
+	}
+	if source.Status != "ACTIVE" {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能修改绑定"}
 	}
 	target, _, err := a.targetCredentials(r.Context(), input.TargetID)
 	if err != nil {

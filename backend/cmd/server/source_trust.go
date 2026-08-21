@@ -19,13 +19,16 @@ func (a *App) updateSourceTrust(w http.ResponseWriter, r *http.Request, id strin
 		return err
 	}
 	defer tx.Rollback()
-	var name string
+	var name, sourceStatus string
 	var current bool
-	if err = tx.QueryRowContext(r.Context(), `SELECT name,manually_untrusted FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&name, &current); err != nil {
+	if err = tx.QueryRowContext(r.Context(), `SELECT name,status,manually_untrusted FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&name, &sourceStatus, &current); err != nil {
 		if err == sql.ErrNoRows {
 			return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 		}
 		return err
+	}
+	if sourceStatus != "ACTIVE" {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能修改信任状态"}
 	}
 	if current == input.ManuallyUntrusted {
 		_ = tx.Rollback()
@@ -97,13 +100,16 @@ func (a *App) updateSourceScheduling(w http.ResponseWriter, r *http.Request, id 
 		return err
 	}
 	defer tx.Rollback()
-	var name string
+	var name, sourceStatus string
 	var current, manuallyUntrusted bool
-	if err = tx.QueryRowContext(r.Context(), `SELECT name,scheduling_paused,manually_untrusted FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&name, &current, &manuallyUntrusted); err != nil {
+	if err = tx.QueryRowContext(r.Context(), `SELECT name,status,scheduling_paused,manually_untrusted FROM sources WHERE id=$1 FOR UPDATE`, id).Scan(&name, &sourceStatus, &current, &manuallyUntrusted); err != nil {
 		if err == sql.ErrNoRows {
 			return &apiError{404, "SOURCE_NOT_FOUND", "数据源不存在"}
 		}
 		return err
+	}
+	if sourceStatus != "ACTIVE" {
+		return &apiError{409, "SOURCE_DELETING", "该数据源正在删除，不能修改调度状态"}
 	}
 	if !input.Paused && manuallyUntrusted {
 		return &apiError{409, "SOURCE_UNTRUSTED", "该数据源已被标记为不可信，取消不可信标记后才能恢复调度"}
