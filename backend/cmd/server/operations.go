@@ -352,22 +352,25 @@ func insufficientBalanceError(err error) bool {
 }
 
 func (a *App) listManagedAccounts(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,COALESCE(sg.name,''),sg.multiplier,m.rate_multiplier,m.remote_id,m.remote_name,m.platform,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name,'platform',tg.platform)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name,sg.name,sg.multiplier ORDER BY m.created_at DESC`)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.target_id,t.name,m.channel_id,s.name,k.name,COALESCE(sg.name,''),sg.multiplier,m.rate_multiplier,m.remote_id,m.remote_name,m.platform,m.priority,m.concurrency,m.schedulable,m.sync_status,m.last_error,m.cache_state,m.cache_score,m.cache_samples,m.cache_input_tokens,m.cache_read_tokens,m.cache_metric_source,m.cache_metric_model,m.cache_metric_request_type,m.cache_metric_at,m.cache_penalty_active,m.created_at,COALESCE(json_agg(json_build_object('id',tg.remote_id,'name',tg.name,'platform',tg.platform)) FILTER (WHERE tg.id IS NOT NULL),'[]') FROM managed_accounts m JOIN targets t ON t.id=m.target_id JOIN channels c ON c.id=m.channel_id JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id GROUP BY m.id,t.name,s.name,k.name,sg.name,sg.multiplier ORDER BY m.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, targetID, targetName, channelID, sourceName, keyName, sourceGroupName, remoteID, remoteName, platform, status, lastError, groups string
-		var sourceMultiplier, rateMultiplier sql.NullFloat64
-		var priority, concurrency int
+		var id, targetID, targetName, channelID, sourceName, keyName, sourceGroupName, remoteID, remoteName, platform, status, lastError, cacheState, cacheSource, cacheModel, cacheRequestType, groups string
+		var sourceMultiplier, rateMultiplier, cacheScore sql.NullFloat64
+		var priority, concurrency, cacheSamples int
+		var cacheInputTokens, cacheReadTokens int64
+		var cacheMetricAt sql.NullTime
 		var schedulable bool
+		var cachePenaltyActive bool
 		var created time.Time
-		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &sourceGroupName, &sourceMultiplier, &rateMultiplier, &remoteID, &remoteName, &platform, &priority, &concurrency, &schedulable, &status, &lastError, &created, &groups); err != nil {
+		if err := rows.Scan(&id, &targetID, &targetName, &channelID, &sourceName, &keyName, &sourceGroupName, &sourceMultiplier, &rateMultiplier, &remoteID, &remoteName, &platform, &priority, &concurrency, &schedulable, &status, &lastError, &cacheState, &cacheScore, &cacheSamples, &cacheInputTokens, &cacheReadTokens, &cacheSource, &cacheModel, &cacheRequestType, &cacheMetricAt, &cachePenaltyActive, &created, &groups); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "sourceGroupName": sourceGroupName, "sourceMultiplier": nullableFloat(sourceMultiplier), "rateMultiplier": nullableFloat(rateMultiplier), "remoteId": remoteID, "remoteName": remoteName, "platform": platform, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "targetGroups": json.RawMessage(groups), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "targetId": targetID, "targetName": targetName, "channelId": channelID, "sourceName": sourceName, "keyName": keyName, "sourceGroupName": sourceGroupName, "sourceMultiplier": nullableFloat(sourceMultiplier), "rateMultiplier": nullableFloat(rateMultiplier), "remoteId": remoteID, "remoteName": remoteName, "platform": platform, "priority": priority, "concurrency": concurrency, "schedulable": schedulable, "syncStatus": status, "lastError": lastError, "cacheState": cacheState, "cacheScore": nullableFloat(cacheScore), "cacheSamples": cacheSamples, "cacheInputTokens": cacheInputTokens, "cacheReadTokens": cacheReadTokens, "cacheMetricSource": cacheSource, "cacheMetricModel": cacheModel, "cacheMetricRequestType": cacheRequestType, "cacheMetricAt": nullableTime(cacheMetricAt), "cachePenaltyActive": cachePenaltyActive, "targetGroups": json.RawMessage(groups), "createdAt": created})
 	}
 	return items, rows.Err()
 }

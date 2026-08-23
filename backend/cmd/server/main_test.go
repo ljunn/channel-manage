@@ -848,6 +848,165 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	}
 }
 
+func TestExtractCacheUsageUsesNormalizedAdminFields(t *testing.T) {
+	usage, ok := extractCacheUsage(map[string]any{"input_tokens": 2000, "cache_read_tokens": 1200, "cache_creation_tokens": 400})
+	if !ok || usage.InputTokens != 2000 || usage.CacheReadTokens != 1200 || usage.CacheCreationTokens != 400 {
+		t.Fatalf("unexpected normalized cache usage: %#v, ok=%v", usage, ok)
+	}
+	if _, ok := extractCacheUsage(map[string]any{"input_tokens": 1000, "cache_read_tokens": 700}); ok {
+		t.Fatal("usage without all normalized cache fields must remain unknown")
+	}
+}
+
+func TestCacheReadRatioIncludesAllNormalizedInputClasses(t *testing.T) {
+	score, total, ok := cacheReadRatio(400, 100, 500)
+	if !ok || total != 1000 || score != .5 {
+		t.Fatalf("score=%v total=%d ok=%v, want .5 over 1000 tokens", score, total, ok)
+	}
+}
+
+func TestManagedCacheStateNeedsDistinctWindowsAndBothGaps(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{CacheMode: cacheModeDeprioritize, CacheMinRequests: 10, CacheMinInputTokens: 100, CacheAbsoluteGap: .10, CacheRelativeGap: .25})
+	now := time.Now().Truncate(cacheMetricWindow)
+	candidate := managedPolicyCandidate{CacheState: cacheStateNormal, CacheScore: sql.NullFloat64{Float64: .20, Valid: true}, CacheSamples: 10, CacheInputTokens: 100, CacheMetricSource: "TARGET_USAGE", CacheMetricAt: sql.NullTime{Time: now, Valid: true}, CacheStateChangedAt: sql.NullTime{Time: now.Add(-time.Hour), Valid: true}}
+	for index := 0; index < config.CacheBadSnapshots; index++ {
+		candidate.CacheMetricAt = sql.NullTime{Time: now.Add(time.Duration(index) * cacheMetricWindow), Valid: true}
+		updated, changed := nextManagedCacheState(candidate, config, .50, true, now.Add(time.Duration(index)*cacheMetricWindow))
+		if !changed || updated.CacheState != cacheStateObserving {
+			if index != config.CacheBadSnapshots-1 || updated.CacheState != cacheStateLow || !updated.CachePenaltyActive {
+				t.Fatalf("snapshot %d should advance cache degradation: %#v changed=%v", index, updated, changed)
+			}
+		}
+		candidate = updated
+	}
+	if candidate.CacheState != cacheStateLow || !candidate.CachePenaltyActive {
+		t.Fatalf("cache degradation should require configured confirmations: %#v", candidate)
+	}
+	duplicate, changed := nextManagedCacheState(candidate, config, .50, true, now.Add(11*time.Minute))
+	if changed || duplicate.CacheBadSnapshots != candidate.CacheBadSnapshots {
+		t.Fatalf("the same metric window must not be counted twice: %#v changed=%v", duplicate, changed)
+	}
+	for _, test := range []struct {
+		score, reference float64
+	}{{score: .38, reference: .50}, {score: .14, reference: .20}} {
+		nearThreshold := candidate
+		nearThreshold.CachePenaltyActive = false
+		nearThreshold.CacheState = cacheStateNormal
+		nearThreshold.CacheBadSnapshots = 0
+		nearThreshold.CacheEvaluatedAt = sql.NullTime{}
+		nearThreshold.CacheMetricAt = sql.NullTime{Time: now.Add(time.Hour), Valid: true}
+		nearThreshold.CacheScore = sql.NullFloat64{Float64: test.score, Valid: true}
+		updated, _ := nextManagedCacheState(nearThreshold, config, test.reference, true, now.Add(time.Hour))
+		if updated.CacheState != cacheStateObserving || updated.CacheBadSnapshots != 0 {
+			t.Fatalf("only one threshold must not count as low cache: %#v", updated)
+		}
+	}
+}
+
+func TestRankManagedAccountsPutsLowCacheAfterNormal(t *testing.T) {
+	normal := eligiblePolicyCandidate("normal-cache", .2, 1000)
+	low := eligiblePolicyCandidate("low-cache", .2, 1100)
+	observing := eligiblePolicyCandidate("observing-cache", .2, 1200)
+	observing.LatencyState = latencyStateObserving
+	observing.CacheState = cacheStateLow
+	low.CacheState = cacheStateLow
+	low.CachePenaltyActive = true
+	low.CacheScore = sql.NullFloat64{Float64: .10, Valid: true}
+	low.CacheSamples = 50
+	low.CacheInputTokens = 50000
+	low.CacheMetricSource = "TARGET_USAGE"
+	config := policyConfig{Mode: "PRICE", CacheMode: cacheModeDeprioritize, MinSuccessRate: 95, MinSamples: 5}
+	priorities := planManagedAccountsAt([]managedPolicyCandidate{low, observing, normal}, config, time.Date(2026, 8, 23, 5, 30, 0, 0, time.UTC)).Priorities
+	if priorities["normal-cache"] != 1000 || priorities["observing-cache"] < observingPriorityStart || priorities["low-cache"] < cacheDeprioritizedStart {
+		t.Fatalf("low cache account was not placed in deprioritized band: %#v", priorities)
+	}
+}
+
+func TestCacheReferenceUsesSameCohortAndLeavesCandidateOut(t *testing.T) {
+	now := time.Now().Truncate(cacheMetricWindow)
+	config := normalizePolicyConfig(policyConfig{CacheMode: cacheModeObserve, CacheMinRequests: 10, CacheMinInputTokens: 100})
+	candidate := managedPolicyCandidate{ID: "candidate", CacheMetricModel: "model-a", CacheMetricRequestType: "stream", CacheMetricAt: sql.NullTime{Time: now, Valid: true}}
+	items := []managedPolicyCandidate{candidate}
+	for index, score := range []float64{.40, .50, .60} {
+		items = append(items, managedPolicyCandidate{ID: fmt.Sprintf("peer-%d", index), CacheMetricModel: "model-a", CacheMetricRequestType: "stream", CacheScore: sql.NullFloat64{Float64: score, Valid: true}, CacheSamples: 10, CacheInputTokens: 100, CacheMetricSource: "TARGET_USAGE", CacheMetricAt: sql.NullTime{Time: now, Valid: true}})
+	}
+	items = append(items, managedPolicyCandidate{ID: "wrong-model", CacheMetricModel: "model-b", CacheMetricRequestType: "stream", CacheScore: sql.NullFloat64{Float64: .01, Valid: true}, CacheSamples: 10, CacheInputTokens: 100, CacheMetricSource: "TARGET_USAGE", CacheMetricAt: sql.NullTime{Time: now, Valid: true}})
+	reference, ok := cacheReferenceScore(candidate, items, config, now)
+	if !ok || reference != .50 {
+		t.Fatalf("reference=%v ok=%v, want leave-one-out cohort median .50", reference, ok)
+	}
+	if _, ok := cacheReferenceScore(candidate, items[:3], config, now); ok {
+		t.Fatal("fewer than three comparable peers must not produce an automatic baseline")
+	}
+}
+
+func TestCacheStaleEvidencePreservesPenalty(t *testing.T) {
+	now := time.Now()
+	config := normalizePolicyConfig(policyConfig{CacheMode: cacheModeDeprioritize, CacheMinRequests: 10, CacheMinInputTokens: 100})
+	candidate := managedPolicyCandidate{CacheState: cacheStateLow, CachePenaltyActive: true, CacheScore: sql.NullFloat64{Float64: .1, Valid: true}, CacheSamples: 10, CacheInputTokens: 100, CacheMetricSource: "TARGET_USAGE", CacheMetricAt: sql.NullTime{Time: now.Add(-time.Hour), Valid: true}, CacheEvaluatedAt: sql.NullTime{Time: now.Add(-time.Hour), Valid: true}, CacheBadSnapshots: 3, CachePenalizedAt: sql.NullTime{Time: now.Add(-time.Hour), Valid: true}}
+	updated, changed := nextManagedCacheState(candidate, config, 0, false, now)
+	if !changed || updated.CacheState != cacheStateStale || !updated.CachePenaltyActive || updated.CacheBadSnapshots != 3 {
+		t.Fatalf("stale evidence must preserve an active penalty: %#v changed=%v", updated, changed)
+	}
+}
+
+func TestCacheRecoveryRequiresNewWindowsAndHold(t *testing.T) {
+	now := time.Now().Truncate(cacheMetricWindow)
+	config := normalizePolicyConfig(policyConfig{CacheMode: cacheModeDeprioritize, CacheMinRequests: 10, CacheMinInputTokens: 100, CacheGoodSnapshots: 3})
+	candidate := managedPolicyCandidate{CacheState: cacheStateLow, CachePenaltyActive: true, CacheScore: sql.NullFloat64{Float64: .50, Valid: true}, CacheSamples: 10, CacheInputTokens: 100, CacheMetricSource: "TARGET_USAGE", CachePenalizedAt: sql.NullTime{Time: now.Add(-cacheStateRecoveryHold), Valid: true}}
+	for index := 0; index < config.CacheGoodSnapshots; index++ {
+		candidate.CacheMetricAt = sql.NullTime{Time: now.Add(time.Duration(index) * cacheMetricWindow), Valid: true}
+		candidate, _ = nextManagedCacheState(candidate, config, .50, true, now.Add(time.Duration(index)*cacheMetricWindow))
+	}
+	if candidate.CachePenaltyActive || candidate.CacheState != cacheStateNormal {
+		t.Fatalf("three positive windows after the hold should recover: %#v", candidate)
+	}
+}
+
+func TestCacheExplorationRotatesOnePenalizedAccount(t *testing.T) {
+	config := normalizePolicyConfig(policyConfig{CacheMode: cacheModeDeprioritize})
+	normal := eligiblePolicyCandidate("normal", .2, 1000)
+	lowA := eligiblePolicyCandidate("low-a", .2, 2000)
+	lowB := eligiblePolicyCandidate("low-b", .2, 3000)
+	lowA.CachePenaltyActive, lowB.CachePenaltyActive = true, true
+	plan := planManagedAccountsAt([]managedPolicyCandidate{normal, lowA, lowB}, config, time.Date(2026, 8, 23, 4, 2, 0, 0, time.UTC))
+	if len(plan.Exploration) != 1 {
+		t.Fatalf("expected exactly one exploration account: %#v", plan.Exploration)
+	}
+	for id := range plan.Exploration {
+		if plan.Priorities[id] != config.PriorityStart {
+			t.Fatalf("exploration account priority=%d, want %d", plan.Priorities[id], config.PriorityStart)
+		}
+	}
+	outside := planManagedAccountsAt([]managedPolicyCandidate{normal, lowA, lowB}, config, time.Date(2026, 8, 23, 4, 30, 0, 0, time.UTC))
+	if len(outside.Exploration) != 0 || outside.Priorities["low-a"] < cacheDeprioritizedStart || outside.Priorities["low-b"] < cacheDeprioritizedStart {
+		t.Fatalf("penalized accounts must stay in their band outside exploration: %#v", outside)
+	}
+}
+
+func TestFetchRecentUsageRecordsStopsAtCutoff(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	now := time.Date(2026, 8, 23, 5, 10, 0, 0, time.UTC)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/admin/usage" || r.URL.Query().Get("account_id") != "42" || r.URL.Query().Get("page_size") != "100" {
+			t.Fatalf("unexpected usage request: %s", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"items":[{"account_id":42,"created_at":"2026-08-23T05:08:00Z","input_tokens":100,"cache_creation_tokens":10,"cache_read_tokens":90},{"account_id":42,"created_at":"2026-08-23T05:00:00Z","input_tokens":100,"cache_creation_tokens":0,"cache_read_tokens":0}],"pages":9}}`))
+	}))
+	defer server.Close()
+	app := &App{httpClient: newRemoteHTTPClient()}
+	items, err := app.fetchRecentUsageRecords(context.Background(), server.URL, "42", now.Add(-cacheMetricWindow), now, remoteSession{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || len(items) != 1 {
+		t.Fatalf("requests=%d items=%d, want one bounded page and one recent record", requests, len(items))
+	}
+}
+
 func TestPolicyRecoveryAcceptsThreeRecentSuccesses(t *testing.T) {
 	config := normalizePolicyConfig(policyConfig{MinSuccessRate: 95, MinSamples: 10})
 	recovering := managedPolicyCandidate{

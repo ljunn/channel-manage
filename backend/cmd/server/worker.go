@@ -24,6 +24,8 @@ const (
 	latencyBadSnapshots       = 2
 	latencyGoodSnapshots      = 3
 	latencyRecoveryHold       = 5 * time.Minute
+	cacheMetricFreshness      = 10 * time.Minute
+	cacheStateRecoveryHold    = 15 * time.Minute
 	priorityChangeCooldown    = 5 * time.Minute
 	fallbackRebuildCooldown   = 15 * time.Minute
 )
@@ -32,6 +34,18 @@ const (
 	latencyStateNormal    = "NORMAL"
 	latencyStateObserving = "OBSERVING"
 	latencyStateSlow      = "SLOW"
+)
+
+const (
+	cacheStateUnknown       = "UNKNOWN"
+	cacheStateWarming       = "WARMING"
+	cacheStateNormal        = "NORMAL"
+	cacheStateObserving     = "OBSERVING"
+	cacheStateLow           = "LOW"
+	cacheStateStale         = "STALE"
+	cacheDeprioritizedStart = 500_000
+	cacheMinimumPeers       = 3
+	cacheExplorationMinutes = 5
 )
 
 func (a *App) runScheduler(ctx context.Context) {
@@ -382,6 +396,10 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		groupItems, err = a.advanceManagedCacheStates(ctx, groupItems, policy.Config, time.Now())
+		if err != nil {
+			return err
+		}
 		plan := planManagedAccounts(groupItems, policy.Config)
 		desiredPriority := plan.Priorities
 		if len(groupItems) > 0 && len(desiredPriority) == 0 && groupNeedsAvailabilityAlert(groupItems, policy.Config) {
@@ -406,6 +424,10 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 				reason := fmt.Sprintf("%s策略自动排序：%s 调整为优先级 %d", policyModeText(policy.Config.Mode), item.SourceGroup, priority)
 				if item.LatencyState == latencyStateObserving {
 					reason = fmt.Sprintf("首响处于观察期，先降到常规队列末档：%s 调整为优先级 %d", item.SourceGroup, priority)
+				} else if plan.Exploration[item.ID] {
+					reason = fmt.Sprintf("缓存降权账号进入每小时探测窗口，临时获得少量真实流量：%s 调整为优先级 %d", item.SourceGroup, priority)
+				} else if policy.Config.CacheMode == cacheModeDeprioritize && item.CachePenaltyActive {
+					reason = fmt.Sprintf("缓存表现低于同目标分组基准，降到缓存降权队列：%s 调整为优先级 %d", policyCacheReason(item, policy.Config), priority)
 				}
 				after := map[string]any{"priority": priority}
 				if item.FallbackActive && !fallback {
@@ -468,20 +490,27 @@ type managedPolicyCandidate struct {
 	ID, ChannelID, TargetGroupID, RemoteID, RemoteName, SourceName, TargetName string
 	State, StateReason, SourceGroup, TargetGroup, SyncStatus                   string
 	LatencyState                                                               string
+	CacheState                                                                 string
 	Platform, ModelsJSON, SpeedMetricModel                                     string
 	SpeedMetricSource                                                          string
+	CacheMetricSource, CacheMetricModel, CacheMetricRequestType                string
 	Schedulable                                                                bool
 	FallbackActive                                                             bool
+	CachePenaltyActive                                                         bool
 	SourceUntrusted                                                            bool
 	SourcePaused                                                               bool
 	Priority                                                                   int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50             sql.NullFloat64
 	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                   sql.NullFloat64
+	CacheScore                                                                 sql.NullFloat64
 	ProbeFirstTokenP95, LatestProbeFirstToken                                  sql.NullFloat64
 	BusinessLatencyAt, LatestProbeAt, LatencyEvaluatedAt                       sql.NullTime
 	LatencyStateChangedAt, PrioritySyncedAt                                    sql.NullTime
+	CacheMetricAt, CacheEvaluatedAt, CacheStateChangedAt, CachePenalizedAt     sql.NullTime
 	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures           int
 	SpeedMetricSamples, LatencyBadSnapshots, LatencyGoodSnapshots              int
+	CacheSamples, CacheBadSnapshots, CacheGoodSnapshots                        int
+	CacheInputTokens, CacheReadTokens                                          int64
 	ConfirmationFailures                                                       int
 }
 
@@ -492,6 +521,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		m.business_first_token_ms,m.business_first_token_p90_ms,m.business_latency_samples,m.business_latency_at,m.business_latency_model,
+			m.cache_state,m.cache_score,m.cache_samples,m.cache_input_tokens,m.cache_read_tokens,m.cache_metric_source,m.cache_metric_model,m.cache_metric_request_type,m.cache_metric_at,m.cache_bad_snapshots,m.cache_good_snapshots,m.cache_evaluated_at,m.cache_state_changed_at,m.cache_penalty_active,m.cache_penalized_at,
 		m.latency_state,m.latency_bad_snapshots,m.latency_good_snapshots,m.latency_evaluated_at,m.latency_state_changed_at,m.priority_synced_at,
 		(SELECT p.first_token_ms FROM probe_runs p WHERE p.channel_id=c.id AND p.first_token_ms IS NOT NULL ORDER BY p.started_at DESC LIMIT 1),
 		(SELECT p.started_at FROM probe_runs p WHERE p.channel_id=c.id AND p.first_token_ms IS NOT NULL ORDER BY p.started_at DESC LIMIT 1),
@@ -514,7 +544,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP50, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -527,6 +557,9 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 		}
 		if item.LatencyState == "" {
 			item.LatencyState = latencyStateNormal
+		}
+		if item.CacheState == "" {
+			item.CacheState = cacheStateUnknown
 		}
 		item.ConfirmationFailures = confirmationFailures
 		items = append(items, item)
@@ -560,6 +593,131 @@ func (a *App) advanceManagedLatencyStates(ctx context.Context, items []managedPo
 		items[index] = updated
 	}
 	return items, nil
+}
+
+func (a *App) advanceManagedCacheStates(ctx context.Context, items []managedPolicyCandidate, config policyConfig, now time.Time) ([]managedPolicyCandidate, error) {
+	config = normalizePolicyConfig(config)
+	if config.CacheMode == cacheModeOff {
+		return items, nil
+	}
+	for index := range items {
+		reference, hasReference := cacheReferenceScore(items[index], items, config, now)
+		updated, changed := nextManagedCacheState(items[index], config, reference, hasReference, now)
+		if !changed {
+			continue
+		}
+		_, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET cache_state=$2,cache_bad_snapshots=$3,cache_good_snapshots=$4,cache_evaluated_at=$5,cache_state_changed_at=$6,cache_penalty_active=$7,cache_penalized_at=$8,updated_at=now() WHERE id=$1`, updated.ID, updated.CacheState, updated.CacheBadSnapshots, updated.CacheGoodSnapshots, updated.CacheEvaluatedAt, updated.CacheStateChangedAt, updated.CachePenaltyActive, updated.CachePenalizedAt)
+		if err != nil {
+			return items, err
+		}
+		items[index] = updated
+	}
+	return items, nil
+}
+
+func cacheReferenceScore(candidate managedPolicyCandidate, items []managedPolicyCandidate, config policyConfig, now time.Time) (float64, bool) {
+	values := []float64{}
+	for _, item := range items {
+		if item.ID != candidate.ID && item.CacheMetricModel == candidate.CacheMetricModel && item.CacheMetricRequestType == candidate.CacheMetricRequestType && item.CacheMetricAt.Valid && candidate.CacheMetricAt.Valid && item.CacheMetricAt.Time.Equal(candidate.CacheMetricAt.Time) && cacheEvidence(item, config, now) {
+			values = append(values, item.CacheScore.Float64)
+		}
+	}
+	if len(values) < cacheMinimumPeers {
+		return 0, false
+	}
+	return medianFloat(values), true
+}
+
+func medianFloat(values []float64) float64 {
+	sort.Float64s(values)
+	middle := len(values) / 2
+	if len(values)%2 == 1 {
+		return values[middle]
+	}
+	return (values[middle-1] + values[middle]) / 2
+}
+
+func cacheEvidence(item managedPolicyCandidate, config policyConfig, now time.Time) bool {
+	config = normalizePolicyConfig(config)
+	metricAge := now.Sub(item.CacheMetricAt.Time)
+	return item.CacheScore.Valid && item.CacheMetricSource != "" && item.CacheMetricSource != "UNKNOWN" && item.CacheMetricAt.Valid && metricAge >= -time.Minute && metricAge <= cacheMetricFreshness && item.CacheSamples >= config.CacheMinRequests && item.CacheInputTokens >= config.CacheMinInputTokens
+}
+
+func nextManagedCacheState(item managedPolicyCandidate, config policyConfig, reference float64, hasReference bool, now time.Time) (managedPolicyCandidate, bool) {
+	config = normalizePolicyConfig(config)
+	if item.CacheState == "" {
+		item.CacheState = cacheStateUnknown
+	}
+	before := item
+	if config.CacheMode != cacheModeDeprioritize {
+		item.CachePenaltyActive = false
+		item.CachePenalizedAt = sql.NullTime{}
+	}
+	if !cacheEvidence(item, config, now) || !hasReference {
+		if item.CacheEvaluatedAt.Valid || item.CachePenaltyActive {
+			item.CacheState = cacheStateStale
+		} else {
+			item.CacheState = cacheStateWarming
+		}
+	} else if item.CacheEvaluatedAt.Valid && !item.CacheMetricAt.Time.After(item.CacheEvaluatedAt.Time) {
+		return item, item.CachePenaltyActive != before.CachePenaltyActive
+	} else {
+		absoluteGap := reference - item.CacheScore.Float64
+		relativeGap := 0.0
+		if reference > 0 {
+			relativeGap = absoluteGap / reference
+		}
+		bad := absoluteGap >= config.CacheAbsoluteGap && relativeGap >= config.CacheRelativeGap
+		good := item.CacheScore.Float64 >= reference || (absoluteGap < config.CacheAbsoluteGap/2 && relativeGap < config.CacheRelativeGap/2)
+		item.CacheEvaluatedAt = sql.NullTime{Time: item.CacheMetricAt.Time, Valid: true}
+		switch {
+		case bad:
+			item.CacheBadSnapshots++
+			item.CacheGoodSnapshots = 0
+			item.CacheState = cacheStateObserving
+			if item.CacheBadSnapshots >= config.CacheBadSnapshots {
+				item.CacheState = cacheStateLow
+				if config.CacheMode == cacheModeDeprioritize && !item.CachePenaltyActive {
+					item.CachePenaltyActive = true
+					item.CachePenalizedAt = sql.NullTime{Time: now, Valid: true}
+				}
+			}
+		case good:
+			item.CacheBadSnapshots = 0
+			if item.CachePenaltyActive {
+				item.CacheGoodSnapshots++
+				item.CacheState = cacheStateLow
+				if item.CacheGoodSnapshots >= config.CacheGoodSnapshots && item.CachePenalizedAt.Valid && now.Sub(item.CachePenalizedAt.Time) >= cacheStateRecoveryHold {
+					item.CachePenaltyActive = false
+					item.CachePenalizedAt = sql.NullTime{}
+					item.CacheGoodSnapshots = 0
+					item.CacheState = cacheStateNormal
+				}
+			} else if item.CacheState == cacheStateObserving || item.CacheState == cacheStateStale {
+				item.CacheGoodSnapshots++
+				if item.CacheGoodSnapshots >= 2 {
+					item.CacheGoodSnapshots = 0
+					item.CacheState = cacheStateNormal
+				}
+			} else {
+				item.CacheGoodSnapshots = 0
+				item.CacheState = cacheStateNormal
+			}
+		default:
+			item.CacheBadSnapshots = 0
+			item.CacheGoodSnapshots = 0
+			if item.CachePenaltyActive {
+				item.CacheState = cacheStateLow
+			} else {
+				item.CacheState = cacheStateObserving
+			}
+		}
+	}
+	if item.CacheState != before.CacheState {
+		item.CacheStateChangedAt = sql.NullTime{Time: now, Valid: true}
+	}
+	changed := item.CacheState != before.CacheState || item.CacheBadSnapshots != before.CacheBadSnapshots || item.CacheGoodSnapshots != before.CacheGoodSnapshots || item.CacheEvaluatedAt != before.CacheEvaluatedAt || item.CachePenaltyActive != before.CachePenaltyActive || item.CachePenalizedAt != before.CachePenalizedAt
+	return item, changed
 }
 
 func nextManagedLatencyState(item managedPolicyCandidate, config policyConfig, now time.Time) (managedPolicyCandidate, bool) {
@@ -657,6 +815,7 @@ func candidatesForTargetGroup(items []managedPolicyCandidate, targetGroupID stri
 type managedPolicyPlan struct {
 	Priorities  map[string]int
 	Fallback    map[string]bool
+	Exploration map[string]bool
 	NormalCount int
 }
 
@@ -666,8 +825,13 @@ const (
 )
 
 func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) managedPolicyPlan {
+	return planManagedAccountsAt(items, config, time.Now())
+}
+
+func planManagedAccountsAt(items []managedPolicyCandidate, config policyConfig, now time.Time) managedPolicyPlan {
 	normal := []managedPolicyCandidate{}
 	observing := []managedPolicyCandidate{}
+	cacheLow := []managedPolicyCandidate{}
 	slowFallback := []managedPolicyCandidate{}
 	availableNormalCount := 0
 	config = normalizePolicyConfig(config)
@@ -675,6 +839,8 @@ func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 		if len(policyRejectionReasons(item, config)) == 0 {
 			if item.LatencyState == latencyStateObserving {
 				observing = append(observing, item)
+			} else if config.CacheMode == cacheModeDeprioritize && item.CachePenaltyActive {
+				cacheLow = append(cacheLow, item)
 			} else {
 				normal = append(normal, item)
 			}
@@ -687,6 +853,7 @@ func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 	}
 	sortPolicyCandidates(normal, config)
 	sortPolicyCandidates(observing, config)
+	sortPolicyCandidates(cacheLow, config)
 	sort.SliceStable(slowFallback, func(i, j int) bool {
 		if slowFallback[i].FirstTokenP50.Float64 != slowFallback[j].FirstTokenP50.Float64 {
 			return slowFallback[i].FirstTokenP50.Float64 < slowFallback[j].FirstTokenP50.Float64
@@ -694,6 +861,15 @@ func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 		return slowFallback[i].ID < slowFallback[j].ID
 	})
 	fallback := map[string]bool{}
+	exploration := map[string]bool{}
+	var explorationAccount *managedPolicyCandidate
+	if len(cacheLow) > 0 && now.Minute() < cacheExplorationMinutes {
+		index := int(now.Unix()/int64(time.Hour/time.Second)) % len(cacheLow)
+		candidate := cacheLow[index]
+		explorationAccount = &candidate
+		exploration[candidate.ID] = true
+		cacheLow = append(cacheLow[:index], cacheLow[index+1:]...)
+	}
 	needed := max(0, config.MinAvailableChannels-availableNormalCount)
 	for index := 0; index < min(needed, len(slowFallback)); index++ {
 		fallback[slowFallback[index].ID] = true
@@ -702,17 +878,25 @@ func planManagedAccounts(items []managedPolicyCandidate, config policyConfig) ma
 	for index, item := range normal {
 		priorities[item.ID] = config.PriorityStart + index*config.PriorityStep
 	}
+	if explorationAccount != nil {
+		priorities[explorationAccount.ID] = config.PriorityStart
+	}
 	nextNormal := config.PriorityStart + len(normal)*config.PriorityStep
 	observingStart := max(observingPriorityStart, nextNormal)
 	for index, item := range observing {
 		priorities[item.ID] = observingStart + index*config.PriorityStep
 	}
 	nextObserving := observingStart + len(observing)*config.PriorityStep
-	fallbackStart := max(fallbackPriorityStart, nextObserving)
+	cacheStart := max(cacheDeprioritizedStart, nextObserving)
+	for index, item := range cacheLow {
+		priorities[item.ID] = cacheStart + index*config.PriorityStep
+	}
+	nextCache := cacheStart + len(cacheLow)*config.PriorityStep
+	fallbackStart := max(fallbackPriorityStart, nextCache)
 	for index := 0; index < min(needed, len(slowFallback)); index++ {
 		priorities[slowFallback[index].ID] = fallbackStart + index*config.PriorityStep
 	}
-	return managedPolicyPlan{Priorities: priorities, Fallback: fallback, NormalCount: availableNormalCount}
+	return managedPolicyPlan{Priorities: priorities, Fallback: fallback, Exploration: exploration, NormalCount: availableNormalCount}
 }
 
 func rankManagedAccounts(items []managedPolicyCandidate, config policyConfig) map[string]int {
@@ -757,6 +941,32 @@ func policySpeedBand(item managedPolicyCandidate, config policyConfig) int {
 		}
 	}
 	return 4
+}
+
+func policyCacheReason(item managedPolicyCandidate, config policyConfig) string {
+	if config.CacheMode == cacheModeOff {
+		return ""
+	}
+	if item.CacheState == cacheStateWarming {
+		return "缓存样本或同类账号不足，继续预热观测"
+	}
+	if item.CacheState == cacheStateStale {
+		if item.CachePenaltyActive {
+			return "缓存数据暂时过期，保留原降权并等待探测窗口"
+		}
+		return "缓存数据暂时过期，等待新窗口"
+	}
+	if item.CacheState == cacheStateUnknown || !item.CacheScore.Valid {
+		return ""
+	}
+	cohort := strings.TrimSpace(item.CacheMetricModel)
+	if item.CacheMetricRequestType != "" {
+		cohort += " / " + item.CacheMetricRequestType
+	}
+	if cohort != "" {
+		cohort = "，" + cohort
+	}
+	return fmt.Sprintf("缓存读取比例 %.1f%%（%d 个请求，%d 个输入 Token%s）", item.CacheScore.Float64*100, item.CacheSamples, item.CacheInputTokens, cohort)
 }
 
 func policySlowFallbackCandidate(item managedPolicyCandidate, config policyConfig) bool {

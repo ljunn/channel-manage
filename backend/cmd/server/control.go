@@ -202,6 +202,9 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			if observation := policyLatencyObservationReason(candidate, policy.Config); observation != "" {
 				reasons = append(reasons, observation)
 			}
+			if cacheReason := policyCacheReason(candidate, policy.Config); cacheReason != "" {
+				reasons = append(reasons, cacheReason)
+			}
 			plan := plans[candidate.TargetGroupID]
 			plannedPriority, eligible = plan.Priorities[candidate.ID]
 			fallback = plan.Fallback[candidate.ID]
@@ -237,9 +240,10 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"schedulable": candidate.Schedulable, "eligible": eligible, "fallback": fallback, "fallbackActive": candidate.FallbackActive, "priority": candidate.Priority, "plannedPriority": plannedPriority, "syncStatus": candidate.SyncStatus,
 			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
 			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP50), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "maxFirstTokenMs": policy.Config.MaxFirstTokenMs, "recentSuccesses": displayedSuccesses,
+			"cacheState": candidate.CacheState, "cacheScore": nullableFloat(candidate.CacheScore), "cacheSamples": candidate.CacheSamples, "cacheInputTokens": candidate.CacheInputTokens, "cacheReadTokens": candidate.CacheReadTokens, "cacheMetricSource": candidate.CacheMetricSource, "cacheMetricModel": candidate.CacheMetricModel, "cacheMetricRequestType": candidate.CacheMetricRequestType, "cachePenaltyActive": candidate.CachePenaltyActive, "cacheExploration": plans[candidate.TargetGroupID].Exploration[candidate.ID], "cacheReason": policyCacheReason(candidate, policy.Config), "cacheMode": policy.Config.CacheMode,
 			"latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, policy.Config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples,
 			"policyId": map[bool]any{true: policy.ID, false: nil}[configured], "policyName": policy.Name,
-			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate, "minAvailableChannels": policy.Config.MinAvailableChannels,
+			"minSamples": policy.Config.MinSamples, "minSuccessRate": policy.Config.MinSuccessRate, "minAvailableChannels": policy.Config.MinAvailableChannels, "cacheAbsoluteGap": policy.Config.CacheAbsoluteGap, "cacheRelativeGap": policy.Config.CacheRelativeGap,
 			"probeIntervalSeconds": probeInterval, "fastProbeIntervalSeconds": fastInterval, "fastValidation": fastValidation, "estimatedValidationSeconds": estimatedValidationSeconds,
 			"reasons": reasons,
 		})
@@ -562,9 +566,26 @@ type policyConfig struct {
 	AllowEqualMultiplier bool     `json:"allowEqualMultiplier"`
 	ProbeModel           string   `json:"probeModel"`
 	DisabledModels       []string `json:"disabledModels"`
+	CacheMode            string   `json:"cacheMode"`
+	CacheMinRequests     int      `json:"cacheMinRequests"`
+	CacheMinInputTokens  int64    `json:"cacheMinInputTokens"`
+	CacheAbsoluteGap     float64  `json:"cacheAbsoluteGap"`
+	CacheRelativeGap     float64  `json:"cacheRelativeGap"`
+	CacheBadSnapshots    int      `json:"cacheBadSnapshots"`
+	CacheGoodSnapshots   int      `json:"cacheGoodSnapshots"`
 }
 
 const defaultPolicyMaxFirstTokenMs = 10_000
+
+const (
+	cacheModeOff            = "OFF"
+	cacheModeObserve        = "OBSERVE"
+	cacheModeDeprioritize   = "DEPRIORITIZE"
+	defaultCacheMinRequest  = 50
+	defaultCacheMinTokens   = 50_000
+	defaultCacheAbsoluteGap = 0.10
+	defaultCacheRelativeGap = 0.25
+)
 
 func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.Mode != "SPEED" {
@@ -588,6 +609,27 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.PriorityStep < 1000 {
 		config.PriorityStep = 1000
 	}
+	if config.CacheMode != cacheModeObserve && config.CacheMode != cacheModeDeprioritize {
+		config.CacheMode = cacheModeOff
+	}
+	if config.CacheMinRequests < 1 {
+		config.CacheMinRequests = defaultCacheMinRequest
+	}
+	if config.CacheMinInputTokens < 1 {
+		config.CacheMinInputTokens = defaultCacheMinTokens
+	}
+	if config.CacheAbsoluteGap <= 0 || config.CacheAbsoluteGap >= 1 {
+		config.CacheAbsoluteGap = defaultCacheAbsoluteGap
+	}
+	if config.CacheRelativeGap <= 0 || config.CacheRelativeGap >= 1 {
+		config.CacheRelativeGap = defaultCacheRelativeGap
+	}
+	if config.CacheBadSnapshots < 1 {
+		config.CacheBadSnapshots = 3
+	}
+	if config.CacheGoodSnapshots < 1 {
+		config.CacheGoodSnapshots = 3
+	}
 	config.ProbeModel = strings.TrimSpace(config.ProbeModel)
 	config.DisabledModels = normalizeModelNames(config.DisabledModels)
 	return config
@@ -605,6 +647,21 @@ func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, conf
 	}
 	if config.PriorityStep < 1000 || config.PriorityStep > 1_000_000 {
 		return config, &apiError{400, "INVALID_PRIORITY_STEP", "优先级间隔需要设置为 1000 至 1000000"}
+	}
+	if config.CacheMinRequests < 1 || config.CacheMinRequests > 10000 {
+		return config, &apiError{400, "INVALID_CACHE_REQUESTS", "缓存最少请求数需要设置为 1 至 10000"}
+	}
+	if config.CacheMinInputTokens < 1 || config.CacheMinInputTokens > 1000000000 {
+		return config, &apiError{400, "INVALID_CACHE_TOKENS", "缓存最少输入 Token 需要设置为 1 至 1000000000"}
+	}
+	if config.CacheAbsoluteGap < 0.01 || config.CacheAbsoluteGap > 0.9 {
+		return config, &apiError{400, "INVALID_CACHE_ABSOLUTE_GAP", "缓存绝对差距需要设置为 1 至 90 个百分点"}
+	}
+	if config.CacheRelativeGap < 0.01 || config.CacheRelativeGap > 0.9 {
+		return config, &apiError{400, "INVALID_CACHE_GAP", "缓存相对差距需要设置为 1% 至 90%"}
+	}
+	if config.CacheBadSnapshots < 1 || config.CacheBadSnapshots > 20 || config.CacheGoodSnapshots < 1 || config.CacheGoodSnapshots > 20 {
+		return config, &apiError{400, "INVALID_CACHE_SNAPSHOTS", "缓存确认窗口需要设置为 1 至 20 次"}
 	}
 	var platform, defaultModel string
 	if err := a.db.QueryRowContext(ctx, `SELECT platform,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &defaultModel); err != nil {
@@ -911,6 +968,9 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		if observation := policyLatencyObservationReason(candidate, config); observation != "" {
 			reasons = append(reasons, observation)
 		}
+		if cacheReason := policyCacheReason(candidate, config); cacheReason != "" {
+			reasons = append(reasons, cacheReason)
+		}
 		priority, selected := plan.Priorities[candidate.ID]
 		fallback := plan.Fallback[candidate.ID]
 		decision := "REJECTED"
@@ -920,7 +980,7 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		} else if selected {
 			decision = "ELIGIBLE"
 		}
-		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples, "plannedPriority": priority, "decision": decision, "reasons": reasons})
+		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples, "cacheState": candidate.CacheState, "cacheScore": nullableFloat(candidate.CacheScore), "cacheSamples": candidate.CacheSamples, "cacheInputTokens": candidate.CacheInputTokens, "cacheReadTokens": candidate.CacheReadTokens, "cacheMetricSource": candidate.CacheMetricSource, "cacheMetricModel": candidate.CacheMetricModel, "cacheMetricRequestType": candidate.CacheMetricRequestType, "cachePenaltyActive": candidate.CachePenaltyActive, "cacheExploration": plan.Exploration[candidate.ID], "cacheReason": policyCacheReason(candidate, config), "cacheMode": config.CacheMode, "cacheAbsoluteGap": config.CacheAbsoluteGap, "cacheRelativeGap": config.CacheRelativeGap, "plannedPriority": priority, "decision": decision, "reasons": reasons})
 	}
 	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
 	return nil

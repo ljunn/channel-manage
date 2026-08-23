@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -14,6 +16,7 @@ import (
 const (
 	recentBusinessLatencySamples = 50
 	businessLatencyWindow        = 5 * time.Minute
+	cacheMetricWindow            = 5 * time.Minute
 )
 
 type businessMetricBucket struct {
@@ -40,6 +43,15 @@ type targetMetricBinding struct {
 	RemoteID   string
 	ChannelID  string
 	ProbeModel string
+}
+
+type cacheMetricBucket struct {
+	ManagedID, Model, RequestType, Source string
+	Window                                time.Time
+	Requests, CacheHits                   int
+	InputTokens                           int64
+	CacheReadTokens                       int64
+	CacheCreationTokens                   int64
 }
 
 func (a *App) syncDueTargetMetrics(ctx context.Context) {
@@ -96,16 +108,49 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	}
 	to := time.Now().UTC()
 	from := to.Add(-7 * time.Minute)
+	cacheWindowEnd := to.Truncate(cacheMetricWindow)
+	cacheFrom := cacheWindowEnd.Add(-cacheMetricWindow)
 	buckets := map[string]*businessMetricBucket{}
+	cacheBuckets := map[string]*cacheMetricBucket{}
+	managedIDs := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		managedIDs = append(managedIDs, binding.ManagedID)
+	}
 	latencySnapshots := map[string]businessLatencySnapshot{}
 	for _, binding := range bindings {
-		latencyCtx, latencyCancel := timeoutContext(ctx)
-		snapshot, snapshotErr := a.fetchRecentBusinessLatency(latencyCtx, target.BaseURL, binding.RemoteID, binding.ProbeModel, session)
-		latencyCancel()
-		if snapshotErr != nil {
-			return snapshotErr
+		usageCtx, usageCancel := timeoutContext(ctx)
+		usageItems, usageErr := a.fetchRecentUsageRecords(usageCtx, target.BaseURL, binding.RemoteID, cacheFrom, to, session)
+		usageCancel()
+		if usageErr != nil {
+			return usageErr
 		}
-		latencySnapshots[binding.ManagedID] = snapshot
+		latencySnapshots[binding.ManagedID] = businessLatencyFromUsageItems(usageItems, binding.RemoteID, binding.ProbeModel, to)
+		for _, item := range usageItems {
+			created, err := parseRemoteTimestamp(text(item["created_at"], ""))
+			if err != nil || created.Before(cacheFrom) || !created.Before(cacheWindowEnd) {
+				continue
+			}
+			cache, ok := extractCacheUsage(item)
+			if !ok {
+				continue
+			}
+			model := strings.TrimSpace(text(item["model"], "UNKNOWN"))
+			requestType := strings.ToLower(strings.TrimSpace(text(item["request_type"], "unknown")))
+			window := created.UTC().Truncate(cacheMetricWindow)
+			key := strings.Join([]string{binding.ManagedID, model, requestType, window.Format(time.RFC3339)}, ":")
+			bucket := cacheBuckets[key]
+			if bucket == nil {
+				bucket = &cacheMetricBucket{ManagedID: binding.ManagedID, Model: model, RequestType: requestType, Source: "TARGET_USAGE", Window: window}
+				cacheBuckets[key] = bucket
+			}
+			bucket.Requests++
+			bucket.InputTokens += cache.InputTokens
+			bucket.CacheReadTokens += cache.CacheReadTokens
+			bucket.CacheCreationTokens += cache.CacheCreationTokens
+			if cache.CacheReadTokens > 0 {
+				bucket.CacheHits++
+			}
+		}
 
 		path := fmt.Sprintf("/api/v1/admin/ops/requests?start_time=%s&end_time=%s&kind=all&sort=created_at_desc&account_id=%s", from.Format(time.RFC3339), to.Format(time.RFC3339), binding.RemoteID)
 		requestCtx, requestCancel := timeoutContext(ctx)
@@ -119,7 +164,7 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 			if !ok || strconv.Itoa(int(accountNumber)) != binding.RemoteID {
 				continue
 			}
-			created, err := time.Parse(time.RFC3339, text(item["created_at"], ""))
+			created, err := parseRemoteTimestamp(text(item["created_at"], ""))
 			if err != nil || created.Before(from) || created.After(to) {
 				continue
 			}
@@ -174,6 +219,20 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 			return err
 		}
 	}
+	for _, bucket := range cacheBuckets {
+		_, err = tx.ExecContext(ctx, `INSERT INTO managed_account_cache_metrics(managed_account_id,model,request_type,window_start,observed_requests,cache_hit_requests,input_tokens,cache_read_tokens,cache_creation_tokens,metric_source)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+			ON CONFLICT(managed_account_id,model,request_type,window_start) DO UPDATE SET observed_requests=excluded.observed_requests,cache_hit_requests=excluded.cache_hit_requests,input_tokens=excluded.input_tokens,cache_read_tokens=excluded.cache_read_tokens,cache_creation_tokens=excluded.cache_creation_tokens,metric_source=excluded.metric_source`, bucket.ManagedID, bucket.Model, bucket.RequestType, bucket.Window, bucket.Requests, bucket.CacheHits, bucket.InputTokens, bucket.CacheReadTokens, bucket.CacheCreationTokens, bucket.Source)
+		if err != nil {
+			return err
+		}
+	}
+	if err = a.updateManagedAccountCacheSnapshots(ctx, tx, cacheBuckets, managedIDs, cacheWindowEnd); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM managed_account_cache_metrics WHERE window_start<now()-interval '7 days'`); err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `UPDATE targets SET last_metrics_at=now() WHERE id=$1`, targetID)
 	if err != nil {
 		return err
@@ -182,6 +241,121 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 		return err
 	}
 	return nil
+}
+
+func (a *App) updateManagedAccountCacheSnapshots(ctx context.Context, tx *sql.Tx, buckets map[string]*cacheMetricBucket, managedIDs []string, evaluatedAt time.Time) error {
+	selected := map[string]*cacheMetricBucket{}
+	for _, bucket := range buckets {
+		current := selected[bucket.ManagedID]
+		bucketTokens := bucket.InputTokens + bucket.CacheCreationTokens + bucket.CacheReadTokens
+		currentTokens := int64(-1)
+		if current != nil {
+			currentTokens = current.InputTokens + current.CacheCreationTokens + current.CacheReadTokens
+		}
+		if current == nil || bucketTokens > currentTokens || (bucketTokens == currentTokens && bucket.Model+":"+bucket.RequestType < current.Model+":"+current.RequestType) {
+			selected[bucket.ManagedID] = bucket
+		}
+	}
+	for _, managedID := range managedIDs {
+		item := selected[managedID]
+		if item == nil {
+			continue
+		}
+		score, totalInput, ok := cacheReadRatio(item.InputTokens, item.CacheCreationTokens, item.CacheReadTokens)
+		if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE managed_accounts SET
+			cache_bad_snapshots=CASE WHEN cache_metric_model<>$7 OR cache_metric_request_type<>$8 THEN 0 ELSE cache_bad_snapshots END,
+			cache_good_snapshots=CASE WHEN cache_metric_model<>$7 OR cache_metric_request_type<>$8 THEN 0 ELSE cache_good_snapshots END,
+			cache_evaluated_at=CASE WHEN cache_metric_model<>$7 OR cache_metric_request_type<>$8 THEN NULL ELSE cache_evaluated_at END,
+			cache_score=$2,cache_samples=$3,cache_input_tokens=$4,cache_read_tokens=$5,cache_metric_source='TARGET_USAGE',cache_metric_at=$6,cache_metric_model=$7,cache_metric_request_type=$8,updated_at=now()
+			WHERE id=$1`, managedID, score, item.Requests, totalInput, item.CacheReadTokens, evaluatedAt, item.Model, item.RequestType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cacheReadRatio(input, created, read int64) (float64, int64, bool) {
+	total := input + created + read
+	if input < 0 || created < 0 || read < 0 || total <= 0 {
+		return 0, total, false
+	}
+	return math.Max(0, math.Min(1, float64(read)/float64(total))), total, true
+}
+
+type cacheUsage struct {
+	InputTokens, CacheReadTokens, CacheCreationTokens int64
+}
+
+func extractCacheUsage(item map[string]any) (cacheUsage, bool) {
+	input, inputOK := integerValue(item["input_tokens"])
+	read, readOK := integerValue(item["cache_read_tokens"])
+	created, createdOK := integerValue(item["cache_creation_tokens"])
+	if !inputOK || !readOK || !createdOK {
+		return cacheUsage{}, false
+	}
+	return cacheUsage{InputTokens: input, CacheReadTokens: read, CacheCreationTokens: created}, true
+}
+
+func integerValue(value any) (int64, bool) {
+	numberValue, ok := number(value)
+	if !ok || numberValue < 0 || math.Trunc(numberValue) != numberValue {
+		return 0, false
+	}
+	return int64(numberValue), true
+}
+
+func (a *App) fetchRecentUsageRecords(ctx context.Context, baseURL, remoteID string, from, to time.Time, session remoteSession) ([]map[string]any, error) {
+	const pageSize = 100
+	basePath := "/api/v1/admin/usage?account_id=" + url.QueryEscape(remoteID) +
+		"&sort_by=created_at&sort_order=desc&timezone=UTC&start_date=" + from.UTC().Format("2006-01-02") +
+		"&end_date=" + to.UTC().Format("2006-01-02")
+	result := []map[string]any{}
+	for page := 1; page <= 100; page++ {
+		path := basePath + "&page=" + strconv.Itoa(page) + "&page_size=" + strconv.Itoa(pageSize)
+		raw, _, err := a.remoteJSON(ctx, baseURL, http.MethodGet, path, session, nil)
+		if err != nil {
+			return nil, err
+		}
+		value, err := unwrapEnvelope(raw, "SUB2API")
+		if err != nil {
+			return nil, err
+		}
+		record, ok := value.(map[string]any)
+		if !ok {
+			return nil, &apiError{502, "SCHEMA_CHANGED", "目标节点用量分页格式不兼容"}
+		}
+		items, ok := record["items"].([]any)
+		if !ok {
+			return nil, &apiError{502, "SCHEMA_CHANGED", "目标节点用量列表格式不兼容"}
+		}
+		reachedCutoff := false
+		for _, rawItem := range items {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			created, parseErr := parseRemoteTimestamp(text(item["created_at"], ""))
+			if parseErr != nil {
+				continue
+			}
+			if created.Before(from) {
+				reachedCutoff = true
+				continue
+			}
+			if created.After(to) {
+				continue
+			}
+			result = append(result, item)
+		}
+		pages, _ := number(record["pages"])
+		if reachedCutoff || len(items) == 0 || page >= int(pages) {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID, probeModel string, session remoteSession) (businessLatencySnapshot, error) {
@@ -203,16 +377,26 @@ func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID,
 	if !ok {
 		return businessLatencySnapshot{}, &apiError{502, "SCHEMA_CHANGED", "目标节点用量列表格式不兼容"}
 	}
+	return businessLatencyFromUsageItems(itemsAsMaps(items), remoteID, probeModel, time.Now()), nil
+}
+
+func itemsAsMaps(items []any) []map[string]any {
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if typed, ok := item.(map[string]any); ok {
+			result = append(result, typed)
+		}
+	}
+	return result
+}
+
+func businessLatencyFromUsageItems(items []map[string]any, remoteID, probeModel string, now time.Time) businessLatencySnapshot {
 	values := make([]int, 0, recentBusinessLatencySamples)
 	modelValues := make([]int, 0, recentBusinessLatencySamples)
 	latest := time.Time{}
 	modelLatest := time.Time{}
-	cutoff := time.Now().Add(-businessLatencyWindow)
-	for _, rawItem := range items {
-		item, ok := rawItem.(map[string]any)
-		if !ok {
-			continue
-		}
+	cutoff := now.Add(-businessLatencyWindow)
+	for _, item := range items {
 		accountNumber, ok := number(item["account_id"])
 		if !ok || strconv.Itoa(int(accountNumber)) != remoteID {
 			continue
@@ -237,7 +421,7 @@ func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID,
 		}
 	}
 	if len(values) == 0 {
-		return businessLatencySnapshot{}, nil
+		return businessLatencySnapshot{}
 	}
 	model := "ALL"
 	if len(modelValues) >= businessLatencyMinSamples {
@@ -245,7 +429,7 @@ func (a *App) fetchRecentBusinessLatency(ctx context.Context, baseURL, remoteID,
 		latest = modelLatest
 		model = probeModel
 	}
-	return businessLatencySnapshot{FirstTokenP50Ms: medianInt(values), FirstTokenP90Ms: percentileInt(values, .90), Samples: len(values), LatestAt: latest, Model: model}, nil
+	return businessLatencySnapshot{FirstTokenP50Ms: medianInt(values), FirstTokenP90Ms: percentileInt(values, .90), Samples: len(values), LatestAt: latest, Model: model}
 }
 
 func parseRemoteTimestamp(value string) (time.Time, error) {
