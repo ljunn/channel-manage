@@ -213,7 +213,7 @@ func (a *App) syncManagedAccountSchedulableStates(ctx context.Context, target Ta
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,m.remote_name,m.schedulable
 		FROM managed_accounts m
 		WHERE m.target_id=$1 AND m.remote_id<>'' AND m.ownership_marker LIKE 'channel-manage:%'
-		AND NOT EXISTS(SELECT 1 FROM action_intents i WHERE i.managed_account_id=m.id AND i.action_type IN ('SET_SCHEDULABLE','ROTATE_FALLBACK','RECREATE_FALLBACK') AND i.status='APPROVED')`, target.ID)
+		AND NOT EXISTS(SELECT 1 FROM action_intents i WHERE i.managed_account_id=m.id AND i.action_type IN ('SET_SCHEDULABLE','ROTATE_FALLBACK','RECREATE_FALLBACK') AND i.status IN ('PENDING','APPROVED'))`, target.ID)
 	if err != nil {
 		log.Printf("读取托管账号启停状态失败 [%s]: %v", target.ID, err)
 		return

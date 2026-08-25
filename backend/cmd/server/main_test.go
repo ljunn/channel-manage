@@ -287,6 +287,17 @@ func TestManagedPlatformUsesTargetGroupType(t *testing.T) {
 	}
 }
 
+func TestManagedActionLocksAreScopedPerAccount(t *testing.T) {
+	app := &App{}
+	first := app.managedActionLock("account-a")
+	if first != app.managedActionLock("account-a") {
+		t.Fatal("同一托管账号应复用同一个动作锁")
+	}
+	if first == app.managedActionLock("account-b") {
+		t.Fatal("不同托管账号不应共享动作锁")
+	}
+}
+
 func TestRateMultiplierNeedsSync(t *testing.T) {
 	if rateMultiplierNeedsSync(.32, true, .32) {
 		t.Fatal("matching account rate was treated as drift")

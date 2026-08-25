@@ -470,8 +470,32 @@ func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string
 	a.enqueueManagedActionWithCooldown(ctx, managedID, action, before, after, reason, 0)
 }
 
+func (a *App) managedActionLock(managedID string) *sync.Mutex {
+	a.managedActionLocksMu.Lock()
+	defer a.managedActionLocksMu.Unlock()
+	if a.managedActionLocks == nil {
+		a.managedActionLocks = make(map[string]*sync.Mutex)
+	}
+	if lock, ok := a.managedActionLocks[managedID]; ok {
+		return lock
+	}
+	lock := &sync.Mutex{}
+	a.managedActionLocks[managedID] = lock
+	return lock
+}
+
 func (a *App) enqueueManagedActionWithCooldown(ctx context.Context, managedID, action string, before, after any, reason string, cooldown time.Duration) {
 	key := stableKey(managedID, action, jsonValue(before), jsonValue(after))
+	lock := a.managedActionLock(managedID)
+	lock.Lock()
+	defer lock.Unlock()
+	if _, err := a.db.ExecContext(ctx, `UPDATE action_intents
+		SET status='REJECTED',error='已由最新调度动作替代',executed_at=now()
+		WHERE managed_account_id=$1 AND action_type=$2 AND status IN ('PENDING','APPROVED')
+			AND after_state IS DISTINCT FROM $3::jsonb`, managedID, action, jsonValue(after)); err != nil {
+		logDatabaseError("替换过期托管动作", err)
+		return
+	}
 	var id string
 	err := a.db.QueryRowContext(ctx, `INSERT INTO action_intents(managed_account_id,action_type,before_state,after_state,reason,status,idempotency_key,approved_at)
 		SELECT $1,$2,$3,$4,$5,'APPROVED',$6,now()

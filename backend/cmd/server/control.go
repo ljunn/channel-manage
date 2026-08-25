@@ -285,10 +285,36 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if frozen || shadow {
 		return a.failAction(ctx, id, "安全冻结或影子模式禁止执行写动作")
 	}
+	var actionManagedID string
+	if err := a.db.QueryRowContext(ctx, `SELECT managed_account_id::text FROM action_intents WHERE id=$1 AND status='APPROVED'`, id).Scan(&actionManagedID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return a.failAction(ctx, id, err.Error())
+	}
+	lock := a.managedActionLock(actionManagedID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	var managedID, action, before, after, idempotencyKey, targetID, targetBase, remoteID, remoteName, marker string
 	var writeEnabled bool
-	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.before_state,i.after_state,i.idempotency_key,t.id,t.base_url,t.write_enabled,m.remote_id,m.remote_name,m.ownership_marker FROM action_intents i JOIN managed_accounts m ON m.id=i.managed_account_id JOIN targets t ON t.id=m.target_id WHERE i.id=$1 AND i.status='APPROVED'`, id).Scan(&managedID, &action, &before, &after, &idempotencyKey, &targetID, &targetBase, &writeEnabled, &remoteID, &remoteName, &marker)
+	err := a.db.QueryRowContext(ctx, `SELECT m.id,i.action_type,i.before_state,i.after_state,i.idempotency_key,t.id,t.base_url,t.write_enabled,m.remote_id,m.remote_name,m.ownership_marker
+		FROM action_intents i
+		JOIN managed_accounts m ON m.id=i.managed_account_id
+		JOIN targets t ON t.id=m.target_id
+		WHERE i.id=$1 AND i.status='APPROVED'
+		AND NOT EXISTS (
+			SELECT 1 FROM action_intents newer
+			WHERE newer.managed_account_id=i.managed_account_id
+				AND newer.action_type=i.action_type
+				AND newer.status='APPROVED'
+				AND newer.created_at>i.created_at
+		)`, id).Scan(&managedID, &action, &before, &after, &idempotencyKey, &targetID, &targetBase, &writeEnabled, &remoteID, &remoteName, &marker)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			a.rejectSupersededAction(ctx, id)
+			return nil
+		}
 		return a.failAction(ctx, id, err.Error())
 	}
 	if !writeEnabled || !strings.HasPrefix(marker, "channel-manage:") {
@@ -309,6 +335,9 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if action == "ROTATE_FALLBACK" || action == "RECREATE_FALLBACK" {
 		err = a.executeFallbackRecreation(ctx, id, managedID, targetID, targetBase, remoteID, remoteName, idempotencyKey, session, previous, state)
 		if err != nil {
+			if errors.Is(err, errManagedActionSuperseded) {
+				return nil
+			}
 			return a.failAction(ctx, id, err.Error())
 		}
 		a.resolveEvent(ctx, actionFailureEventKey(managedID, action))
@@ -342,20 +371,65 @@ func (a *App) executeAction(ctx context.Context, id string) error {
 	if err != nil {
 		return a.failAction(ctx, id, err.Error())
 	}
-	_, err = a.db.ExecContext(ctx, `UPDATE action_intents SET status='EXECUTED',executed_at=now(),error='' WHERE id=$1`, id)
-	if err == nil {
-		if schedulable, ok := state["schedulable"].(bool); ok {
-			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET schedulable=$2,fallback_active=CASE WHEN $2 THEN fallback_active ELSE false END,updated_at=now() WHERE id=$1`, managedID, schedulable)
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE action_intents current
+		SET status='EXECUTED',executed_at=now(),error=''
+		WHERE current.id=$1 AND current.status='APPROVED'
+		AND NOT EXISTS (
+			SELECT 1 FROM action_intents newer
+			WHERE newer.managed_account_id=current.managed_account_id
+				AND newer.action_type=current.action_type
+				AND newer.status='APPROVED'
+				AND newer.created_at>current.created_at
+		)`, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return nil
+	}
+	if schedulable, ok := state["schedulable"].(bool); ok {
+		if _, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET schedulable=$2,fallback_active=CASE WHEN $2 THEN fallback_active ELSE false END,updated_at=now() WHERE id=$1`, managedID, schedulable); err != nil {
+			return err
 		}
-		if priority, ok := number(state["priority"]); ok {
-			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1`, managedID, int(priority))
+	}
+	if priority, ok := number(state["priority"]); ok {
+		if _, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET priority=$2,priority_synced_at=now(),updated_at=now() WHERE id=$1`, managedID, int(priority)); err != nil {
+			return err
 		}
-		if fallbackActive, ok := state["fallbackActive"].(bool); ok {
-			_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET fallback_active=$2,updated_at=now() WHERE id=$1`, managedID, fallbackActive)
+	}
+	if fallbackActive, ok := state["fallbackActive"].(bool); ok {
+		if _, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET fallback_active=$2,updated_at=now() WHERE id=$1`, managedID, fallbackActive); err != nil {
+			return err
 		}
+	}
+	if err = tx.Commit(); err == nil {
 		a.resolveEvent(ctx, actionFailureEventKey(managedID, action))
 	}
 	return err
+}
+
+var errManagedActionSuperseded = errors.New("托管动作已被更新动作替代")
+
+func (a *App) rejectSupersededAction(ctx context.Context, id string) {
+	_, _ = a.db.ExecContext(ctx, `UPDATE action_intents current
+		SET status='REJECTED',error='已由更新的托管动作替代',executed_at=now()
+		WHERE current.id=$1 AND current.status='APPROVED'
+		AND EXISTS (
+			SELECT 1 FROM action_intents newer
+			WHERE newer.managed_account_id=current.managed_account_id
+				AND newer.action_type=current.action_type
+				AND newer.status='APPROVED'
+				AND newer.created_at>current.created_at
+		)`, id)
 }
 
 type fallbackRebuildSpec struct {
@@ -513,16 +587,30 @@ func (a *App) executeFallbackRecreation(ctx context.Context, actionID, managedID
 		ON CONFLICT(target_id,remote_id) DO UPDATE SET reason=EXCLUDED.reason,deleted_at=NULL,cleanup_attempted_at=NULL,cleanup_error=''`, managedID, targetID, oldRemoteID, oldRemoteName); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,remote_name=$3,priority=$4,schedulable=true,fallback_active=true,priority_synced_at=now(),sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$5`, managedID, newRemoteID, newRemoteName, int(priority), oldRemoteID)
+	result, err := tx.ExecContext(ctx, `UPDATE action_intents current
+		SET status='EXECUTED',executed_at=now(),error=''
+		WHERE current.id=$1 AND current.status='APPROVED'
+		AND NOT EXISTS (
+			SELECT 1 FROM action_intents newer
+			WHERE newer.managed_account_id=current.managed_account_id
+				AND newer.action_type=current.action_type
+				AND newer.status='APPROVED'
+				AND newer.created_at>current.created_at
+		)`, actionID)
 	if err != nil {
 		return err
 	}
 	affected, err := result.RowsAffected()
 	if err != nil || affected != 1 {
-		return fmt.Errorf("托管账号在替换过程中已发生变化")
+		return errManagedActionSuperseded
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE action_intents SET status='EXECUTED',executed_at=now(),error='' WHERE id=$1 AND status='APPROVED'`, actionID); err != nil {
+	result, err = tx.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,remote_name=$3,priority=$4,schedulable=true,fallback_active=true,priority_synced_at=now(),sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$5`, managedID, newRemoteID, newRemoteName, int(priority), oldRemoteID)
+	if err != nil {
 		return err
+	}
+	affected, err = result.RowsAffected()
+	if err != nil || affected != 1 {
+		return fmt.Errorf("托管账号在替换过程中已发生变化")
 	}
 	if err = tx.Commit(); err != nil {
 		return err
@@ -550,7 +638,26 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 		managedID = id
 		action = "UNKNOWN"
 	}
-	_, _ = a.db.ExecContext(ctx, `UPDATE action_intents SET status='FAILED',error=$2,executed_at=now() WHERE id=$1`, id, truncate(message, 500))
+	result, err := a.db.ExecContext(ctx, `UPDATE action_intents current
+		SET status='FAILED',error=$2,executed_at=now()
+		WHERE current.id=$1 AND current.status='APPROVED'
+		AND NOT EXISTS (
+			SELECT 1 FROM action_intents newer
+			WHERE newer.managed_account_id=current.managed_account_id
+				AND newer.action_type=current.action_type
+				AND newer.status='APPROVED'
+				AND newer.created_at>current.created_at
+		)`, id, truncate(message, 500))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("action superseded: %s", message)
+	}
 	a.openEvent(ctx, "P0", "ACTION_EXECUTION", "远程动作执行失败", message, actionFailureEventKey(managedID, action))
 	return fmt.Errorf("action failed: %s", message)
 }

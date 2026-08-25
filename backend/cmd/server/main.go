@@ -53,6 +53,8 @@ type App struct {
 	targetRateSyncs           map[string]struct{}
 	targetSchedulableMu       sync.Mutex
 	targetSchedulableSyncs    map[string]struct{}
+	managedActionLocksMu      sync.Mutex
+	managedActionLocks        map[string]*sync.Mutex
 	quickValidationMu         sync.Mutex
 	quickValidations          map[string]struct{}
 }
