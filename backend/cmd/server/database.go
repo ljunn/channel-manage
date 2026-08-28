@@ -289,10 +289,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"probe_interval_seconds": "900", "scan_interval_seconds": "900", "max_daily_probe_cost_usd": "1",
 		"min_healthy_channels": "1", "confirmation_failures": "3", "metric_window_minutes": "5",
 		"min_error_samples": "5", "error_rate_threshold": "20",
-		"balance_alert_work_hours": "4", "balance_alert_night_hours": "12", "balance_alert_weekend_hours": "36",
-		"email_alert_source_balance": "true", "email_alert_source_scan": "true", "email_alert_target_sync": "true",
-		"email_alert_group_availability": "true", "email_alert_action_execution": "true", "email_alert_platform_sync": "true",
-		"email_alert_recovery": "false",
+		"balance_alert_threshold": "10",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

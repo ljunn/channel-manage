@@ -455,7 +455,7 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		}
 		plan := planManagedAccounts(groupItems, policy.Config)
 		desiredPriority := plan.Priorities
-		if len(groupItems) > 0 && len(desiredPriority) == 0 && groupNeedsAvailabilityAlert(groupItems, policy.Config) {
+		if len(groupItems) > 0 && len(desiredPriority) == 0 {
 			detail := fmt.Sprintf("%s / %s 当前没有任何符合策略的托管账号。系统仍在快速复检可恢复渠道，请检查源站余额、渠道状态和倍率。", groupItems[0].TargetName, groupItems[0].TargetGroup)
 			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
 		} else if len(desiredPriority) > 0 {
@@ -501,22 +501,6 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func groupNeedsAvailabilityAlert(items []managedPolicyCandidate, config policyConfig) bool {
-	config = normalizePolicyConfig(config)
-	for _, item := range items {
-		if item.Schedulable || item.State != "HEALTHY" {
-			return true
-		}
-		if !policyMultiplierQualified(item, config) {
-			return true
-		}
-		if item.Samples >= config.MinSamples && !policySuccessQualified(item, config) {
-			return true
-		}
-	}
-	return false
 }
 
 func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string, before, after any, reason string) {

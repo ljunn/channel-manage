@@ -327,59 +327,18 @@ func TestBalanceForecastUsesMedianConsumptionAndIgnoresRecharge(t *testing.T) {
 	}
 }
 
-func TestBalanceForecastNeedsThreeConsumptionIntervals(t *testing.T) {
-	start := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
-	forecast := calculateBalanceForecast([]balanceSample{
-		{Balance: 100, CapturedAt: start},
-		{Balance: 90, CapturedAt: start.Add(time.Hour)},
-		{Balance: 80, CapturedAt: start.Add(2 * time.Hour)},
-	})
-	if forecast.Known {
-		t.Fatalf("forecast should wait for three consumption intervals: %#v", forecast)
+func TestBalanceAlertUsesStrictConfiguredThreshold(t *testing.T) {
+	if !balanceBelowAlertThreshold(9.99, 10) {
+		t.Fatal("balance below threshold was not detected")
 	}
-}
-
-func TestBalanceForecastRequiresConsecutiveThresholdBreaches(t *testing.T) {
-	start := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
-	samples := []balanceSample{
-		{Balance: 100, CapturedAt: start},
-		{Balance: 99, CapturedAt: start.Add(time.Hour)},
-		{Balance: 98, CapturedAt: start.Add(2 * time.Hour)},
-		{Balance: 97, CapturedAt: start.Add(3 * time.Hour)},
-		{Balance: 77, CapturedAt: start.Add(4 * time.Hour)},
+	if balanceBelowAlertThreshold(10, 10) {
+		t.Fatal("balance equal to threshold must not alert")
 	}
-	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
-		t.Fatal("a single short spike must not trigger a forecast alert")
+	if balanceBelowAlertThreshold(10.01, 10) {
+		t.Fatal("balance above threshold must not alert")
 	}
-	samples = append(samples, balanceSample{Balance: 57, CapturedAt: start.Add(5 * time.Hour)})
-	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
-		t.Fatal("the first low-runway forecast must wait for confirmation")
-	}
-	samples = append(samples, balanceSample{Balance: 37, CapturedAt: start.Add(6 * time.Hour)})
-	if consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
-		t.Fatal("the previous forecast was still above the threshold")
-	}
-	samples = append(samples, balanceSample{Balance: 17, CapturedAt: start.Add(7 * time.Hour)})
-	if !consecutiveBalanceForecasts(samples, 2, func(item balanceForecast) bool { return item.EtaHours < 10 }) {
-		t.Fatal("two consecutive threshold breaches should trigger the alert")
-	}
-}
-
-func TestRecommendedRechargeRoundsUpWithCoverageBuffer(t *testing.T) {
-	if got := recommendedRecharge(12, 2, 14); got != 20 {
-		t.Fatalf("recommended recharge = %.2f, want 20", got)
-	}
-}
-
-func TestBalanceAlertLeadUsesNightAndWeekendWindows(t *testing.T) {
-	if hours, period := balanceAlertLead(time.Date(2026, 7, 29, 10, 0, 0, 0, time.UTC), 4, 12, 36); hours != 4 || period != "工作时段" {
-		t.Fatalf("unexpected work period: %d %s", hours, period)
-	}
-	if hours, period := balanceAlertLead(time.Date(2026, 7, 29, 22, 0, 0, 0, time.UTC), 4, 12, 36); hours != 12 || period != "夜间" {
-		t.Fatalf("unexpected night period: %d %s", hours, period)
-	}
-	if hours, period := balanceAlertLead(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC), 4, 12, 36); hours != 36 || period != "周末" {
-		t.Fatalf("unexpected weekend period: %d %s", hours, period)
+	if balanceBelowAlertThreshold(1, 0) {
+		t.Fatal("non-positive threshold must not alert")
 	}
 }
 
@@ -411,20 +370,15 @@ func TestEventEmailGuidanceIsActionable(t *testing.T) {
 			t.Fatalf("email is missing %q:\n%s", expected, content)
 		}
 	}
-	if eventEmailSetting("GROUP_AVAILABILITY") != "email_alert_group_availability" {
-		t.Fatal("group availability setting was not mapped")
+	for _, category := range []string{"SOURCE_BALANCE", "GROUP_AVAILABILITY"} {
+		if !(&App{}).eventEmailEnabled(context.Background(), category, "P1") {
+			t.Fatalf("category %s was not allowed to send email", category)
+		}
 	}
-	if eventEmailSetting("ACCOUNT_MODEL_SYNC") != "email_alert_platform_sync" {
-		t.Fatal("model mapping correction must use the account configuration setting")
-	}
-	if eventEmailSetting("ACCOUNT_RATE_SYNC") != "email_alert_platform_sync" {
-		t.Fatal("rate correction must use the account configuration setting")
-	}
-	if eventEmailSetting("TARGET_LOG") != "" {
-		t.Fatal("unconfigured event category unexpectedly has an email setting")
-	}
-	if (&App{}).eventEmailEnabled(context.Background(), "TARGET_LOG", "P1") {
-		t.Fatal("unconfigured event category was allowed to send email")
+	for _, category := range []string{"SOURCE_BALANCE", "GROUP_AVAILABILITY", "SOURCE_SCAN"} {
+		if (&App{}).eventEmailEnabled(context.Background(), category, "恢复") {
+			t.Fatalf("recovery event for %s must not send email", category)
+		}
 	}
 	modelGuidance := eventEmailGuidanceFor("ACCOUNT_MODEL_SYNC", false)
 	if modelGuidance.Scene != "账号模型映射校正失败" || !strings.Contains(modelGuidance.Action, "写入权限") {
@@ -1374,36 +1328,6 @@ func TestRankManagedAccountsExcludesIneligibleChannels(t *testing.T) {
 	}
 	if _, exists := priorities["unhealthy"]; exists {
 		t.Fatalf("ineligible account was ranked: %#v", priorities)
-	}
-}
-
-func TestGroupAvailabilityAlertSuppressesOnlyColdStart(t *testing.T) {
-	config := policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5}
-	warming := eligiblePolicyCandidate("warming", .2, 120)
-	warming.Samples = 2
-	warming.RecentSuccesses = 0
-	warming.SuccessRate = sql.NullFloat64{}
-	if groupNeedsAvailabilityAlert([]managedPolicyCandidate{warming}, config) {
-		t.Fatal("sample-only cold start should not alert")
-	}
-
-	unhealthy := warming
-	unhealthy.State = "OFFLINE"
-	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{unhealthy}, config) {
-		t.Fatal("offline group with no eligible account should alert")
-	}
-
-	overMultiplier := warming
-	overMultiplier.SourceMultiplier.Float64 = 1.1
-	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{overMultiplier}, config) {
-		t.Fatal("multiplier violation with no eligible account should alert")
-	}
-
-	failedValidation := warming
-	failedValidation.Samples = 5
-	failedValidation.SuccessRate = sql.NullFloat64{Float64: 40, Valid: true}
-	if !groupNeedsAvailabilityAlert([]managedPolicyCandidate{failedValidation}, config) {
-		t.Fatal("qualified sample window with low success rate should alert")
 	}
 }
 

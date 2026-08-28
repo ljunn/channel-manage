@@ -257,6 +257,9 @@ func formatBalanceEmail(severity, detail string, eventTime time.Time) string {
 	if balance := eventDetailField(detail, "当前余额"); balance != "" {
 		lines = append(lines, "当前余额："+balance)
 	}
+	if threshold := eventDetailField(detail, "提醒阈值"); threshold != "" {
+		lines = append(lines, "提醒阈值："+threshold)
+	}
 	if severity == "恢复" {
 		lines = append(lines, "恢复时间："+eventTime.In(location).Format("2006-01-02 15:04 UTC+8"))
 		return strings.Join(lines, "\n")
@@ -331,42 +334,11 @@ type eventEmailGuidance struct {
 	Automation string
 }
 
-func eventEmailSetting(category string) string {
-	switch category {
-	case "SOURCE_BALANCE":
-		return "email_alert_source_balance"
-	case "SOURCE_SCAN":
-		return "email_alert_source_scan"
-	case "TARGET_SYNC":
-		return "email_alert_target_sync"
-	case "GROUP_AVAILABILITY":
-		return "email_alert_group_availability"
-	case "ACTION_EXECUTION":
-		return "email_alert_action_execution"
-	case "ACCOUNT_PLATFORM_SYNC", "ACCOUNT_MODEL_SYNC", "ACCOUNT_RATE_SYNC":
-		return "email_alert_platform_sync"
-	default:
-		return ""
-	}
-}
-
 func (a *App) eventEmailEnabled(ctx context.Context, category, severity string) bool {
-	if severity == "恢复" && !a.settingBoolDefault(ctx, "email_alert_recovery", false) {
+	if severity == "恢复" {
 		return false
 	}
-	setting := eventEmailSetting(category)
-	if setting == "" {
-		return false
-	}
-	return a.settingBoolDefault(ctx, setting, true)
-}
-
-func (a *App) settingBoolDefault(ctx context.Context, key string, fallback bool) bool {
-	value, err := a.settingBool(ctx, key)
-	if err != nil {
-		return fallback
-	}
-	return value
+	return category == "SOURCE_BALANCE" || category == "GROUP_AVAILABILITY"
 }
 
 func eventEmailGuidanceFor(category string, recovered bool) eventEmailGuidance {
@@ -380,7 +352,7 @@ func eventEmailGuidanceFor(category string, recovered bool) eventEmailGuidance {
 	}
 	switch category {
 	case "SOURCE_BALANCE":
-		return eventEmailGuidance{"账户余额不足", "该数据源下的托管渠道可能无法请求，相关目标分组可能停止调度。", "请登录邮件中所列的数据源账户充值。充值到账后无需手动恢复。", "系统会持续复检余额和渠道；确认可用后自动恢复调度并发送恢复邮件。"}
+		return eventEmailGuidance{"账户余额不足", "该数据源下的托管渠道可能无法请求，相关目标分组可能停止调度。", "请登录邮件中所列的数据源账户充值。充值到账后无需手动恢复。", "系统会持续复检余额和渠道；确认可用后自动恢复调度并关闭事件，不发送恢复邮件。"}
 	case "SOURCE_SCAN":
 		return eventEmailGuidance{"数据源扫描失败", "余额、源分组和倍率暂时无法刷新，调度会继续使用最近一次有效数据。", "请检查对应源站是否在线、登录凭据是否失效，以及服务器到源站的网络是否可达。", "系统会按扫描周期自动重试，恢复后自动关闭事件。"}
 	case "TARGET_SYNC":

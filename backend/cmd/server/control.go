@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1126,10 +1127,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		"probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true,
 		"min_healthy_channels": true, "confirmation_failures": true, "metric_window_minutes": true,
 		"min_error_samples": true, "error_rate_threshold": true,
-		"balance_alert_work_hours": true, "balance_alert_night_hours": true, "balance_alert_weekend_hours": true,
-		"email_alert_source_balance": true, "email_alert_source_scan": true, "email_alert_target_sync": true,
-		"email_alert_group_availability": true, "email_alert_action_execution": true, "email_alert_platform_sync": true,
-		"email_alert_recovery": true,
+		"balance_alert_threshold": true,
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1140,15 +1138,10 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		if !allowed[key] {
 			return &apiError{400, "INVALID_SETTING", "包含不支持的系统设置"}
 		}
-		if strings.HasPrefix(key, "email_alert_") {
-			if _, ok := value.(bool); !ok {
-				return &apiError{400, "INVALID_EMAIL_ALERT_SETTING", "邮件场景开关必须是布尔值"}
-			}
-		}
-		if strings.HasPrefix(key, "balance_alert_") {
-			hours, ok := number(value)
-			if !ok || hours < 1 || hours > 168 || hours != float64(int(hours)) {
-				return &apiError{400, "INVALID_BALANCE_ALERT_WINDOW", "余额预警提前量必须是 1 到 168 之间的整数小时"}
+		if key == "balance_alert_threshold" {
+			threshold, ok := number(value)
+			if !ok || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 || threshold > 1000000 {
+				return &apiError{400, "INVALID_BALANCE_ALERT_THRESHOLD", "余额提醒阈值必须大于 0 且不超过 1000000"}
 			}
 		}
 		if _, err = tx.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()`, key, jsonValue(value)); err != nil {
@@ -1183,6 +1176,18 @@ func (a *App) settingInt(ctx context.Context, key string, fallback int) int {
 	}
 	value, err := strconv.Atoi(strings.Trim(raw, `"`))
 	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func (a *App) settingFloat(ctx context.Context, key string, fallback float64) float64 {
+	var raw string
+	if a.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=$1`, key).Scan(&raw) != nil {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(strings.Trim(raw, `"`), 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
 	}
 	return value

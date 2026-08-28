@@ -413,9 +413,6 @@ svg.lucide { flex: none; stroke-width: 1.8; }
 .danger-row input:checked + span { background: var(--red); }
 .notification-settings { grid-column: 1/-1; }
 .balance-alert-settings { grid-column: 1/-1; }
-.email-scene-settings { grid-column: 1/-1; }
-.email-scene-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 30px; }
-.email-scene-grid .toggle-row:nth-last-child(-n+2) { border-bottom: 0; }
 .form-grid.three { grid-template-columns: repeat(3,1fr); }
 .notification-settings .state-block { min-height: 120px; margin-top: 14px; }
 .notification-list { display: grid; margin-top: 12px; }
@@ -831,8 +828,6 @@ svg.lucide { flex: none; stroke-width: 1.8; }
   .settings-section > header > div { min-width: 0; flex: 1; }
   .route-settings { padding-bottom: 82px!important; }
   .route-settings .page-head > .btn { position: fixed; right: 16px; bottom: calc(12px + env(safe-area-inset-bottom)); left: 16px; z-index: 20; width: auto; height: 48px; box-shadow: var(--shadow-pop); }
-  .email-scene-grid { grid-template-columns: 1fr; }
-  .email-scene-grid .toggle-row:nth-last-child(2) { border-bottom: 1px solid var(--line-soft); }
   .notification-list > div { grid-template-columns: minmax(0,1fr) auto; }
   .notification-list > div > .btn { grid-column: 1/-1; justify-self: start; }
   .target-tile footer { align-items: flex-start; gap: 10px; }
