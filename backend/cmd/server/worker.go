@@ -28,6 +28,9 @@ const (
 	cacheStateRecoveryHold    = 15 * time.Minute
 	priorityChangeCooldown    = 5 * time.Minute
 	fallbackRebuildCooldown   = 15 * time.Minute
+	tokenRefreshCheckInterval = time.Minute
+	tokenRefreshLead          = 10 * time.Minute
+	tokenRefreshFallback      = 30 * time.Minute
 )
 
 const (
@@ -51,8 +54,10 @@ const (
 func (a *App) runScheduler(ctx context.Context) {
 	recoveryTicker := time.NewTicker(15 * time.Second)
 	maintenanceTicker := time.NewTicker(30 * time.Second)
+	tokenRefreshTicker := time.NewTicker(tokenRefreshCheckInterval)
 	defer recoveryTicker.Stop()
 	defer maintenanceTicker.Stop()
+	defer tokenRefreshTicker.Stop()
 	a.runAutomation(ctx)
 	for {
 		select {
@@ -62,13 +67,61 @@ func (a *App) runScheduler(ctx context.Context) {
 			a.runRecovery(ctx)
 		case <-maintenanceTicker.C:
 			a.runMaintenance(ctx)
+		case <-tokenRefreshTicker.C:
+			a.refreshDueSourceTokens(ctx)
 		}
 	}
 }
 
 func (a *App) runAutomation(ctx context.Context) {
+	a.refreshDueSourceTokens(ctx)
 	a.runRecovery(ctx)
 	a.runMaintenance(ctx)
+}
+
+func (a *App) refreshDueSourceTokens(ctx context.Context) {
+	if !a.sourceTokenRefreshMu.TryLock() {
+		return
+	}
+	defer a.sourceTokenRefreshMu.Unlock()
+
+	rows, err := a.db.QueryContext(ctx, `SELECT id FROM sources WHERE status='ACTIVE' AND (token_refresh_next_at IS NULL OR token_refresh_next_at<=now()) ORDER BY token_refresh_next_at NULLS FIRST,created_at`)
+	if err != nil {
+		logDatabaseError("读取待保活数据源", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		logDatabaseError("读取待保活数据源", err)
+	}
+	_ = rows.Close()
+	if len(ids) == 0 {
+		return
+	}
+
+	semaphore := make(chan struct{}, 4)
+	var wait sync.WaitGroup
+	for _, id := range ids {
+		id := id
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := a.refreshSourceToken(requestCtx, id); err != nil {
+				log.Printf("数据源 %s 会话保活失败: %v", id, err)
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 func (a *App) runRecovery(ctx context.Context) {

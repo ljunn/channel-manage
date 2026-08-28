@@ -41,7 +41,8 @@ type App struct {
 	recoveryMu                sync.Mutex
 	mappingMu                 sync.RWMutex
 	mappingGroupLocks         sync.Map
-	sourceAuthMu              sync.Mutex
+	sourceAuthLocks           sync.Map
+	sourceTokenRefreshMu      sync.Mutex
 	targetAuthMu              sync.Mutex
 	targetMultiplierMu        sync.Mutex
 	targetMultiplierRefreshes map[string]struct{}

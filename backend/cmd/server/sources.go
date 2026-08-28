@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +35,11 @@ type Source struct {
 	ScanStatus            string     `json:"scanStatus"`
 	LastScanAt            *time.Time `json:"lastScanAt"`
 	LastError             string     `json:"lastError"`
+	AccessTokenExpiresAt  *time.Time `json:"accessTokenExpiresAt"`
+	LastTokenRefreshAt    *time.Time `json:"lastTokenRefreshAt"`
+	TokenRefreshNextAt    *time.Time `json:"tokenRefreshNextAt"`
+	TokenRefreshFailures  int        `json:"tokenRefreshFailures"`
+	TokenRefreshError     string     `json:"tokenRefreshError"`
 	Balance               *float64   `json:"balance"`
 	BalanceCurrency       string     `json:"balanceCurrency"`
 	BalanceBurnRate       *float64   `json:"balanceBurnRate"`
@@ -66,7 +74,7 @@ type sourceCredentials struct {
 }
 
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.scheduling_paused,s.scheduling_paused_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.balance,s.balance_currency,s.created_at,
+	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.scheduling_paused,s.scheduling_paused_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.access_token_expires_at,s.last_token_refresh_at,s.token_refresh_next_at,s.token_refresh_failures,s.token_refresh_error,s.balance,s.balance_currency,s.created_at,
 		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),
 		(SELECT count(*) FROM source_groups g WHERE g.source_id=s.id),
 		(SELECT count(DISTINCT c.source_group_id) FROM managed_accounts m JOIN channels c ON c.id=m.channel_id WHERE c.source_id=s.id AND c.source_group_id IS NOT NULL),
@@ -79,9 +87,9 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 	result := []Source{}
 	for rows.Next() {
 		var item Source
-		var lastScan, manuallyUntrustedAt, schedulingPausedAt sql.NullTime
+		var lastScan, manuallyUntrustedAt, schedulingPausedAt, accessTokenExpiresAt, lastTokenRefreshAt, tokenRefreshNextAt sql.NullTime
 		var balance sql.NullFloat64
-		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.RechargeURL, &item.Status, &item.ManuallyUntrusted, &manuallyUntrustedAt, &item.SchedulingPaused, &schedulingPausedAt, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Platform, &item.BaseURL, &item.RechargeURL, &item.Status, &item.ManuallyUntrusted, &manuallyUntrustedAt, &item.SchedulingPaused, &schedulingPausedAt, &item.ValueDivisor, &item.UsernameHint, &item.Version, &item.ScanIntervalSeconds, &item.ScanStatus, &lastScan, &item.LastError, &accessTokenExpiresAt, &lastTokenRefreshAt, &tokenRefreshNextAt, &item.TokenRefreshFailures, &item.TokenRefreshError, &balance, &item.BalanceCurrency, &item.CreatedAt, &item.KeyCount, &item.GroupCount, &item.BoundGroupCount, &item.ManagedAccountCount); err != nil {
 			return nil, err
 		}
 		if lastScan.Valid {
@@ -95,6 +103,15 @@ func (a *App) listSources(ctx context.Context) ([]Source, error) {
 		}
 		if balance.Valid {
 			item.Balance = &balance.Float64
+		}
+		if accessTokenExpiresAt.Valid {
+			item.AccessTokenExpiresAt = &accessTokenExpiresAt.Time
+		}
+		if lastTokenRefreshAt.Valid {
+			item.LastTokenRefreshAt = &lastTokenRefreshAt.Time
+		}
+		if tokenRefreshNextAt.Valid {
+			item.TokenRefreshNextAt = &tokenRefreshNextAt.Time
 		}
 		result = append(result, item)
 	}
@@ -291,7 +308,7 @@ func (a *App) updateSource(w http.ResponseWriter, r *http.Request, id string) er
 		return err
 	}
 	if credentialChanged {
-		if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET credential_cipher=$2,username_hint=$3,scan_status='UNKNOWN',last_error='',updated_at=now() WHERE id=$1`, id, encryptedCredential, credentialHint); err != nil {
+		if _, err = tx.ExecContext(r.Context(), `UPDATE sources SET credential_cipher=$2,username_hint=$3,scan_status='UNKNOWN',last_error='',access_token_expires_at=NULL,last_token_refresh_at=NULL,token_refresh_next_at=CASE WHEN $3='令牌认证' THEN now() ELSE NULL END,token_refresh_failures=0,token_refresh_error='',updated_at=now() WHERE id=$1`, id, encryptedCredential, credentialHint); err != nil {
 			return err
 		}
 	}
@@ -472,8 +489,22 @@ func (a *App) authenticateSource(ctx context.Context, source Source, credential 
 }
 
 func (a *App) renewSourceSession(ctx context.Context, source Source, expected sourceCredentials) (remoteSession, error) {
-	a.sourceAuthMu.Lock()
-	defer a.sourceAuthMu.Unlock()
+	lock := a.sourceAuthLock(source.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return a.renewSourceSessionLocked(ctx, source, expected)
+}
+
+func (a *App) sourceAuthLock(sourceID string) *sync.Mutex {
+	if value, ok := a.sourceAuthLocks.Load(sourceID); ok {
+		return value.(*sync.Mutex)
+	}
+	created := &sync.Mutex{}
+	actual, _ := a.sourceAuthLocks.LoadOrStore(sourceID, created)
+	return actual.(*sync.Mutex)
+}
+
+func (a *App) renewSourceSessionLocked(ctx context.Context, source Source, expected sourceCredentials) (remoteSession, error) {
 
 	_, current, err := a.sourceCredentials(ctx, source.ID)
 	if err != nil {
@@ -519,10 +550,135 @@ func (a *App) persistSourceSession(ctx context.Context, sourceID string, credent
 	if err != nil {
 		return err
 	}
-	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,updated_at=now() WHERE id=$1`, sourceID, encrypted); err != nil {
+	var accessTokenExpiresAt, tokenRefreshNextAt any
+	if accessToken := strings.TrimSpace(strings.TrimPrefix(session.Authorization, "Bearer ")); accessToken != "" {
+		now := time.Now()
+		if expiresAt, ok := accessTokenExpiry(accessToken); ok {
+			accessTokenExpiresAt = expiresAt
+			nextAt := nextTokenRefreshAt(expiresAt, now)
+			tokenRefreshNextAt = nextAt
+		} else {
+			tokenRefreshNextAt = now.Add(tokenRefreshFallback)
+		}
+	}
+	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,access_token_expires_at=$3,last_token_refresh_at=CASE WHEN $4 IS NOT NULL THEN now() ELSE last_token_refresh_at END,token_refresh_next_at=$4,token_refresh_failures=0,token_refresh_error='',scan_status=CASE WHEN scan_status='AUTH_REQUIRED' THEN 'UNKNOWN' ELSE scan_status END,last_error=CASE WHEN scan_status='AUTH_REQUIRED' THEN '' ELSE last_error END,last_scan_at=CASE WHEN scan_status='AUTH_REQUIRED' THEN NULL ELSE last_scan_at END,updated_at=now() WHERE id=$1`, sourceID, encrypted, accessTokenExpiresAt, tokenRefreshNextAt); err != nil {
 		return err
 	}
 	return nil
+}
+
+func accessTokenExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}, false
+	}
+	var payload []byte
+	var err error
+	for _, encoding := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding} {
+		payload, err = encoding.DecodeString(parts[1])
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims map[string]json.RawMessage
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return time.Time{}, false
+	}
+	var seconds float64
+	if raw, ok := claims["exp"]; !ok || json.Unmarshal(raw, &seconds) != nil || seconds <= 0 {
+		return time.Time{}, false
+	}
+	if seconds > 1e12 {
+		seconds /= 1000
+	}
+	expiresAt := time.Unix(int64(seconds), 0)
+	if expiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return expiresAt, true
+}
+
+func nextTokenRefreshAt(expiresAt, now time.Time) time.Time {
+	remaining := expiresAt.Sub(now)
+	lead := tokenRefreshLead
+	if remaining > 0 && remaining/5 < lead {
+		lead = remaining / 5
+	}
+	if lead < time.Minute {
+		lead = time.Minute
+	}
+	next := expiresAt.Add(-lead)
+	if next.Before(now) {
+		return now
+	}
+	return next
+}
+
+func tokenRefreshBackoff(failures int) time.Duration {
+	switch {
+	case failures <= 1:
+		return time.Minute
+	case failures == 2:
+		return 5 * time.Minute
+	case failures == 3:
+		return 15 * time.Minute
+	case failures == 4:
+		return time.Hour
+	default:
+		return 6 * time.Hour
+	}
+}
+
+func (a *App) refreshSourceToken(ctx context.Context, sourceID string) error {
+	source, _, err := a.sourceCredentials(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	lock := a.sourceAuthLock(sourceID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	source, current, err := a.sourceCredentials(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	if source.Status != "ACTIVE" {
+		return nil
+	}
+	var nextAt sql.NullTime
+	if err = a.db.QueryRowContext(ctx, `SELECT token_refresh_next_at FROM sources WHERE id=$1`, sourceID).Scan(&nextAt); err != nil {
+		return err
+	}
+	if nextAt.Valid && nextAt.Time.After(time.Now()) {
+		return nil
+	}
+	if current.RefreshToken == "" && !(source.Platform == "NEW_API" && current.Cookie != "" && current.SessionID != "") {
+		_, err = a.db.ExecContext(ctx, `UPDATE sources SET token_refresh_next_at=now()+$2 * interval '1 second',updated_at=now() WHERE id=$1`, sourceID, int(tokenRefreshFallback.Seconds()))
+		return err
+	}
+	_, err = a.renewSourceSessionLocked(ctx, source, current)
+	if err == nil {
+		log.Printf("数据源 %s 会话保活成功", sourceID)
+		return nil
+	}
+	if recordErr := a.recordSourceTokenRefreshFailure(ctx, sourceID, err); recordErr != nil {
+		logDatabaseError("记录数据源令牌刷新失败", recordErr)
+	}
+	return err
+}
+
+func (a *App) recordSourceTokenRefreshFailure(ctx context.Context, sourceID string, cause error) error {
+	var failures int
+	if err := a.db.QueryRowContext(ctx, `SELECT token_refresh_failures FROM sources WHERE id=$1`, sourceID).Scan(&failures); err != nil {
+		return err
+	}
+	failures++
+	backoff := tokenRefreshBackoff(failures)
+	_, err := a.db.ExecContext(ctx, `UPDATE sources SET token_refresh_failures=$2,token_refresh_error=$3,token_refresh_next_at=now()+$4 * interval '1 second',updated_at=now() WHERE id=$1`, sourceID, failures, truncate(cause.Error(), 500), int(backoff.Seconds()))
+	return err
 }
 
 func (a *App) collectSource(ctx context.Context, source Source, session remoteSession) error {
