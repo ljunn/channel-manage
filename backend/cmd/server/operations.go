@@ -16,7 +16,9 @@ import (
 )
 
 func (a *App) listChannels(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT c.id,s.name,k.name,g.name,g.multiplier,c.lifecycle_state,c.state_reason,c.score,c.priority_tier,c.consecutive_failures,c.last_probe_at,c.state_changed_at,
+	rows, err := a.db.QueryContext(ctx, `SELECT c.id,s.name,k.name,g.name,g.multiplier,c.lifecycle_state,c.state_reason,c.score,
+		c.model_check_required,c.model_check_status,c.model_check_model,c.model_check_score,c.model_check_reason,c.model_check_version,c.model_check_trigger,c.model_check_at,c.model_check_started_at,c.model_check_override,c.model_check_override_at,c.model_check_override_reason,
+		c.priority_tier,c.consecutive_failures,c.last_probe_at,c.state_changed_at,
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '1 hour'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-interval '7 days'),
@@ -35,19 +37,20 @@ func (a *App) listChannels(ctx context.Context) ([]map[string]any, error) {
 	items := []map[string]any{}
 	for rows.Next() {
 		var id, sourceName, keyName, groupName, state, reason, tier string
-		var multiplier, score, rate1h, rate7d, p95, businessRate sql.NullFloat64
+		var modelCheckStatus, modelCheckModel, modelCheckReason, modelCheckVersion, modelCheckTrigger, modelCheckOverrideReason string
+		var multiplier, score, modelCheckScore, rate1h, rate7d, p95, businessRate sql.NullFloat64
 		var failures, samples, businessRequests int
-		var usesBusinessLatency bool
-		var lastProbe sql.NullTime
+		var usesBusinessLatency, modelCheckRequired, modelCheckOverride bool
+		var lastProbe, modelCheckAt, modelCheckStartedAt, modelCheckOverrideAt sql.NullTime
 		var changed time.Time
-		if err := rows.Scan(&id, &sourceName, &keyName, &groupName, &multiplier, &state, &reason, &score, &tier, &failures, &lastProbe, &changed, &samples, &rate1h, &rate7d, &p95, &usesBusinessLatency, &businessRequests, &businessRate); err != nil {
+		if err := rows.Scan(&id, &sourceName, &keyName, &groupName, &multiplier, &state, &reason, &score, &modelCheckRequired, &modelCheckStatus, &modelCheckModel, &modelCheckScore, &modelCheckReason, &modelCheckVersion, &modelCheckTrigger, &modelCheckAt, &modelCheckStartedAt, &modelCheckOverride, &modelCheckOverrideAt, &modelCheckOverrideReason, &tier, &failures, &lastProbe, &changed, &samples, &rate1h, &rate7d, &p95, &usesBusinessLatency, &businessRequests, &businessRate); err != nil {
 			return nil, err
 		}
 		speedSource := "PROBE"
 		if usesBusinessLatency {
 			speedSource = "BUSINESS"
 		}
-		items = append(items, map[string]any{"id": id, "sourceName": sourceName, "keyName": keyName, "groupName": groupName, "multiplier": nullableFloat(multiplier), "lifecycleState": state, "stateReason": reason, "score": nullableFloat(score), "priorityTier": tier, "consecutiveFailures": failures, "lastProbeAt": nullableTime(lastProbe), "stateChangedAt": changed, "probeSamples1h": samples, "probeExpected1h": 4, "probeSamples7d": samples, "probeExpected7d": 672, "successRate": nullableFloat(rate1h), "successRate7d": nullableFloat(rate7d), "firstTokenP95Ms": nullableFloat(p95), "speedFirstTokenMs": nullableFloat(p95), "speedMetricSource": speedSource, "requests": samples, "businessRequests1h": businessRequests, "businessSuccessRate1h": nullableFloat(businessRate), "metricWindowMinutes": 60})
+		items = append(items, map[string]any{"id": id, "sourceName": sourceName, "keyName": keyName, "groupName": groupName, "multiplier": nullableFloat(multiplier), "lifecycleState": state, "stateReason": reason, "score": nullableFloat(score), "modelCheckRequired": modelCheckRequired, "modelCheckStatus": modelCheckStatus, "modelCheckModel": modelCheckModel, "modelCheckScore": nullableFloat(modelCheckScore), "modelCheckReason": modelCheckReason, "modelCheckVersion": modelCheckVersion, "modelCheckTrigger": modelCheckTrigger, "modelCheckAt": nullableTime(modelCheckAt), "modelCheckStartedAt": nullableTime(modelCheckStartedAt), "modelCheckOverride": modelCheckOverride, "modelCheckOverrideAt": nullableTime(modelCheckOverrideAt), "modelCheckOverrideReason": modelCheckOverrideReason, "priorityTier": tier, "consecutiveFailures": failures, "lastProbeAt": nullableTime(lastProbe), "stateChangedAt": changed, "probeSamples1h": samples, "probeExpected1h": 4, "probeSamples7d": samples, "probeExpected7d": 672, "successRate": nullableFloat(rate1h), "successRate7d": nullableFloat(rate7d), "firstTokenP95Ms": nullableFloat(p95), "speedFirstTokenMs": nullableFloat(p95), "speedMetricSource": speedSource, "requests": samples, "businessRequests1h": businessRequests, "businessSuccessRate1h": nullableFloat(businessRate), "metricWindowMinutes": 60})
 	}
 	return items, rows.Err()
 }
@@ -60,9 +63,9 @@ func nullableTime(value sql.NullTime) any {
 }
 
 func (a *App) probeChannel(ctx context.Context, id string) error {
-	var sourceID, sourceName, sourceBase, keyName, groupName, encryptedKey, state, stateReason, modelsJSON string
-	var managed bool
-	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models,EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id) FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON, &managed)
+	var sourceID, sourceName, sourceBase, keyName, groupName, encryptedKey, state, stateReason, modelsJSON, modelCheckStatus string
+	var managed, modelCheckRequired, modelCheckOverride bool
+	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models,c.model_check_required,c.model_check_status,c.model_check_override,EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id) FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON, &modelCheckRequired, &modelCheckStatus, &modelCheckOverride, &managed)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
 	}
@@ -76,7 +79,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if isSlowFirstTokenQuarantine(state, stateReason) {
+	if isSlowFirstTokenQuarantine(state, stateReason) && !modelQualityOwnsHealthLifecycle(modelCheckStatus, modelCheckRequired, modelCheckOverride, state, stateReason) {
 		return a.probeSlowFirstTokenRecovery(ctx, id, sourceID, sourceName, sourceBase, keyName, groupName, string(keyBytes), modelsJSON)
 	}
 	models := []string{}
@@ -122,7 +125,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 			firstTokenMs, probeModels, unavailableModels, sampleErr := a.measureProbeModels(ctx, id, sourceBase, string(keyBytes), models)
 			unavailableNote := ""
 			if len(unavailableModels) > 0 {
-				unavailableNote = fmt.Sprintf("；已跳过不支持的分组测试模型 %s", strings.Join(unavailableModels, "、"))
+				unavailableNote = fmt.Sprintf("；已跳过不支持的业务测速模型 %s", strings.Join(unavailableModels, "、"))
 			}
 			if len(probeModels) == 0 && len(unavailableModels) > 0 && sampleErr == nil {
 				skippedActiveProbe = true
@@ -132,7 +135,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				requestErr = sampleErr
 				errorType = "PROBE_MODEL_UNAVAILABLE"
 				if requestErr == nil {
-					requestErr = fmt.Errorf("没有已配置的分组测试模型")
+					requestErr = fmt.Errorf("没有已配置的业务测速模型")
 				}
 				summary = truncate(requestErr.Error(), 200)
 				latency = 0
@@ -145,7 +148,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				modelLabel := strings.Join(probeModels, "、")
 				if slowFirstToken {
 					errorType = "FIRST_TOKEN_TOO_SLOW"
-					summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
+					summary = fmt.Sprintf("业务测速模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
 				} else if sampleErr != nil {
 					errorType, summary = classifyProbeFailure(sampleErr)
 					if errorType != "BALANCE_EXHAUSTED" {
@@ -153,7 +156,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 					}
 				} else {
 					errorType = ""
-					summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
+					summary = fmt.Sprintf("业务测速模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
 				}
 				summary = truncate(summary+unavailableNote, 200)
 			}
@@ -165,6 +168,17 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	var currentState, currentStateReason, currentModelCheckStatus string
+	var currentModelCheckRequired, currentModelCheckOverride bool
+	if err = tx.QueryRowContext(ctx, `SELECT lifecycle_state,state_reason,model_check_required,model_check_status,model_check_override FROM channels WHERE id=$1 FOR UPDATE`, id).Scan(&currentState, &currentStateReason, &currentModelCheckRequired, &currentModelCheckStatus, &currentModelCheckOverride); err != nil {
+		return err
+	}
+	state = currentState
+	stateReason = currentStateReason
+	modelCheckRequired = currentModelCheckRequired
+	modelCheckStatus = currentModelCheckStatus
+	modelCheckOverride = currentModelCheckOverride
+	qualityOwnsHealth := modelQualityOwnsHealthLifecycle(modelCheckStatus, modelCheckRequired, modelCheckOverride, state, stateReason)
 	_, err = tx.ExecContext(ctx, `INSERT INTO probe_runs(channel_id,kind,success,latency_ms,first_token_ms,error_type,response_summary,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())`, id, probeKind, success, latency, firstTokenValue, truncate(errorType, 100), summary)
 	if err != nil {
 		return err
@@ -172,7 +186,11 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if modelsLoaded && len(models) > 0 {
 		_, _ = tx.ExecContext(ctx, `UPDATE source_keys SET models=$2::jsonb,updated_at=now() WHERE id=(SELECT source_key_id FROM channels WHERE id=$1)`, id, jsonValue(models))
 	}
-	if slowFirstToken && !managed {
+	if state == "MANUAL_HOLD" || qualityOwnsHealth {
+		// Health samples are retained, but a quality gate owns the lifecycle until
+		// it reaches a clear verdict or an administrator explicitly overrides it.
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+	} else if slowFirstToken && !managed {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,score=0,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, slowFirstTokenReason(latency))
 	} else if success && skippedActiveProbe {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
@@ -686,6 +704,16 @@ func (a *App) updateChannelState(w http.ResponseWriter, r *http.Request, id, act
 		writeData(w, map[string]string{"id": id, "state": "MANUAL_HOLD"})
 		return nil
 	case "resume-validation":
+		var qualityStatus string
+		var qualityRequired, qualityOverride bool
+		if err := a.db.QueryRowContext(r.Context(), `SELECT model_check_status,model_check_required,model_check_override FROM channels WHERE id=$1`, id).Scan(&qualityStatus, &qualityRequired, &qualityOverride); errors.Is(err, sql.ErrNoRows) {
+			return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
+		} else if err != nil {
+			return err
+		}
+		if modelQualityBlocksSchedulingFor(qualityStatus, qualityRequired, qualityOverride) {
+			return &apiError{409, "MODEL_CHECK_REQUIRED", "该渠道仍受模型能力检测闸门限制，请先手动检测或人工强制通过"}
+		}
 		_, err := a.db.ExecContext(r.Context(), `UPDATE channels SET lifecycle_state='VALIDATING',state_reason='等待重新验证',consecutive_failures=0,state_changed_at=now() WHERE id=$1`, id)
 		if err != nil {
 			return err

@@ -123,6 +123,9 @@ func validateRemoteURLWithOptions(raw string, allowPublicIPHTTP bool) (string, e
 }
 
 func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, session remoteSession, body any) (any, http.Header, error) {
+	if a.httpClient == nil {
+		return nil, nil, &apiError{Status: 502, Code: "REMOTE_UNAVAILABLE", Message: "远端 HTTP 客户端未初始化"}
+	}
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -204,6 +207,8 @@ func (a *App) remoteJSON(ctx context.Context, baseURL, method, path string, sess
 			code = "REMOTE_UNAUTHORIZED"
 		} else if response.StatusCode == http.StatusNotFound {
 			code = "REMOTE_NOT_FOUND"
+		} else if response.StatusCode >= 500 {
+			code = "REMOTE_UNAVAILABLE"
 		}
 		return value, response.Header, &apiError{Status: 502, Code: code, Message: message}
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -203,6 +204,31 @@ func (a *App) runPolicyEvaluation(ctx context.Context) {
 	}
 }
 
+func (a *App) requestPolicyEvaluation() {
+	a.policyEvaluationMu.Lock()
+	a.policyEvaluationRequested = true
+	if a.policyEvaluationRunning {
+		a.policyEvaluationMu.Unlock()
+		return
+	}
+	a.policyEvaluationRunning = true
+	a.policyEvaluationMu.Unlock()
+
+	go func() {
+		for {
+			a.policyEvaluationMu.Lock()
+			if !a.policyEvaluationRequested {
+				a.policyEvaluationRunning = false
+				a.policyEvaluationMu.Unlock()
+				return
+			}
+			a.policyEvaluationRequested = false
+			a.policyEvaluationMu.Unlock()
+			a.runPolicyEvaluation(context.Background())
+		}
+	}()
+}
+
 func (a *App) scanDueSources(ctx context.Context) {
 	rows, err := a.db.QueryContext(ctx, `SELECT id FROM sources WHERE status='ACTIVE' AND scan_status NOT IN ('RUNNING','AUTH_REQUIRED') AND (last_scan_at IS NULL OR last_scan_at + (CASE WHEN manually_untrusted THEN GREATEST(scan_interval_seconds,86400) ELSE scan_interval_seconds END) * interval '1 second' <= now())`)
 	if err != nil {
@@ -342,7 +368,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.SourceUntrusted || item.SourcePaused || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+	if item.SourceUntrusted || item.SourcePaused || item.State == "MANUAL_HOLD" || modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
 	return item.LatencyState == latencyStateSlow || item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -440,26 +466,63 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 	}
 	shadow, _ := a.settingBool(ctx, "shadow_mode")
 	frozen, _ := a.settingBool(ctx, "emergency_freeze")
-	if shadow || frozen {
-		return nil
-	}
 	for _, policy := range policies {
 		groupItems := candidatesForTargetGroup(items, policy.ScopeID)
-		groupItems, err = a.advanceManagedLatencyStates(ctx, groupItems, policy.Config, time.Now())
-		if err != nil {
-			return err
+		if policy.Config.DynamicMultiplierEnabled {
+			quote, available := calculateDynamicMultiplier(groupItems, policy.Config)
+			if !available {
+				detail := "目标分组没有可用于计算动态倍率的源分组价格；系统保留 Sub2API 当前倍率，等待数据源刷新。"
+				a.openEvent(ctx, "P1", "DYNAMIC_MULTIPLIER", "动态倍率计算失败", detail, dynamicMultiplierEventKey(policy.ScopeID))
+			} else if !shadow && !frozen {
+				if err = a.reconcileDynamicTargetGroupMultiplier(ctx, policy.ID, policy.ScopeID, quote); err != nil {
+					detail := fmt.Sprintf("最低价分组 %s 为 %.6fx，计划将目标倍率调整为 %.6fx，但写入 Sub2API 失败：%s", quote.SourceGroup, quote.Lowest, quote.Desired, userErrorMessage(err))
+					a.openEvent(ctx, "P1", "DYNAMIC_MULTIPLIER", "动态倍率同步失败", detail, dynamicMultiplierEventKey(policy.ScopeID))
+				} else {
+					a.resolveEvent(ctx, dynamicMultiplierEventKey(policy.ScopeID))
+					groupItems = candidatesWithTargetMultiplier(groupItems, quote.Desired)
+				}
+			}
+		} else {
+			a.resolveEvent(ctx, dynamicMultiplierEventKey(policy.ScopeID))
 		}
-		groupItems, err = a.advanceManagedCacheStates(ctx, groupItems, policy.Config, time.Now())
-		if err != nil {
-			return err
+		// Shadow mode and emergency freeze suppress remote/lifecycle writes, but
+		// availability monitoring still has to run so an empty target group can
+		// raise the configured email alert.
+		if !shadow && !frozen {
+			groupItems, err = a.advanceManagedLatencyStates(ctx, groupItems, policy.Config, time.Now())
+			if err != nil {
+				return err
+			}
+			groupItems, err = a.advanceManagedCacheStates(ctx, groupItems, policy.Config, time.Now())
+			if err != nil {
+				return err
+			}
 		}
 		plan := planManagedAccounts(groupItems, policy.Config)
 		desiredPriority := plan.Priorities
-		if len(groupItems) > 0 && len(desiredPriority) == 0 {
+		if len(groupItems) == 0 {
+			targetName, groupName := a.targetGroupAvailabilityLabel(ctx, policy.ScopeID)
+			detail := fmt.Sprintf("%s / %s 当前没有任何托管账号，目标分组没有可用渠道。请先在数据源中完成绑定。", targetName, groupName)
+			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
+			continue
+		}
+		if len(desiredPriority) == 0 {
+			qualityBlocked := 0
+			for _, item := range groupItems {
+				if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
+					qualityBlocked++
+				}
+			}
 			detail := fmt.Sprintf("%s / %s 当前没有任何符合策略的托管账号。系统仍在快速复检可恢复渠道，请检查源站余额、渠道状态和倍率。", groupItems[0].TargetName, groupItems[0].TargetGroup)
+			if qualityBlocked > 0 {
+				detail += fmt.Sprintf("其中 %d 个渠道受模型能力检测闸门限制；请到渠道雷达手动检测，或在确认风险后人工放行。", qualityBlocked)
+			}
 			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
 		} else if len(desiredPriority) > 0 {
 			a.resolveEvent(ctx, "group-availability:"+policy.ScopeID)
+		}
+		if shadow || frozen {
+			continue
 		}
 		for _, item := range groupItems {
 			reasons := policyRejectionReasons(item, policy.Config)
@@ -501,6 +564,66 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+type dynamicMultiplierQuote struct {
+	Lowest      float64
+	Desired     float64
+	SourceGroup string
+}
+
+func calculateDynamicMultiplier(items []managedPolicyCandidate, config policyConfig) (dynamicMultiplierQuote, bool) {
+	config = normalizePolicyConfig(config)
+	if !config.DynamicMultiplierEnabled || validateDynamicMultiplierConfig(config) != nil {
+		return dynamicMultiplierQuote{}, false
+	}
+	quote := dynamicMultiplierQuote{}
+	found := false
+	for _, item := range items {
+		if !item.SourceMultiplier.Valid || math.IsNaN(item.SourceMultiplier.Float64) || math.IsInf(item.SourceMultiplier.Float64, 0) || item.SourceMultiplier.Float64 < 0 {
+			continue
+		}
+		if !found || item.SourceMultiplier.Float64 < quote.Lowest {
+			quote.Lowest = item.SourceMultiplier.Float64
+			quote.SourceGroup = item.SourceGroup
+			found = true
+		}
+	}
+	if !found {
+		return dynamicMultiplierQuote{}, false
+	}
+	if config.DynamicMultiplierType == dynamicMultiplierPercent {
+		raw := quote.Lowest * (1 + config.DynamicMultiplierValue/100)
+		quote.Desired = math.Ceil(raw*100-1e-9) / 100
+		quote.Desired = math.Max(dynamicMultiplierStep, quote.Desired)
+	} else {
+		quote.Desired = quote.Lowest + config.DynamicMultiplierValue
+		quote.Desired = math.Round(quote.Desired*1_000_000) / 1_000_000
+	}
+	if math.IsNaN(quote.Desired) || math.IsInf(quote.Desired, 0) || quote.Desired <= 0 || quote.Desired > 10_000_000 {
+		return dynamicMultiplierQuote{}, false
+	}
+	return quote, true
+}
+
+func candidatesWithTargetMultiplier(items []managedPolicyCandidate, multiplier float64) []managedPolicyCandidate {
+	updated := append([]managedPolicyCandidate(nil), items...)
+	for index := range updated {
+		updated[index].TargetMultiplier = sql.NullFloat64{Float64: multiplier, Valid: true}
+	}
+	return updated
+}
+
+func dynamicMultiplierEventKey(targetGroupID string) string {
+	return "dynamic-multiplier:" + targetGroupID
+}
+
+func (a *App) targetGroupAvailabilityLabel(ctx context.Context, groupID string) (string, string) {
+	var targetName, groupName string
+	if err := a.db.QueryRowContext(ctx, `SELECT t.name,tg.name FROM target_groups tg JOIN targets t ON t.id=tg.target_id WHERE tg.id=$1`, groupID).Scan(&targetName, &groupName); err != nil {
+		return "目标节点", "目标分组"
+	}
+	return targetName, groupName
 }
 
 func (a *App) enqueueManagedAction(ctx context.Context, managedID, action string, before, after any, reason string) {
@@ -550,18 +673,22 @@ func (a *App) enqueueManagedActionWithCooldown(ctx context.Context, managedID, a
 type managedPolicyCandidate struct {
 	ID, ChannelID, TargetGroupID, RemoteID, RemoteName, SourceName, TargetName string
 	State, StateReason, SourceGroup, TargetGroup, SyncStatus                   string
+	ModelCheckStatus, ModelCheckModel, ModelCheckReason                        string
 	LatencyState                                                               string
 	CacheState                                                                 string
 	Platform, ModelsJSON, SpeedMetricModel                                     string
 	SpeedMetricSource                                                          string
 	CacheMetricSource, CacheMetricModel, CacheMetricRequestType                string
 	Schedulable                                                                bool
+	ModelCheckRequired                                                         bool
+	ModelCheckOverride                                                         bool
 	FallbackActive                                                             bool
 	CachePenaltyActive                                                         bool
 	SourceUntrusted                                                            bool
 	SourcePaused                                                               bool
 	Priority                                                                   int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50             sql.NullFloat64
+	ModelCheckScore                                                            sql.NullFloat64
 	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                   sql.NullFloat64
 	CacheScore                                                                 sql.NullFloat64
 	ProbeFirstTokenP95, LatestProbeFirstToken                                  sql.NullFloat64
@@ -578,7 +705,7 @@ type managedPolicyCandidate struct {
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_id,m.remote_name,min(s.name),min(t.name),m.schedulable,m.fallback_active,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_id,m.remote_name,min(s.name),min(t.name),m.schedulable,m.fallback_active,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.model_check_required,c.model_check_status,c.model_check_override,c.model_check_score,c.model_check_reason,c.model_check_model,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		m.business_first_token_ms,m.business_first_token_p90_ms,m.business_latency_samples,m.business_latency_at,m.business_latency_model,
@@ -605,7 +732,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP50, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -1055,6 +1182,20 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	}
 	if item.SourcePaused {
 		reasons = append(reasons, "数据源已人工暂停调度")
+	}
+	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
+		switch item.ModelCheckStatus {
+		case modelCheckPending:
+			reasons = append(reasons, "等待模型能力检测")
+		case modelCheckRunning:
+			reasons = append(reasons, "模型能力检测进行中")
+		case modelCheckFailed:
+			reasons = append(reasons, "模型能力检测不通过："+item.ModelCheckReason)
+		case modelCheckUnknown:
+			reasons = append(reasons, "模型能力检测失败，等待人工处理："+item.ModelCheckReason)
+		default:
+			reasons = append(reasons, "模型能力检测未通过")
+		}
 	}
 	unconfirmed := unconfirmedProbeFailure(item)
 	if item.State != "HEALTHY" && !unconfirmed {

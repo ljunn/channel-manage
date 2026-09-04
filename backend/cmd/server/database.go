@@ -100,14 +100,52 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE target_groups DROP COLUMN IF EXISTS protected_best_priority`,
 		`DROP TABLE IF EXISTS protected_accounts`,
 		`CREATE TABLE IF NOT EXISTS channels (
-			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-			source_key_id UUID NOT NULL REFERENCES source_keys(id) ON DELETE CASCADE, source_group_id UUID REFERENCES source_groups(id) ON DELETE SET NULL,
-			lifecycle_state TEXT NOT NULL DEFAULT 'DISCOVERED', state_reason TEXT NOT NULL DEFAULT '', score NUMERIC(8,3),
-			priority_tier TEXT NOT NULL DEFAULT 'STANDARD', consecutive_failures INT NOT NULL DEFAULT 0,
-			last_probe_at TIMESTAMPTZ, last_slow_sample_at TIMESTAMPTZ, state_changed_at TIMESTAMPTZ NOT NULL DEFAULT now(), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			UNIQUE(source_key_id, source_group_id)
-		)`,
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+				source_key_id UUID NOT NULL REFERENCES source_keys(id) ON DELETE CASCADE, source_group_id UUID REFERENCES source_groups(id) ON DELETE SET NULL,
+				lifecycle_state TEXT NOT NULL DEFAULT 'DISCOVERED', state_reason TEXT NOT NULL DEFAULT '', score NUMERIC(8,3),
+				priority_tier TEXT NOT NULL DEFAULT 'STANDARD', consecutive_failures INT NOT NULL DEFAULT 0,
+				last_probe_at TIMESTAMPTZ, last_slow_sample_at TIMESTAMPTZ,
+				model_check_required BOOLEAN NOT NULL DEFAULT false, model_check_status TEXT NOT NULL DEFAULT 'LEGACY', model_check_model TEXT NOT NULL DEFAULT '',
+				model_check_score NUMERIC(6,2), model_check_reason TEXT NOT NULL DEFAULT '', model_check_version TEXT NOT NULL DEFAULT '',
+				model_check_trigger TEXT NOT NULL DEFAULT '', model_check_at TIMESTAMPTZ, model_check_started_at TIMESTAMPTZ,
+				model_check_override BOOLEAN NOT NULL DEFAULT false, model_check_override_at TIMESTAMPTZ,
+				model_check_override_reason TEXT NOT NULL DEFAULT '',
+				state_changed_at TIMESTAMPTZ NOT NULL DEFAULT now(), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				UNIQUE(source_key_id, source_group_id)
+			)`,
 		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS last_slow_sample_at TIMESTAMPTZ`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_required BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_status TEXT NOT NULL DEFAULT 'LEGACY'`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_score NUMERIC(6,2)`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_version TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_trigger TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_at TIMESTAMPTZ`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_started_at TIMESTAMPTZ`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_override BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_override_at TIMESTAMPTZ`,
+		`ALTER TABLE channels ADD COLUMN IF NOT EXISTS model_check_override_reason TEXT NOT NULL DEFAULT ''`,
+		// Channels created by an earlier development build may already carry the
+		// pending marker but predate model_check_required. Preserve that intent.
+		`UPDATE channels SET model_check_required=true,model_check_trigger=CASE WHEN model_check_trigger='' THEN 'NEW_CHANNEL' ELSE model_check_trigger END WHERE NOT model_check_required AND model_check_status IN ('PENDING','RUNNING') AND (state_reason LIKE '等待模型能力检测%' OR state_reason LIKE '模型能力检测进行中%')`,
+		// Manual checks are never resumed automatically. A process exit while a
+		// manual request is queued therefore becomes an explicit UNKNOWN result.
+		`UPDATE channels SET model_check_status='UNKNOWN',model_check_reason='服务在检测开始前重启',model_check_score=NULL,model_check_started_at=NULL,model_check_at=now() WHERE model_check_status='PENDING' AND model_check_trigger='MANUAL'`,
+		`UPDATE channels SET model_check_status='UNKNOWN',model_check_reason='服务在检测完成前重启',model_check_score=NULL,model_check_started_at=NULL,model_check_at=now() WHERE model_check_status='RUNNING'`,
+		// Once the initial gate has a real pass, later manual technical failures
+		// are observational and must not take an established channel offline.
+		`UPDATE channels SET model_check_required=false WHERE model_check_required AND model_check_status='PASSED'`,
+		`CREATE INDEX IF NOT EXISTS idx_channels_model_check_status ON channels(model_check_status)`,
+		`CREATE TABLE IF NOT EXISTS model_check_runs (
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(), channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+				trigger TEXT NOT NULL, status TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
+				score NUMERIC(6,2), task_count INT NOT NULL DEFAULT 0, passed_tasks INT NOT NULL DEFAULT 0,
+				input_tokens BIGINT NOT NULL DEFAULT 0, output_tokens BIGINT NOT NULL DEFAULT 0, total_tokens BIGINT NOT NULL DEFAULT 0,
+				error_type TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', details JSONB NOT NULL DEFAULT '{}'::jsonb,
+				started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ
+			)`,
+		`CREATE INDEX IF NOT EXISTS idx_model_check_runs_channel_time ON model_check_runs(channel_id,started_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS probe_runs (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
 			kind TEXT NOT NULL, success BOOLEAN NOT NULL, status_code INT, latency_ms INT, first_token_ms INT,
@@ -228,7 +266,13 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			version INT NOT NULL, config JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(policy_id, version)
 		)`,
 		`UPDATE policy_versions v
-		SET config=jsonb_set(v.config,'{probeModel}',to_jsonb(tg.probe_model),true)
+		SET config=jsonb_set(v.config,'{probeModel}',to_jsonb(CASE lower(COALESCE(tg.platform,'openai'))
+			WHEN 'openai' THEN 'gpt-5.6-sol'
+			WHEN 'anthropic' THEN COALESCE(NULLIF(tg.probe_model,''),'claude-3-5-haiku-latest')
+			WHEN 'gemini' THEN COALESCE(NULLIF(tg.probe_model,''),'gemini-2.5-flash')
+			WHEN 'grok' THEN COALESCE(NULLIF(tg.probe_model,''),'grok-3-mini')
+			ELSE COALESCE(NULLIF(tg.probe_model,''),'gpt-5.6-sol')
+		END),true)
 		FROM policies p JOIN target_groups tg ON tg.id=p.scope_id
 		WHERE v.policy_id=p.id AND COALESCE(v.config->>'probeModel','')=''`,
 		`CREATE TABLE IF NOT EXISTS action_intents (
@@ -289,7 +333,8 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"probe_interval_seconds": "900", "scan_interval_seconds": "900", "max_daily_probe_cost_usd": "1",
 		"min_healthy_channels": "1", "confirmation_failures": "3", "metric_window_minutes": "5",
 		"min_error_samples": "5", "error_rate_threshold": "20",
-		"balance_alert_threshold": "10",
+		"balance_alert_threshold":     "10",
+		modelQualityProbeModelSetting: "\"gpt-5.6-sol\"",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

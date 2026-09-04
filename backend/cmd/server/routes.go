@@ -273,6 +273,27 @@ func (a *App) routeAPI(w http.ResponseWriter, r *http.Request, path string) erro
 			return a.targetStatus(w, r, id, parts[2])
 		}
 	}
+	if len(parts) == 3 && parts[0] == "channels" && parts[2] == "model-check" {
+		if method == http.MethodPost {
+			return a.startModelQualityCheckAPI(w, r, parts[1])
+		}
+		if method == http.MethodGet {
+			value, err := a.modelQualityStatus(r.Context(), parts[1])
+			if err != nil {
+				return err
+			}
+			writeData(w, value)
+			return nil
+		}
+	}
+	if len(parts) == 4 && parts[0] == "channels" && parts[2] == "model-check" {
+		if parts[3] == "override" && method == http.MethodPatch {
+			return a.updateModelQualityOverride(w, r, parts[1])
+		}
+		if parts[3] == "runs" && method == http.MethodGet {
+			return a.listModelQualityRuns(w, r, parts[1])
+		}
+	}
 	if len(parts) == 2 && parts[0] == "policies" {
 		if method == http.MethodPatch {
 			return a.updatePolicy(w, r, parts[1])

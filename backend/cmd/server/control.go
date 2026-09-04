@@ -239,7 +239,7 @@ func (a *App) listSchedulingStatus(ctx context.Context) ([]map[string]any, error
 			"sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup,
 			"targetName": candidate.TargetName, "targetGroupId": candidate.TargetGroupID, "targetGroup": candidate.TargetGroup,
 			"schedulable": candidate.Schedulable, "eligible": eligible, "fallback": fallback, "fallbackActive": candidate.FallbackActive, "priority": candidate.Priority, "plannedPriority": plannedPriority, "syncStatus": candidate.SyncStatus,
-			"channelState": candidate.State, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
+			"channelState": candidate.State, "modelCheckRequired": candidate.ModelCheckRequired, "modelCheckStatus": candidate.ModelCheckStatus, "modelCheckModel": candidate.ModelCheckModel, "modelCheckScore": nullableFloat(candidate.ModelCheckScore), "modelCheckReason": candidate.ModelCheckReason, "modelCheckOverride": candidate.ModelCheckOverride, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetMultiplier": nullableFloat(candidate.TargetMultiplier),
 			"samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "firstTokenP95Ms": nullableFloat(candidate.FirstTokenP50), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "maxFirstTokenMs": policy.Config.MaxFirstTokenMs, "recentSuccesses": displayedSuccesses,
 			"cacheState": candidate.CacheState, "cacheScore": nullableFloat(candidate.CacheScore), "cacheSamples": candidate.CacheSamples, "cacheInputTokens": candidate.CacheInputTokens, "cacheReadTokens": candidate.CacheReadTokens, "cacheMetricSource": candidate.CacheMetricSource, "cacheMetricModel": candidate.CacheMetricModel, "cacheMetricRequestType": candidate.CacheMetricRequestType, "cachePenaltyActive": candidate.CachePenaltyActive, "cacheExploration": plans[candidate.TargetGroupID].Exploration[candidate.ID], "cacheReason": policyCacheReason(candidate, policy.Config), "cacheMode": policy.Config.CacheMode,
 			"latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, policy.Config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples,
@@ -664,28 +664,35 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 }
 
 type policyConfig struct {
-	Mode                 string   `json:"mode"`
-	MinSuccessRate       float64  `json:"minSuccessRate"`
-	MinSamples           int      `json:"minSamples"`
-	MaxFirstTokenMs      int      `json:"maxFirstTokenMs"`
-	MinAvailableChannels int      `json:"minAvailableChannels"`
-	PriorityStart        int      `json:"priorityStart"`
-	PriorityStep         int      `json:"priorityStep"`
-	AllowEqualMultiplier bool     `json:"allowEqualMultiplier"`
-	ProbeModel           string   `json:"probeModel"`
-	DisabledModels       []string `json:"disabledModels"`
-	CacheMode            string   `json:"cacheMode"`
-	CacheMinRequests     int      `json:"cacheMinRequests"`
-	CacheMinInputTokens  int64    `json:"cacheMinInputTokens"`
-	CacheAbsoluteGap     float64  `json:"cacheAbsoluteGap"`
-	CacheRelativeGap     float64  `json:"cacheRelativeGap"`
-	CacheBadSnapshots    int      `json:"cacheBadSnapshots"`
-	CacheGoodSnapshots   int      `json:"cacheGoodSnapshots"`
+	Mode                     string   `json:"mode"`
+	MinSuccessRate           float64  `json:"minSuccessRate"`
+	MinSamples               int      `json:"minSamples"`
+	MaxFirstTokenMs          int      `json:"maxFirstTokenMs"`
+	MinAvailableChannels     int      `json:"minAvailableChannels"`
+	PriorityStart            int      `json:"priorityStart"`
+	PriorityStep             int      `json:"priorityStep"`
+	AllowEqualMultiplier     bool     `json:"allowEqualMultiplier"`
+	DynamicMultiplierEnabled bool     `json:"dynamicMultiplierEnabled"`
+	DynamicMultiplierType    string   `json:"dynamicMultiplierType"`
+	DynamicMultiplierValue   float64  `json:"dynamicMultiplierValue"`
+	ProbeModel               string   `json:"probeModel"`
+	DisabledModels           []string `json:"disabledModels"`
+	CacheMode                string   `json:"cacheMode"`
+	CacheMinRequests         int      `json:"cacheMinRequests"`
+	CacheMinInputTokens      int64    `json:"cacheMinInputTokens"`
+	CacheAbsoluteGap         float64  `json:"cacheAbsoluteGap"`
+	CacheRelativeGap         float64  `json:"cacheRelativeGap"`
+	CacheBadSnapshots        int      `json:"cacheBadSnapshots"`
+	CacheGoodSnapshots       int      `json:"cacheGoodSnapshots"`
 }
 
 const defaultPolicyMaxFirstTokenMs = 10_000
 
 const (
+	dynamicMultiplierFixed   = "FIXED"
+	dynamicMultiplierPercent = "PERCENT"
+	dynamicMultiplierStep    = 0.01
+
 	cacheModeOff            = "OFF"
 	cacheModeObserve        = "OBSERVE"
 	cacheModeDeprioritize   = "DEPRIORITIZE"
@@ -698,6 +705,12 @@ const (
 func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.Mode != "SPEED" {
 		config.Mode = "PRICE"
+	}
+	if config.DynamicMultiplierType != dynamicMultiplierPercent {
+		config.DynamicMultiplierType = dynamicMultiplierFixed
+	}
+	if config.DynamicMultiplierValue == 0 && !config.DynamicMultiplierEnabled {
+		config.DynamicMultiplierValue = dynamicMultiplierStep
 	}
 	if config.MinSuccessRate <= 0 {
 		config.MinSuccessRate = 95
@@ -744,6 +757,9 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 }
 
 func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, config policyConfig) (policyConfig, error) {
+	if err := validateDynamicMultiplierConfig(config); err != nil {
+		return config, err
+	}
 	if config.MaxFirstTokenMs < 1_000 || config.MaxFirstTokenMs > maxFirstTokenMs {
 		return config, &apiError{400, "INVALID_FIRST_TOKEN_LIMIT", "首 Token 上限需要设置为 1 至 60 秒"}
 	}
@@ -771,15 +787,12 @@ func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, conf
 	if config.CacheBadSnapshots < 1 || config.CacheBadSnapshots > 20 || config.CacheGoodSnapshots < 1 || config.CacheGoodSnapshots > 20 {
 		return config, &apiError{400, "INVALID_CACHE_SNAPSHOTS", "缓存确认窗口需要设置为 1 至 20 次"}
 	}
-	var platform, defaultModel string
-	if err := a.db.QueryRowContext(ctx, `SELECT platform,probe_model FROM target_groups WHERE id=$1`, scopeID).Scan(&platform, &defaultModel); err != nil {
+	var platform string
+	if err := a.db.QueryRowContext(ctx, `SELECT platform FROM target_groups WHERE id=$1`, scopeID).Scan(&platform); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return config, &apiError{400, "INVALID_POLICY_SCOPE", "目标分组不存在"}
 		}
 		return config, err
-	}
-	if config.ProbeModel == "" {
-		config.ProbeModel = strings.TrimSpace(defaultModel)
 	}
 	if config.ProbeModel == "" {
 		config.ProbeModel = defaultProbeModelForPlatform(platform)
@@ -790,9 +803,32 @@ func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, conf
 	return config, nil
 }
 
+func validateDynamicMultiplierConfig(config policyConfig) error {
+	if !config.DynamicMultiplierEnabled {
+		return nil
+	}
+	if config.Mode != "PRICE" {
+		return &apiError{400, "DYNAMIC_MULTIPLIER_PRICE_ONLY", "动态倍率只能在价格优先策略中启用"}
+	}
+	value := config.DynamicMultiplierValue
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < dynamicMultiplierStep {
+		return &apiError{400, "INVALID_DYNAMIC_MULTIPLIER_VALUE", "动态倍率上浮值不能小于 0.01"}
+	}
+	if config.DynamicMultiplierType == dynamicMultiplierPercent {
+		if value > 10_000 {
+			return &apiError{400, "INVALID_DYNAMIC_MULTIPLIER_VALUE", "动态倍率上浮百分比不能超过 10000%"}
+		}
+		return nil
+	}
+	if config.DynamicMultiplierType != dynamicMultiplierFixed || value > 1_000 {
+		return &apiError{400, "INVALID_DYNAMIC_MULTIPLIER_VALUE", "动态倍率固定增加值需要设置为 0.01 至 1000"}
+	}
+	return nil
+}
+
 func validatePolicyModelNames(config policyConfig) error {
 	if !validPolicyModelName(config.ProbeModel) {
-		return &apiError{400, "INVALID_PROBE_MODEL", "测试模型需要是 1 至 200 个字符的单行模型名称"}
+		return &apiError{400, "INVALID_PROBE_MODEL", "业务测速模型需要是 1 至 200 个字符的单行模型名称"}
 	}
 	if len(config.DisabledModels) > 200 {
 		return &apiError{400, "TOO_MANY_DISABLED_MODELS", "禁用模型最多填写 200 个"}
@@ -802,7 +838,7 @@ func validatePolicyModelNames(config policyConfig) error {
 			return &apiError{400, "INVALID_DISABLED_MODEL", "禁用模型需要是 1 至 200 个字符的单行模型名称"}
 		}
 		if model == config.ProbeModel {
-			return &apiError{400, "PROBE_MODEL_DISABLED", "测试模型不能同时加入禁用模型清单"}
+			return &apiError{400, "PROBE_MODEL_DISABLED", "业务测速模型不能同时加入禁用模型清单"}
 		}
 	}
 	return nil
@@ -817,7 +853,7 @@ func validPolicyModelName(model string) bool {
 }
 
 func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id,COALESCE(tg.models,'[]'::jsonb),
+	rows, err := a.db.QueryContext(ctx, `SELECT p.id,p.name,p.scope_type,p.scope_id,p.status,p.active_version,p.created_at,COALESCE(v.config,'{}'::jsonb),COALESCE(tg.name,''),COALESCE(t.name,''),tg.target_id,COALESCE(tg.models,'[]'::jsonb),tg.multiplier,
 		(SELECT count(*) FROM managed_account_groups mg WHERE mg.target_group_id=p.scope_id),
 		(SELECT count(*) FROM managed_account_groups mg JOIN managed_accounts m ON m.id=mg.managed_account_id WHERE mg.target_group_id=p.scope_id AND m.schedulable=true)
 		FROM policies p LEFT JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version LEFT JOIN target_groups tg ON tg.id=p.scope_id LEFT JOIN targets t ON t.id=tg.target_id ORDER BY p.created_at DESC`)
@@ -830,14 +866,15 @@ func (a *App) listPolicies(ctx context.Context) ([]map[string]any, error) {
 		var id, name, scope, status, config, targetGroupName, targetName, probeModels string
 		var scopeID, targetID sql.NullString
 		var active sql.NullInt64
+		var targetMultiplier sql.NullFloat64
 		var managedCount, schedulableCount int
 		var created time.Time
-		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID, &probeModels, &managedCount, &schedulableCount); err != nil {
+		if err := rows.Scan(&id, &name, &scope, &scopeID, &status, &active, &created, &config, &targetGroupName, &targetName, &targetID, &probeModels, &targetMultiplier, &managedCount, &schedulableCount); err != nil {
 			return nil, err
 		}
 		var policy policyConfig
 		_ = json.Unmarshal([]byte(config), &policy)
-		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "probeModels": json.RawMessage(probeModels), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": fastProbeIntervalSeconds, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
+		items = append(items, map[string]any{"id": id, "name": name, "scopeType": scope, "scopeId": nullableString(scopeID), "targetId": nullableString(targetID), "targetGroupName": targetGroupName, "targetName": targetName, "targetMultiplier": nullableFloat(targetMultiplier), "status": status, "activeVersion": nullableInt(active), "config": normalizePolicyConfig(policy), "probeModels": json.RawMessage(probeModels), "managedCount": managedCount, "schedulableCount": schedulableCount, "evaluationIntervalSeconds": fastProbeIntervalSeconds, "metricWindowDays": policyMetricWindowDays, "multiplierLimitSource": "TARGET_GROUP", "multiplierCacheSeconds": int(targetMultiplierCacheTTL.Seconds()), "createdAt": created})
 	}
 	return items, rows.Err()
 }
@@ -913,6 +950,7 @@ func (a *App) deletePolicy(w http.ResponseWriter, r *http.Request, id string) er
 		return &apiError{404, "POLICY_NOT_FOUND", "策略不存在"}
 	}
 	a.audit(r.Context(), "DELETE", "policy", id, nil)
+	a.resolveEvent(r.Context(), dynamicMultiplierEventKey(scopeID))
 	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]bool{"deleted": true})
 	return nil
@@ -928,6 +966,7 @@ func (a *App) deactivatePolicy(w http.ResponseWriter, r *http.Request, id string
 		return err
 	}
 	a.audit(r.Context(), "DEACTIVATE", "policy", id, nil)
+	a.resolveEvent(r.Context(), dynamicMultiplierEventKey(scopeID))
 	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]any{"id": id, "status": "DRAFT"})
 	return nil
@@ -1070,6 +1109,18 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	preview := []map[string]any{}
 	groupCandidates := candidatesForTargetGroup(candidates, scopeID)
+	dynamicPreview := map[string]any{"enabled": config.DynamicMultiplierEnabled}
+	if config.DynamicMultiplierEnabled {
+		if quote, available := calculateDynamicMultiplier(groupCandidates, config); available {
+			dynamicPreview["available"] = true
+			dynamicPreview["sourceGroup"] = quote.SourceGroup
+			dynamicPreview["lowest"] = quote.Lowest
+			dynamicPreview["desired"] = quote.Desired
+			groupCandidates = candidatesWithTargetMultiplier(groupCandidates, quote.Desired)
+		} else {
+			dynamicPreview["available"] = false
+		}
+	}
 	plan := planManagedAccounts(groupCandidates, config)
 	for _, candidate := range groupCandidates {
 		reasons := policyRejectionReasons(candidate, config)
@@ -1090,7 +1141,7 @@ func (a *App) simulatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		}
 		preview = append(preview, map[string]any{"managedAccountId": candidate.ID, "remoteName": candidate.RemoteName, "sourceName": candidate.SourceName, "sourceGroup": candidate.SourceGroup, "sourceMultiplier": nullableFloat(candidate.SourceMultiplier), "targetName": candidate.TargetName, "targetGroup": candidate.TargetGroup, "targetMultiplier": nullableFloat(candidate.TargetMultiplier), "samples": candidate.Samples, "successRate": nullableFloat(candidate.SuccessRate), "minSamples": config.MinSamples, "minSuccessRate": config.MinSuccessRate, "maxFirstTokenMs": config.MaxFirstTokenMs, "firstTokenP50Ms": nullableFloat(candidate.FirstTokenP50), "firstTokenP90Ms": nullableFloat(candidate.FirstTokenP90), "speedFirstTokenMs": nullableFloat(candidate.FirstTokenP50), "speedMetricSource": candidate.SpeedMetricSource, "speedMetricModel": candidate.SpeedMetricModel, "speedMetricSamples": candidate.SpeedMetricSamples, "latencyState": candidate.LatencyState, "latencyBadSnapshots": candidate.LatencyBadSnapshots, "latencyBadRequired": latencyBadSnapshotLimit(candidate, config), "latencyGoodSnapshots": candidate.LatencyGoodSnapshots, "latencyMinSamples": businessLatencyMinSamples, "cacheState": candidate.CacheState, "cacheScore": nullableFloat(candidate.CacheScore), "cacheSamples": candidate.CacheSamples, "cacheInputTokens": candidate.CacheInputTokens, "cacheReadTokens": candidate.CacheReadTokens, "cacheMetricSource": candidate.CacheMetricSource, "cacheMetricModel": candidate.CacheMetricModel, "cacheMetricRequestType": candidate.CacheMetricRequestType, "cachePenaltyActive": candidate.CachePenaltyActive, "cacheExploration": plan.Exploration[candidate.ID], "cacheReason": policyCacheReason(candidate, config), "cacheMode": config.CacheMode, "cacheAbsoluteGap": config.CacheAbsoluteGap, "cacheRelativeGap": config.CacheRelativeGap, "plannedPriority": priority, "decision": decision, "reasons": reasons})
 	}
-	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "preview": preview})
+	writeData(w, map[string]any{"policyId": id, "generatedAt": time.Now(), "dynamicMultiplier": dynamicPreview, "preview": preview})
 	return nil
 }
 
@@ -1127,7 +1178,8 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		"probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true,
 		"min_healthy_channels": true, "confirmation_failures": true, "metric_window_minutes": true,
 		"min_error_samples": true, "error_rate_threshold": true,
-		"balance_alert_threshold": true,
+		"balance_alert_threshold":     true,
+		modelQualityProbeModelSetting: true,
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1143,6 +1195,17 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 			if !ok || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 || threshold > 1000000 {
 				return &apiError{400, "INVALID_BALANCE_ALERT_THRESHOLD", "余额提醒阈值必须大于 0 且不超过 1000000"}
 			}
+		}
+		if key == modelQualityProbeModelSetting {
+			configured, ok := value.(string)
+			if !ok {
+				return &apiError{400, "INVALID_MODEL", "模型能力检测模型必须是文本"}
+			}
+			normalized, validationErr := resolveModelQualityProbeModel(configured)
+			if validationErr != nil {
+				return validationErr
+			}
+			value = normalized
 		}
 		if _, err = tx.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()`, key, jsonValue(value)); err != nil {
 			return err

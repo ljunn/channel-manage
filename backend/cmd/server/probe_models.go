@@ -43,9 +43,15 @@ func modelMatchesPlatform(platform, model string) bool {
 	if value == "" {
 		return false
 	}
+	// Providers commonly prefix an upstream model with their own namespace
+	// (for example openai/gpt-4o). Platform matching should inspect the model
+	// family while preserving the original ID for the remote request.
+	if slash := strings.LastIndexByte(value, '/'); slash >= 0 {
+		value = value[slash+1:]
+	}
 	switch managedPlatform(platform) {
 	case "openai":
-		return strings.HasPrefix(value, "gpt-")
+		return strings.HasPrefix(value, "gpt-") || strings.HasPrefix(value, "o1") || strings.HasPrefix(value, "o3") || strings.HasPrefix(value, "o4") || strings.HasPrefix(value, "chatgpt-")
 	case "anthropic":
 		return strings.HasPrefix(value, "claude-")
 	case "gemini":
@@ -136,7 +142,7 @@ func intersectModels(left, right []string) []string {
 
 func preferredProbeModel(platform string, models []string) string {
 	preferences := map[string][]string{
-		"openai":    {"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"},
+		"openai":    {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"},
 		"anthropic": {"claude-sonnet-4-6", "claude-sonnet-4-5-20250929"},
 		"gemini":    {"gemini-2.5-pro", "gemini-2.5-flash"},
 		"grok":      {"grok-4.3"},
@@ -156,7 +162,7 @@ func preferredProbeModel(platform string, models []string) string {
 
 func defaultProbeModelForPlatform(platform string) string {
 	defaults := map[string]string{
-		"openai":    "gpt-4.1-mini",
+		"openai":    "gpt-5.6-sol",
 		"anthropic": "claude-3-5-haiku-latest",
 		"gemini":    "gemini-2.5-flash",
 		"grok":      "grok-3-mini",
@@ -164,7 +170,7 @@ func defaultProbeModelForPlatform(platform string) string {
 	if model := defaults[managedPlatform(platform)]; model != "" {
 		return model
 	}
-	return "gpt-4.1-mini"
+	return "gpt-5.6-sol"
 }
 
 func (a *App) ensureTargetProbeModels(ctx context.Context, targetID string) error {
@@ -234,7 +240,7 @@ func (a *App) configuredChannelProbeModels(ctx context.Context, channelID string
 			return nil, nil, err
 		}
 		if model == "" {
-			return nil, nil, fmt.Errorf("目标分组 %s 尚未指定测试模型", groupName)
+			return nil, nil, fmt.Errorf("目标分组 %s 尚未指定业务测速模型", groupName)
 		}
 		if !available[model] {
 			unavailable = append(unavailable, fmt.Sprintf("%s：%s", groupName, model))
@@ -268,7 +274,7 @@ func (a *App) measureProbeModels(ctx context.Context, channelID, baseURL, key st
 			maximum = firstTokenMs
 		}
 		if sampleErr != nil {
-			return maximum, models, unavailable, fmt.Errorf("测试模型 %s：%w", model, sampleErr)
+			return maximum, models, unavailable, fmt.Errorf("业务测速模型 %s：%w", model, sampleErr)
 		}
 		if firstTokenMs > maxFirstTokenMs {
 			return maximum, models, unavailable, nil

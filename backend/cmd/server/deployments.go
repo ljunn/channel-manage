@@ -277,6 +277,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 	}
 	defer tx.Rollback()
 	result := make([]map[string]any, 0, len(sourceGroups)*len(targetGroups))
+	newChannelIDs := make([]string, 0, len(created))
 	for _, item := range created {
 		keyID := uuid.NewString()
 		encryptedKey, encryptErr := a.encryptSecret([]byte(item.Key.Key))
@@ -288,10 +289,11 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 			return nil, err
 		}
 		channelID := uuid.NewString()
-		_, err = tx.ExecContext(ctx, `INSERT INTO channels(id,source_id,source_key_id,source_group_id,lifecycle_state,state_reason,score,last_probe_at) VALUES($1,$2,$3,$4,'HEALTHY','自动映射已完成模型验证',100,now())`, channelID, sourceID, keyID, item.SourceGroup.ID)
+		_, err = tx.ExecContext(ctx, `INSERT INTO channels(id,source_id,source_key_id,source_group_id,lifecycle_state,state_reason,model_check_required,model_check_status,model_check_trigger) VALUES($1,$2,$3,$4,'DISCOVERED','等待模型能力检测',true,'PENDING','NEW_CHANNEL')`, channelID, sourceID, keyID, item.SourceGroup.ID)
 		if err != nil {
 			return nil, err
 		}
+		newChannelIDs = append(newChannelIDs, channelID)
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
 			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, item.Models, account.TargetGroup.DisabledModels))
@@ -309,6 +311,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		return nil, err
 	}
 	committed = true
+	a.queueNewModelChecks(newChannelIDs)
 	for _, item := range result {
 		a.audit(ctx, "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_id": item["targetGroupId"]})
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -107,6 +109,10 @@ func (a *App) targetCredentials(ctx context.Context, id string) (Target, sourceC
 }
 
 func (a *App) syncTarget(ctx context.Context, id string) error {
+	assetLock := a.targetAssetLock(id)
+	assetLock.Lock()
+	defer assetLock.Unlock()
+
 	target, _, err := a.targetCredentials(ctx, id)
 	if err != nil {
 		return err
@@ -163,6 +169,71 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		a.syncManagedAccountModelMappings(platformCtx, target, session)
 	}()
 	return nil
+}
+
+func (a *App) targetAssetLock(targetID string) *sync.Mutex {
+	if value, ok := a.targetAssetLocks.Load(targetID); ok {
+		return value.(*sync.Mutex)
+	}
+	created := &sync.Mutex{}
+	actual, _ := a.targetAssetLocks.LoadOrStore(targetID, created)
+	return actual.(*sync.Mutex)
+}
+
+func (a *App) reconcileDynamicTargetGroupMultiplier(ctx context.Context, policyID, targetGroupID string, quote dynamicMultiplierQuote) error {
+	var targetID string
+	if err := a.db.QueryRowContext(ctx, `SELECT target_id FROM target_groups WHERE id=$1`, targetGroupID).Scan(&targetID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return &apiError{404, "TARGET_GROUP_NOT_FOUND", "动态倍率对应的目标分组不存在"}
+		}
+		return err
+	}
+	assetLock := a.targetAssetLock(targetID)
+	assetLock.Lock()
+	defer assetLock.Unlock()
+
+	var remoteID, groupName string
+	var current sql.NullFloat64
+	if err := a.db.QueryRowContext(ctx, `SELECT remote_id,name,multiplier FROM target_groups WHERE id=$1 AND target_id=$2`, targetGroupID, targetID).Scan(&remoteID, &groupName, &current); err != nil {
+		return err
+	}
+	if current.Valid && !rateMultiplierNeedsSync(current.Float64, true, quote.Desired) {
+		return nil
+	}
+	target, _, err := a.targetCredentials(ctx, targetID)
+	if err != nil {
+		return err
+	}
+	if !target.WriteEnabled {
+		return &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入，无法同步动态倍率"}
+	}
+	requestCtx, cancel := timeoutContext(ctx)
+	defer cancel()
+	session, err := a.authenticateTarget(requestCtx, target, true)
+	if err != nil {
+		return err
+	}
+	if err = a.updateRemoteTargetGroupMultiplier(requestCtx, target.BaseURL, remoteID, session, quote.Desired); err != nil {
+		return err
+	}
+	if _, err = a.db.ExecContext(context.Background(), `UPDATE target_groups SET multiplier=$2,multiplier_captured_at=now(),updated_at=now() WHERE id=$1`, targetGroupID, quote.Desired); err != nil {
+		return err
+	}
+	a.audit(context.Background(), "SYNC_DYNAMIC_MULTIPLIER", "target_group", targetGroupID, map[string]any{
+		"policy_id": policyID, "remote_id": remoteID, "group": groupName,
+		"source_group": quote.SourceGroup, "lowest": quote.Lowest,
+		"before": nullableFloat(current), "desired": quote.Desired,
+	})
+	return nil
+}
+
+func (a *App) updateRemoteTargetGroupMultiplier(ctx context.Context, baseURL, remoteID string, session remoteSession, multiplier float64) error {
+	value, _, err := a.remoteJSON(ctx, baseURL, http.MethodPut, "/api/v1/admin/groups/"+url.PathEscape(remoteID), session, map[string]any{"rate_multiplier": multiplier})
+	if err != nil {
+		return err
+	}
+	_, err = unwrapEnvelope(value, "SUB2API")
+	return err
 }
 
 func (a *App) syncPolicyModelMappings(ctx context.Context, targetGroupID string) {

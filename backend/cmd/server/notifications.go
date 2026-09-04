@@ -358,7 +358,7 @@ func eventEmailGuidanceFor(category string, recovered bool) eventEmailGuidance {
 	case "TARGET_SYNC":
 		return eventEmailGuidance{"目标节点同步失败", "目标分组倍率或账号状态可能不是最新值，后续调度写入可能延迟。", "请检查目标节点是否在线，以及管理员账号和写入权限是否有效。", "系统会自动重试同步；成功后刷新缓存并关闭事件。"}
 	case "GROUP_AVAILABILITY":
-		return eventEmailGuidance{"目标分组无人可调度", "该目标分组当前没有可用托管账号，流量无法正常分配。", "请打开“调度运行”，展开该分组的未参与账号，按显示原因优先处理余额、倍率或渠道状态。", "系统最快每 15 秒复检待恢复账号；任一账号恢复后会自动重新参与调度。"}
+		return eventEmailGuidance{"目标分组无人可调度", "该目标分组当前没有可用托管账号，流量无法正常分配。", "请打开“调度运行”，展开该分组的未参与账号，按显示原因优先处理余额、倍率或渠道状态；如果是模型能力检测，前往“渠道雷达”手动检测或在确认风险后人工放行。", "系统最快每 15 秒复检待恢复账号；任一账号恢复后会自动重新参与调度，不会自动重复模型能力检测。"}
 	case "ACTION_EXECUTION":
 		return eventEmailGuidance{"远程调度写入失败", "系统判定的启停或优先级变更没有完整写入目标节点。", "请打开“调度运行”的执行记录，查看失败账号和远端返回原因后处理。", "系统会保留失败记录并继续执行后续有效调度；故障解除后自动恢复。"}
 	case "ACCOUNT_PLATFORM_SYNC":

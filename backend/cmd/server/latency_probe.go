@@ -134,10 +134,10 @@ func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sou
 	}
 	if requestErr == nil && !success {
 		errorType = "FIRST_TOKEN_TOO_SLOW"
-		summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
+		summary = fmt.Sprintf("业务测速模型 %s 首 Token %.2f 秒超过 60 秒", modelLabel, float64(firstTokenMs)/1000)
 	}
 	if success {
-		summary = fmt.Sprintf("测试模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
+		summary = fmt.Sprintf("业务测速模型 %s 首 Token %.2f 秒", modelLabel, float64(firstTokenMs)/1000)
 	}
 
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -145,6 +145,12 @@ func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sou
 		return err
 	}
 	defer tx.Rollback()
+	var currentState, currentStateReason, modelCheckStatus string
+	var modelCheckRequired, modelCheckOverride bool
+	if err = tx.QueryRowContext(ctx, `SELECT lifecycle_state,state_reason,model_check_required,model_check_status,model_check_override FROM channels WHERE id=$1 FOR UPDATE`, id).Scan(&currentState, &currentStateReason, &modelCheckRequired, &modelCheckStatus, &modelCheckOverride); err != nil {
+		return err
+	}
+	qualityOwnsHealth := modelQualityOwnsHealthLifecycle(modelCheckStatus, modelCheckRequired, modelCheckOverride, currentState, currentStateReason)
 	_, err = tx.ExecContext(ctx, `INSERT INTO probe_runs(channel_id,kind,success,latency_ms,first_token_ms,error_type,response_summary,finished_at) VALUES($1,'RECOVERY',$2,$3,$3,$4,$5,now())`, id, success, firstTokenMs, truncate(errorType, 100), summary)
 	if err != nil {
 		return err
@@ -171,7 +177,9 @@ func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sou
 		}
 	}
 	recovered := success && recoverySuccesses >= recoverySuccessSamples
-	if recovered {
+	if currentState == "MANUAL_HOLD" || qualityOwnsHealth {
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+	} else if recovered {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason=$2,score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, fmt.Sprintf("真实业务首 Token 连续 %d 次抽样通过，已恢复", recoverySuccessSamples))
 	} else if success {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,consecutive_failures=0,last_probe_at=now() WHERE id=$1`, id, fmt.Sprintf("真实业务首 Token 隔离抽样：连续通过 %d/%d，本次 %.2f 秒", recoverySuccesses, recoverySuccessSamples, float64(firstTokenMs)/1000))

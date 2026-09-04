@@ -436,6 +436,7 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 			a.evaluateSourceBalance(ctx, id)
 		}
 		go a.syncSourceManagedAccountRateMultipliers(id)
+		a.requestPolicyEvaluation()
 	}
 	return err
 }
@@ -817,11 +818,30 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO channels(source_id,source_key_id,source_group_id,state_reason) SELECT k.source_id,k.id,g.id,'等待首次探测' FROM source_keys k JOIN source_groups g ON g.source_id=k.source_id WHERE k.source_id=$1 AND k.production_authorized=true AND k.auto_generated=false ON CONFLICT DO NOTHING`, source.ID)
+	rows, err := tx.QueryContext(ctx, `INSERT INTO channels(source_id,source_key_id,source_group_id,lifecycle_state,state_reason,model_check_required,model_check_status,model_check_trigger) SELECT k.source_id,k.id,g.id,'DISCOVERED','等待模型能力检测',true,'PENDING','NEW_CHANNEL' FROM source_keys k JOIN source_groups g ON g.source_id=k.source_id WHERE k.source_id=$1 AND k.production_authorized=true AND k.auto_generated=false ON CONFLICT DO NOTHING RETURNING id`, source.ID)
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	newChannelIDs := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		newChannelIDs = append(newChannelIDs, id)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	a.queueNewModelChecks(newChannelIDs)
+	return nil
 }
 
 func sourceProfileBalance(profile map[string]any) (float64, bool) {
@@ -880,12 +900,35 @@ func (a *App) addSourceKey(w http.ResponseWriter, r *http.Request, sourceID stri
 	if err != nil {
 		return err
 	}
+	newChannelIDs := []string{}
 	if input.ProductionAuthorized {
-		_, err = a.db.ExecContext(r.Context(), `INSERT INTO channels(source_id,source_key_id,source_group_id,state_reason) SELECT $1,$2,id,'等待首次探测' FROM source_groups WHERE source_id=$1 ON CONFLICT DO NOTHING`, sourceID, id)
+		rows, insertErr := a.db.QueryContext(r.Context(), `INSERT INTO channels(source_id,source_key_id,source_group_id,lifecycle_state,state_reason,model_check_required,model_check_status,model_check_trigger) SELECT $1,$2,id,'DISCOVERED','等待模型能力检测',true,'PENDING','NEW_CHANNEL' FROM source_groups WHERE source_id=$1 ON CONFLICT DO NOTHING RETURNING id`, sourceID, id)
+		if insertErr != nil {
+			err = insertErr
+		} else {
+			for rows.Next() {
+				var channelID string
+				if scanErr := rows.Scan(&channelID); scanErr != nil {
+					err = scanErr
+					break
+				}
+				newChannelIDs = append(newChannelIDs, channelID)
+			}
+			if closeErr := rows.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+			if err == nil {
+				err = rows.Err()
+			}
+		}
 	}
 	a.audit(r.Context(), "CREATE", "source_key", id, map[string]any{"source_id": sourceID, "production_authorized": input.ProductionAuthorized})
+	if err != nil {
+		return err
+	}
+	a.queueNewModelChecks(newChannelIDs)
 	writeData(w, map[string]any{"id": id})
-	return err
+	return nil
 }
 
 func (a *App) sourceDetail(w http.ResponseWriter, r *http.Request, id string) error {

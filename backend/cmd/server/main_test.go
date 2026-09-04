@@ -813,6 +813,105 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 	}
 }
 
+func TestCalculateDynamicMultiplierUsesLowestBoundGroup(t *testing.T) {
+	items := []managedPolicyCandidate{
+		{SourceGroup: "较高价", SourceMultiplier: sql.NullFloat64{Float64: .08, Valid: true}},
+		{SourceGroup: "最低价", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}},
+		{SourceGroup: "缺少价格"},
+	}
+	percent := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierPercent, DynamicMultiplierValue: 5}
+	quote, ok := calculateDynamicMultiplier(items, percent)
+	if !ok || quote.SourceGroup != "最低价" || quote.Lowest != .06 || quote.Desired != .07 {
+		t.Fatalf("unexpected percentage quote: %#v, ok=%v", quote, ok)
+	}
+
+	fixed := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierFixed, DynamicMultiplierValue: .01}
+	quote, ok = calculateDynamicMultiplier(items, fixed)
+	if !ok || quote.Desired != .07 {
+		t.Fatalf("unexpected fixed quote: %#v, ok=%v", quote, ok)
+	}
+}
+
+func TestCalculateDynamicMultiplierPercentRoundsUpByOneCent(t *testing.T) {
+	config := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierPercent, DynamicMultiplierValue: 5}
+	quote, ok := calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "A", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}}}, config)
+	if !ok || quote.Desired != .07 {
+		t.Fatalf("0.063 should round up to 0.07, got %#v", quote)
+	}
+
+	config.DynamicMultiplierValue = 20
+	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "B", SourceMultiplier: sql.NullFloat64{Float64: .05, Valid: true}}}, config)
+	if !ok || quote.Desired != .06 {
+		t.Fatalf("an exact cent must not be rounded to the next cent, got %#v", quote)
+	}
+
+	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "免费", SourceMultiplier: sql.NullFloat64{Float64: 0, Valid: true}}}, config)
+	if !ok || quote.Desired != dynamicMultiplierStep {
+		t.Fatalf("dynamic target multiplier must remain at least 0.01, got %#v", quote)
+	}
+}
+
+func TestValidateDynamicMultiplierRequiresPriceModeAndMinimumValue(t *testing.T) {
+	config := policyConfig{Mode: "SPEED", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierFixed, DynamicMultiplierValue: .01}
+	if err := validateDynamicMultiplierConfig(config); err == nil {
+		t.Fatal("speed-first policy accepted dynamic multiplier")
+	}
+	config.Mode = "PRICE"
+	config.DynamicMultiplierValue = 0
+	if normalized := normalizePolicyConfig(config); validateDynamicMultiplierConfig(normalized) == nil {
+		t.Fatal("enabled dynamic multiplier accepted a missing value")
+	}
+	config.DynamicMultiplierValue = .001
+	if err := validateDynamicMultiplierConfig(config); err == nil {
+		t.Fatal("dynamic multiplier accepted a value below 0.01")
+	}
+	config.DynamicMultiplierValue = .01
+	if err := validateDynamicMultiplierConfig(config); err != nil {
+		t.Fatalf("valid dynamic multiplier was rejected: %v", err)
+	}
+}
+
+func TestUpdateRemoteTargetGroupMultiplierUsesSub2APIGroupEndpoint(t *testing.T) {
+	t.Setenv("ALLOW_PRIVATE_UPSTREAMS", "true")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/admin/groups/17" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("X-Admin-UI-Request") != "1" {
+			t.Fatal("dynamic group update was not marked as an admin UI request")
+		}
+		var payload map[string]float64
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["rate_multiplier"] != .07 {
+			t.Fatalf("unexpected payload: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"id":17,"rate_multiplier":0.07}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: newRemoteHTTPClient()}
+	if err := app.updateRemoteTargetGroupMultiplier(context.Background(), server.URL, "17", remoteSession{}, .07); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateRemoteTargetGroupMultiplierRejectsSub2APIBusinessError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":1,"message":"倍率不可用"}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	err := app.updateRemoteTargetGroupMultiplier(context.Background(), server.URL, "17", remoteSession{}, .07)
+	if err == nil || !strings.Contains(err.Error(), "倍率不可用") {
+		t.Fatalf("business rejection was not propagated: %v", err)
+	}
+}
+
 func TestExtractCacheUsageUsesNormalizedAdminFields(t *testing.T) {
 	usage, ok := extractCacheUsage(map[string]any{"input_tokens": 2000, "cache_read_tokens": 1200, "cache_creation_tokens": 400})
 	if !ok || usage.InputTokens != 2000 || usage.CacheReadTokens != 1200 || usage.CacheCreationTokens != 400 {
@@ -1261,6 +1360,9 @@ func TestPolicyModelNamesAllowModelsOutsideDiscoveredList(t *testing.T) {
 }
 
 func TestDefaultProbeModelExistsForEveryManagedPlatform(t *testing.T) {
+	if got := defaultProbeModelForPlatform("openai"); got != "gpt-5.6-sol" {
+		t.Fatalf("OpenAI default probe model=%q, want gpt-5.6-sol", got)
+	}
 	for _, platform := range []string{"openai", "anthropic", "gemini", "grok", "custom"} {
 		if model := defaultProbeModelForPlatform(platform); model == "" {
 			t.Fatalf("platform %s has no default probe model", platform)

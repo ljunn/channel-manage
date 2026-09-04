@@ -39,11 +39,15 @@ type App struct {
 	httpClient                *http.Client
 	workerMu                  sync.Mutex
 	recoveryMu                sync.Mutex
+	policyEvaluationMu        sync.Mutex
+	policyEvaluationRunning   bool
+	policyEvaluationRequested bool
 	mappingMu                 sync.RWMutex
 	mappingGroupLocks         sync.Map
 	sourceAuthLocks           sync.Map
 	sourceTokenRefreshMu      sync.Mutex
 	targetAuthMu              sync.Mutex
+	targetAssetLocks          sync.Map
 	targetMultiplierMu        sync.Mutex
 	targetMultiplierRefreshes map[string]struct{}
 	targetPlatformMu          sync.Mutex
@@ -58,6 +62,9 @@ type App struct {
 	managedActionLocks        map[string]*sync.Mutex
 	quickValidationMu         sync.Mutex
 	quickValidations          map[string]struct{}
+	modelQualityMu            sync.Mutex
+	modelQualityRunning       map[string]struct{}
+	modelQualitySlots         chan struct{}
 }
 
 type apiError struct {
@@ -116,6 +123,9 @@ func main() {
 	if err := app.seed(ctx); err != nil {
 		log.Fatalf("初始化管理员失败: %v", err)
 	}
+	// Drain only durable, never-started new-channel checks. Completed checks and
+	// technical UNKNOWN results are intentionally left for an operator to rerun.
+	app.queuePendingModelChecks(ctx)
 
 	server := &http.Server{
 		Addr:              env("SERVER_HOST", "0.0.0.0") + ":" + env("SERVER_PORT", "8080"),
