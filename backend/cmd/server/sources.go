@@ -562,7 +562,7 @@ func (a *App) persistSourceSession(ctx context.Context, sourceID string, credent
 			tokenRefreshNextAt = now.Add(tokenRefreshFallback)
 		}
 	}
-	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,access_token_expires_at=$3::timestamptz,last_token_refresh_at=CASE WHEN $4::timestamptz IS NOT NULL THEN now() ELSE last_token_refresh_at END,token_refresh_next_at=$4::timestamptz,token_refresh_failures=0,token_refresh_error='',scan_status=CASE WHEN scan_status='AUTH_REQUIRED' THEN 'UNKNOWN' ELSE scan_status END,last_error=CASE WHEN scan_status='AUTH_REQUIRED' THEN '' ELSE last_error END,last_scan_at=CASE WHEN scan_status='AUTH_REQUIRED' THEN NULL ELSE last_scan_at END,updated_at=now() WHERE id=$1`, sourceID, encrypted, accessTokenExpiresAt, tokenRefreshNextAt); err != nil {
+	if _, err = a.db.ExecContext(ctx, `UPDATE sources SET credential_cipher=$2,access_token_expires_at=$3::timestamptz,last_token_refresh_at=CASE WHEN $4::timestamptz IS NOT NULL THEN now() ELSE last_token_refresh_at END,token_refresh_next_at=$4::timestamptz,token_refresh_failures=0,token_refresh_error='',scan_status=CASE WHEN scan_status='AUTH_REQUIRED' THEN 'UNKNOWN' ELSE scan_status END,last_error=CASE WHEN scan_status='AUTH_REQUIRED' THEN '' ELSE last_error END,last_scan_at=CASE WHEN scan_status='AUTH_REQUIRED' THEN NULL ELSE last_scan_at END,last_successful_scan_at=CASE WHEN scan_status='AUTH_REQUIRED' THEN NULL ELSE last_successful_scan_at END,updated_at=now() WHERE id=$1`, sourceID, encrypted, accessTokenExpiresAt, tokenRefreshNextAt); err != nil {
 		return err
 	}
 	return nil
