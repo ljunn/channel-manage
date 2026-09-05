@@ -27,7 +27,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			recharge_url TEXT NOT NULL DEFAULT '', manually_untrusted BOOLEAN NOT NULL DEFAULT false, manually_untrusted_at TIMESTAMPTZ,
 			credential_cipher BYTEA, username_hint TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '',
 			capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, scan_interval_seconds INT NOT NULL DEFAULT 900,
-			scan_status TEXT NOT NULL DEFAULT 'IDLE', last_scan_at TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '',
+				scan_status TEXT NOT NULL DEFAULT 'IDLE', last_scan_at TIMESTAMPTZ, last_successful_scan_at TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '',
 			balance NUMERIC(18,6), balance_currency TEXT NOT NULL DEFAULT 'USD', value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1, expires_at TIMESTAMPTZ,
 			tags JSONB NOT NULL DEFAULT '[]'::jsonb, risk_note TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
@@ -36,6 +36,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS manually_untrusted_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS scheduling_paused BOOLEAN NOT NULL DEFAULT false`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS scheduling_paused_at TIMESTAMPTZ`,
+		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS last_successful_scan_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS access_token_expires_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS last_token_refresh_at TIMESTAMPTZ`,
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS token_refresh_next_at TIMESTAMPTZ`,
@@ -45,6 +46,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE sources ADD COLUMN IF NOT EXISTS value_divisor NUMERIC(18,8) NOT NULL DEFAULT 1`,
 		`ALTER TABLE sources DROP COLUMN IF EXISTS asset_mode`,
 		`UPDATE sources SET scan_status='IDLE',last_error='',updated_at=now() WHERE scan_status='RUNNING'`,
+		`UPDATE sources SET last_successful_scan_at=last_scan_at WHERE last_successful_scan_at IS NULL AND scan_status='SUCCESS' AND last_scan_at IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS source_keys (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 			name TEXT NOT NULL, key_cipher BYTEA NOT NULL, key_hint TEXT NOT NULL, production_authorized BOOLEAN NOT NULL DEFAULT false,

@@ -16,22 +16,23 @@ import (
 )
 
 const (
-	fastProbeIntervalSeconds  = 15
-	recoverySuccessSamples    = 3
-	maxConcurrentProbes       = 6
-	maxFirstTokenMs           = 60_000
-	businessLatencyFreshness  = 15 * time.Minute
-	businessLatencyMinSamples = 5
-	latencyBadSnapshots       = 2
-	latencyGoodSnapshots      = 3
-	latencyRecoveryHold       = 5 * time.Minute
-	cacheMetricFreshness      = 10 * time.Minute
-	cacheStateRecoveryHold    = 15 * time.Minute
-	priorityChangeCooldown    = 5 * time.Minute
-	fallbackRebuildCooldown   = 15 * time.Minute
-	tokenRefreshCheckInterval = time.Minute
-	tokenRefreshLead          = 10 * time.Minute
-	tokenRefreshFallback      = 30 * time.Minute
+	fastProbeIntervalSeconds   = 15
+	recoverySuccessSamples     = 3
+	maxConcurrentProbes        = 6
+	maxFirstTokenMs            = 60_000
+	businessLatencyFreshness   = 15 * time.Minute
+	businessLatencyMinSamples  = 5
+	latencyBadSnapshots        = 2
+	latencyGoodSnapshots       = 3
+	latencyRecoveryHold        = 5 * time.Minute
+	cacheMetricFreshness       = 10 * time.Minute
+	cacheStateRecoveryHold     = 15 * time.Minute
+	priorityChangeCooldown     = 5 * time.Minute
+	managedActionRetryCooldown = 5 * time.Minute
+	fallbackRebuildCooldown    = 15 * time.Minute
+	tokenRefreshCheckInterval  = time.Minute
+	tokenRefreshLead           = 10 * time.Minute
+	tokenRefreshFallback       = 30 * time.Minute
 )
 
 const (
@@ -368,7 +369,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.SourceUntrusted || item.SourcePaused || item.State == "MANUAL_HOLD" || modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || (item.SyncStatus != "" && item.SyncStatus != "SYNCED") || item.BusinessConfirmedFailure || probeFailureRequiresImmediateIsolation(item.StateReason) || item.State == "MANUAL_HOLD" || modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
 	return item.LatencyState == latencyStateSlow || item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -506,19 +507,19 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
 			continue
 		}
-		if len(desiredPriority) == 0 {
+		if plan.NormalCount < policy.Config.MinAvailableChannels {
 			qualityBlocked := 0
 			for _, item := range groupItems {
 				if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
 					qualityBlocked++
 				}
 			}
-			detail := fmt.Sprintf("%s / %s 当前没有任何符合策略的托管账号。系统仍在快速复检可恢复渠道，请检查源站余额、渠道状态和倍率。", groupItems[0].TargetName, groupItems[0].TargetGroup)
+			detail := fmt.Sprintf("%s / %s 当前仅有 %d/%d 个符合策略的常规托管账号。系统仍在快速复检可恢复渠道，请检查源站扫描、同步状态、余额、渠道状态和倍率。", groupItems[0].TargetName, groupItems[0].TargetGroup, plan.NormalCount, policy.Config.MinAvailableChannels)
 			if qualityBlocked > 0 {
 				detail += fmt.Sprintf("其中 %d 个渠道受模型能力检测闸门限制；请到渠道雷达手动检测，或在确认风险后人工放行。", qualityBlocked)
 			}
 			a.openEvent(ctx, "P1", "GROUP_AVAILABILITY", "目标分组无可用账号", detail, "group-availability:"+policy.ScopeID)
-		} else if len(desiredPriority) > 0 {
+		} else {
 			a.resolveEvent(ctx, "group-availability:"+policy.ScopeID)
 		}
 		if shadow || frozen {
@@ -549,7 +550,7 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 				if item.FallbackActive && !fallback {
 					after["fallbackActive"] = false
 				}
-				a.enqueueManagedAction(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, after, reason)
+				a.enqueueManagedActionWithCooldown(ctx, item.ID, "SET_PRIORITY", map[string]int{"priority": item.Priority}, after, reason, managedActionRetryCooldown)
 				continue
 			}
 			if desired != item.Schedulable {
@@ -559,7 +560,7 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 				} else if fallback {
 					reason = fmt.Sprintf("常规可用渠道仅 %d/%d，慢渠道以优先级 %d 作为兜底恢复调度", plan.NormalCount, policy.Config.MinAvailableChannels, priority)
 				}
-				a.enqueueManagedAction(ctx, item.ID, "SET_SCHEDULABLE", map[string]bool{"schedulable": item.Schedulable}, map[string]bool{"schedulable": desired}, reason)
+				a.enqueueManagedActionWithCooldown(ctx, item.ID, "SET_SCHEDULABLE", map[string]bool{"schedulable": item.Schedulable}, map[string]bool{"schedulable": desired}, reason, managedActionRetryCooldown)
 			}
 		}
 	}
@@ -686,7 +687,12 @@ type managedPolicyCandidate struct {
 	CachePenaltyActive                                                         bool
 	SourceUntrusted                                                            bool
 	SourcePaused                                                               bool
+	SourceScanBlocked                                                          bool
+	BusinessConfirmedFailure                                                   bool
 	Priority                                                                   int
+	SourceStatus, SourceScanStatus, SourceLastError, SourceScanBlockReason     string
+	SourceLastSuccessfulScanAt                                                 sql.NullTime
+	SourceScanIntervalSeconds                                                  int
 	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50             sql.NullFloat64
 	ModelCheckScore                                                            sql.NullFloat64
 	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                   sql.NullFloat64
@@ -699,12 +705,19 @@ type managedPolicyCandidate struct {
 	SpeedMetricSamples, LatencyBadSnapshots, LatencyGoodSnapshots              int
 	CacheSamples, CacheBadSnapshots, CacheGoodSnapshots                        int
 	CacheInputTokens, CacheReadTokens                                          int64
+	BusinessRequests, BusinessErrors                                           int
 	ConfirmationFailures                                                       int
 }
 
 const policyMetricWindowDays = 7
 
 func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandidate, error) {
+	businessWindowMinutes := a.settingInt(ctx, "metric_window_minutes", 5)
+	if businessWindowMinutes < 1 {
+		businessWindowMinutes = 5
+	}
+	businessMinSamples := a.settingInt(ctx, "min_error_samples", 5)
+	businessErrorThreshold := a.settingInt(ctx, "error_rate_threshold", 20)
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_id,m.remote_name,min(s.name),min(t.name),m.schedulable,m.fallback_active,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.model_check_required,c.model_check_status,c.model_check_override,c.model_check_score,c.model_check_reason,c.model_check_model,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
@@ -721,9 +734,12 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 		(SELECT count(*) FROM (
 			SELECT bool_and(success) OVER (ORDER BY started_at DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS success_streak
 			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id AND p.kind='RECOVERY' ORDER BY p.started_at DESC LIMIT $2) recent
-		) streak WHERE success_streak)
+		) streak WHERE success_streak),
+		min(s.status),min(s.scan_status),max(s.last_successful_scan_at),min(s.last_error),min(s.scan_interval_seconds),
+		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-$3 * interval '1 minute'),
+		(SELECT COALESCE(sum(b.errors),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-$3 * interval '1 minute')
 		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN source_keys k ON k.id=c.source_key_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
-		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples)
+		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples, businessWindowMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -732,7 +748,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses, &item.SourceStatus, &item.SourceScanStatus, &item.SourceLastSuccessfulScanAt, &item.SourceLastError, &item.SourceScanIntervalSeconds, &item.BusinessRequests, &item.BusinessErrors); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP50, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -750,6 +766,9 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 			item.CacheState = cacheStateUnknown
 		}
 		item.ConfirmationFailures = confirmationFailures
+		item.SourceScanBlockReason = sourceSchedulingBlockReason(item.SourceStatus, item.SourceScanStatus, item.SourceLastError, item.SourceLastSuccessfulScanAt, item.SourceScanIntervalSeconds, time.Now())
+		item.SourceScanBlocked = item.SourceScanBlockReason != ""
+		item.BusinessConfirmedFailure = item.BusinessRequests >= businessMinSamples && item.BusinessErrors*100 >= item.BusinessRequests*businessErrorThreshold
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -1174,6 +1193,87 @@ func policyModeText(mode string) string {
 	return "价格优先"
 }
 
+func sourceSchedulingBlockReason(status, scanStatus, lastError string, lastScanAt sql.NullTime, scanIntervalSeconds int, now time.Time) string {
+	status = strings.TrimSpace(status)
+	scanStatus = strings.ToUpper(strings.TrimSpace(scanStatus))
+	lastError = strings.TrimSpace(lastError)
+	if status != "" && status != "ACTIVE" {
+		return "数据源状态为 " + status
+	}
+	if scanStatus == "AUTH_REQUIRED" || sourceScanErrorRequiresAction(lastError) {
+		if lastError == "" {
+			return "数据源扫描需要重新认证或人工处理"
+		}
+		return "数据源扫描阻断调度：" + lastError
+	}
+	grace := 30 * time.Minute
+	if scanIntervalSeconds > 0 {
+		configuredGrace := 2 * time.Duration(scanIntervalSeconds) * time.Second
+		if configuredGrace > grace {
+			grace = configuredGrace
+		}
+	}
+	stale := !lastScanAt.Valid || now.Sub(lastScanAt.Time) > grace
+	switch scanStatus {
+	case "FAILED":
+		if stale {
+			return fmt.Sprintf("数据源扫描失败且已超过 %s 未成功刷新", grace.Round(time.Minute))
+		}
+	case "RUNNING":
+		if stale {
+			return fmt.Sprintf("数据源扫描长时间未完成，已超过 %s", grace.Round(time.Minute))
+		}
+	case "", "UNKNOWN", "IDLE":
+		if !lastScanAt.Valid {
+			return "数据源尚未完成成功扫描"
+		}
+		if stale {
+			return fmt.Sprintf("数据源扫描结果已超过 %s 未刷新", grace.Round(time.Minute))
+		}
+	}
+	return ""
+}
+
+func sourceScanErrorRequiresAction(message string) bool {
+	message = strings.ToLower(message)
+	for _, marker := range []string{
+		"auth_required", "source_reauth_required", "source_auth_action_required", "remote_unauthorized",
+		"unauthorized", "forbidden", "invalid token", "token expired", "session expired", "no credentials",
+		"invalid source credential", "重新认证", "令牌失效", "令牌过期", "会话已失效", "没有可用的账号密码",
+		"滑块", "403", "invalid url", "url 无效", "返回非 json", "非 json 数据", "schema changed",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func managedProbeFailureBlocksScheduling(item managedPolicyCandidate) bool {
+	if item.BusinessConfirmedFailure || probeFailureRequiresImmediateIsolation(item.StateReason) {
+		return true
+	}
+	limit := item.ConfirmationFailures
+	if limit < 1 {
+		limit = 3
+	}
+	return item.ConsecutiveFailures >= limit && strings.TrimSpace(item.StateReason) != "" && !strings.Contains(item.StateReason, "最近流式抽样成功")
+}
+
+func probeFailureRequiresImmediateIsolation(values ...string) bool {
+	message := strings.ToLower(strings.Join(values, " "))
+	for _, marker := range []string{
+		"group_deleted", "account_not_found", "remote_not_found", "managed_account_not_found", "分组已删除", "账户不存在",
+		"余额不足", "balance exhausted", "insufficient balance", "quota exhausted", "remote_unauthorized", "unauthorized",
+		"forbidden", "invalid token", "token expired", "401", "403", "probe_model_unavailable",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []string {
 	config = normalizePolicyConfig(config)
 	reasons := []string{}
@@ -1182,6 +1282,12 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	}
 	if item.SourcePaused {
 		reasons = append(reasons, "数据源已人工暂停调度")
+	}
+	if item.SyncStatus != "" && item.SyncStatus != "SYNCED" {
+		reasons = append(reasons, "托管账号同步状态为 "+item.SyncStatus+"，暂停调度")
+	}
+	if item.SourceScanBlocked {
+		reasons = append(reasons, item.SourceScanBlockReason)
 	}
 	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
 		switch item.ModelCheckStatus {
@@ -1206,6 +1312,9 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	}
 	if item.LatencyState == latencyStateSlow {
 		reasons = append(reasons, policyLatencyReason(item, config))
+	}
+	if managedProbeFailureBlocksScheduling(item) {
+		reasons = append(reasons, "近期主动探测或真实业务已确认失败："+item.StateReason)
 	}
 	if !item.SourceMultiplier.Valid || !item.TargetMultiplier.Valid {
 		reasons = append(reasons, "源分组或目标分组倍率缺失")

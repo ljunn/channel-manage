@@ -159,7 +159,21 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 		if err != nil {
 			return err
 		}
+		seenRequests := map[string]struct{}{}
 		for _, item := range items {
+			requestID := remoteRequestID(item["request_id"])
+			if requestID == "" {
+				requestID = remoteRequestID(item["requestId"])
+			}
+			if requestID == "" {
+				requestID = remoteRequestID(item["id"])
+			}
+			if requestID != "" {
+				if _, exists := seenRequests[requestID]; exists {
+					continue
+				}
+				seenRequests[requestID] = struct{}{}
+			}
 			accountNumber, ok := number(item["account_id"])
 			if !ok || strconv.Itoa(int(accountNumber)) != binding.RemoteID {
 				continue
@@ -450,6 +464,16 @@ func medianInt(values []int) int {
 		return sorted[middle]
 	}
 	return sorted[middle-1] + (sorted[middle]-sorted[middle-1])/2
+}
+
+func remoteRequestID(value any) string {
+	if id := text(value, ""); id != "" {
+		return id
+	}
+	if numberValue, ok := number(value); ok {
+		return strconv.FormatInt(int64(numberValue), 10)
+	}
+	return ""
 }
 
 func percentileInt(values []int, ratio float64) int {

@@ -659,8 +659,21 @@ func (a *App) failAction(ctx context.Context, id, message string) error {
 	if affected == 0 {
 		return fmt.Errorf("action superseded: %s", message)
 	}
+	if managedAccountGoneError(message) && managedID != "" {
+		_, _ = a.db.ExecContext(ctx, `UPDATE managed_accounts SET schedulable=false,sync_status='FAILED',last_error=$2,updated_at=now() WHERE id=$1`, managedID, truncate("远端托管账号已不存在，已停止调度："+message, 500))
+	}
 	a.openEvent(ctx, "P0", "ACTION_EXECUTION", "远程动作执行失败", message, actionFailureEventKey(managedID, action))
 	return fmt.Errorf("action failed: %s", message)
+}
+
+func managedAccountGoneError(message string) bool {
+	message = strings.ToLower(message)
+	for _, marker := range []string{"account_not_found", "managed_account_not_found", "account not found", "账户不存在", "账号不存在", "group_deleted", "分组已删除"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 type policyConfig struct {

@@ -429,7 +429,7 @@ func (a *App) scanSource(ctx context.Context, id string) error {
 		}
 		return reported
 	}
-	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
+	_, err = a.db.ExecContext(ctx, `UPDATE sources SET scan_status='SUCCESS',last_scan_at=now(),last_successful_scan_at=now(),last_error='',updated_at=now() WHERE id=$1`, id)
 	if err == nil {
 		if !a.sourceIsManuallyUntrusted(ctx, id) {
 			a.resolveEvent(ctx, "source-scan:"+id)

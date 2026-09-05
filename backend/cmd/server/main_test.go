@@ -510,6 +510,69 @@ func TestPausedSourceIsAlwaysRejectedBySchedulingPolicy(t *testing.T) {
 	}
 }
 
+func TestPolicyRejectsManagedAccountWithFailedSyncStatus(t *testing.T) {
+	candidate := eligiblePolicyCandidate("sync-failed", .2, 120)
+	candidate.SyncStatus = "FAILED"
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5})
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "同步状态为 FAILED") {
+		t.Fatalf("failed sync account remained eligible: %#v", reasons)
+	}
+}
+
+func TestPolicyRejectsManagedAccountWithConfirmedBusinessFailure(t *testing.T) {
+	candidate := eligiblePolicyCandidate("business-failed", .2, 120)
+	candidate.BusinessConfirmedFailure = true
+	candidate.StateReason = "测试模型 gpt-5.5：抽样请求失败 (403)"
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 1, MinSamples: 5})
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "已确认失败") {
+		t.Fatalf("confirmed business failure remained eligible: %#v", reasons)
+	}
+}
+
+func TestPolicyRejectsImmediateProbeFailureDespiteHealthySevenDayRate(t *testing.T) {
+	candidate := eligiblePolicyCandidate("deleted-group", .2, 120)
+	candidate.SuccessRate = sql.NullFloat64{Float64: 100, Valid: true}
+	candidate.StateReason = "GROUP_DELETED: API Key 所属分组已删除"
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 1, MinSamples: 5})
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "已确认失败") {
+		t.Fatalf("deleted group remained eligible: %#v", reasons)
+	}
+}
+
+func TestSourceScanFailuresBlockOnlyActionableOrStaleSources(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	if reason := sourceSchedulingBlockReason("ACTIVE", "FAILED", "session expired/no credentials", sql.NullTime{Time: now, Valid: true}, 900, now); reason == "" {
+		t.Fatal("authentication failure did not block scheduling")
+	}
+	if reason := sourceSchedulingBlockReason("ACTIVE", "FAILED", "temporary upstream timeout", sql.NullTime{Time: now.Add(-5 * time.Minute), Valid: true}, 900, now); reason != "" {
+		t.Fatalf("fresh transient scan failure was blocked: %s", reason)
+	}
+	if reason := sourceSchedulingBlockReason("ACTIVE", "FAILED", "temporary upstream timeout", sql.NullTime{Time: now.Add(-31 * time.Minute), Valid: true}, 900, now); reason == "" {
+		t.Fatal("stale scan failure did not block scheduling")
+	}
+}
+
+func TestManagedAccountGoneErrorRecognizesRemoteDeletion(t *testing.T) {
+	if !managedAccountGoneError("REMOTE_NOT_FOUND: ACCOUNT_NOT_FOUND: account not found") {
+		t.Fatal("remote account deletion was not recognized")
+	}
+	if managedAccountGoneError("REMOTE_UNAVAILABLE: upstream timeout") {
+		t.Fatal("transient remote outage was treated as account deletion")
+	}
+}
+
+func TestRemoteRequestIDNormalizesStringAndNumericIDs(t *testing.T) {
+	if got := remoteRequestID("request-1"); got != "request-1" {
+		t.Fatalf("string request ID=%q", got)
+	}
+	if got := remoteRequestID(float64(42)); got != "42" {
+		t.Fatalf("numeric request ID=%q", got)
+	}
+	if got := remoteRequestID(nil); got != "" {
+		t.Fatalf("missing request ID=%q", got)
+	}
+}
+
 func TestSourceEventDedupeFindsOnlyMappedSource(t *testing.T) {
 	if got := sourceIDFromEvent("SOURCE_BALANCE", "source-balance:source-1"); got != "source-1" {
 		t.Fatalf("sourceIDFromEvent() = %q", got)
