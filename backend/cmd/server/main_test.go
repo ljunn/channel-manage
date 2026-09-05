@@ -890,8 +890,8 @@ func TestPolicyRejectionReasonsUsesTargetGroupMultiplier(t *testing.T) {
 
 func TestCalculateDynamicMultiplierUsesLowestBoundGroup(t *testing.T) {
 	items := []managedPolicyCandidate{
-		{SourceGroup: "较高价", SourceMultiplier: sql.NullFloat64{Float64: .08, Valid: true}},
-		{SourceGroup: "最低价", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}},
+		{SourceGroup: "较高价", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .08, Valid: true}},
+		{SourceGroup: "最低价", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}},
 		{SourceGroup: "缺少价格"},
 	}
 	percent := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierPercent, DynamicMultiplierValue: 5}
@@ -907,20 +907,33 @@ func TestCalculateDynamicMultiplierUsesLowestBoundGroup(t *testing.T) {
 	}
 }
 
+func TestCalculateDynamicMultiplierIgnoresUnavailableLowestSource(t *testing.T) {
+	items := []managedPolicyCandidate{
+		{SourceGroup: "已删除分组", State: "QUARANTINED", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .001, Valid: true}},
+		{SourceGroup: "健康低价分组", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .04, Valid: true}},
+		{SourceGroup: "同步失败分组", State: "HEALTHY", SyncStatus: "FAILED", SourceMultiplier: sql.NullFloat64{Float64: .02, Valid: true}},
+	}
+	config := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierPercent, DynamicMultiplierValue: 20}
+	quote, ok := calculateDynamicMultiplier(items, config)
+	if !ok || quote.SourceGroup != "健康低价分组" || quote.Lowest != .04 || quote.Desired != .05 {
+		t.Fatalf("unavailable sources affected dynamic quote: %#v, ok=%v", quote, ok)
+	}
+}
+
 func TestCalculateDynamicMultiplierPercentRoundsUpByOneCent(t *testing.T) {
 	config := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierPercent, DynamicMultiplierValue: 5}
-	quote, ok := calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "A", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}}}, config)
+	quote, ok := calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "A", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .06, Valid: true}}}, config)
 	if !ok || quote.Desired != .07 {
 		t.Fatalf("0.063 should round up to 0.07, got %#v", quote)
 	}
 
 	config.DynamicMultiplierValue = 20
-	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "B", SourceMultiplier: sql.NullFloat64{Float64: .05, Valid: true}}}, config)
+	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "B", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .05, Valid: true}}}, config)
 	if !ok || quote.Desired != .06 {
 		t.Fatalf("an exact cent must not be rounded to the next cent, got %#v", quote)
 	}
 
-	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "免费", SourceMultiplier: sql.NullFloat64{Float64: 0, Valid: true}}}, config)
+	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "免费", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: 0, Valid: true}}}, config)
 	if !ok || quote.Desired != dynamicMultiplierStep {
 		t.Fatalf("dynamic target multiplier must remain at least 0.01, got %#v", quote)
 	}

@@ -473,7 +473,7 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 		if policy.Config.DynamicMultiplierEnabled {
 			quote, available := calculateDynamicMultiplier(groupItems, policy.Config)
 			if !available {
-				detail := "目标分组没有可用于计算动态倍率的源分组价格；系统保留 Sub2API 当前倍率，等待数据源刷新。"
+				detail := "目标分组没有可用于计算动态倍率的健康托管账号；系统保留 Sub2API 当前倍率，等待渠道恢复或数据源刷新。"
 				a.openEvent(ctx, "P1", "DYNAMIC_MULTIPLIER", "动态倍率计算失败", detail, dynamicMultiplierEventKey(policy.ScopeID))
 			} else if !shadow && !frozen {
 				if err = a.reconcileDynamicTargetGroupMultiplier(ctx, policy.ID, policy.ScopeID, quote); err != nil {
@@ -585,6 +585,9 @@ func calculateDynamicMultiplier(items []managedPolicyCandidate, config policyCon
 	quote := dynamicMultiplierQuote{}
 	found := false
 	for _, item := range items {
+		if !dynamicMultiplierCandidate(item, config) {
+			continue
+		}
 		if !item.SourceMultiplier.Valid || math.IsNaN(item.SourceMultiplier.Float64) || math.IsInf(item.SourceMultiplier.Float64, 0) || item.SourceMultiplier.Float64 < 0 {
 			continue
 		}
@@ -609,6 +612,23 @@ func calculateDynamicMultiplier(items []managedPolicyCandidate, config policyCon
 		return dynamicMultiplierQuote{}, false
 	}
 	return quote, true
+}
+
+func dynamicMultiplierCandidate(item managedPolicyCandidate, config policyConfig) bool {
+	config = normalizePolicyConfig(config)
+	if !item.SourceMultiplier.Valid || item.State != "HEALTHY" || item.SyncStatus != "SYNCED" {
+		return false
+	}
+	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || item.State == "MANUAL_HOLD" {
+		return false
+	}
+	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
+		return false
+	}
+	if !policyHasAllowedModels(item, config) || item.LatencyState == latencyStateSlow {
+		return false
+	}
+	return !managedProbeFailureBlocksScheduling(item)
 }
 
 func candidatesWithTargetMultiplier(items []managedPolicyCandidate, multiplier float64) []managedPolicyCandidate {
