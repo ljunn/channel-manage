@@ -169,6 +169,11 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			ownership_marker TEXT NOT NULL, sync_status TEXT NOT NULL DEFAULT 'PENDING', last_error TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(target_id, channel_id)
 		)`,
+		`ALTER TABLE metric_buckets ADD COLUMN IF NOT EXISTS managed_account_id UUID`,
+		`ALTER TABLE metric_buckets DROP CONSTRAINT IF EXISTS metric_buckets_channel_id_window_start_key`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_managed_time ON metric_buckets(managed_account_id, window_start)`,
+		`CREATE INDEX IF NOT EXISTS idx_metric_managed_channel_time ON metric_buckets(managed_account_id, channel_id, window_start DESC)`,
+		`DELETE FROM metric_buckets b WHERE b.managed_account_id IS NULL AND EXISTS (SELECT 1 FROM managed_accounts m WHERE m.channel_id=b.channel_id)`,
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS model_mapping_hash TEXT NOT NULL DEFAULT ''`,

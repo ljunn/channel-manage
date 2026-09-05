@@ -676,42 +676,42 @@ func (a *App) enqueueManagedActionWithCooldown(ctx context.Context, managedID, a
 }
 
 type managedPolicyCandidate struct {
-	ID, ChannelID, TargetGroupID, RemoteID, RemoteName, SourceName, TargetName string
-	State, StateReason, SourceGroup, TargetGroup, SyncStatus                   string
-	ModelCheckStatus, ModelCheckModel, ModelCheckReason                        string
-	LatencyState                                                               string
-	CacheState                                                                 string
-	Platform, ModelsJSON, SpeedMetricModel                                     string
-	SpeedMetricSource                                                          string
-	CacheMetricSource, CacheMetricModel, CacheMetricRequestType                string
-	Schedulable                                                                bool
-	ModelCheckRequired                                                         bool
-	ModelCheckOverride                                                         bool
-	FallbackActive                                                             bool
-	CachePenaltyActive                                                         bool
-	SourceUntrusted                                                            bool
-	SourcePaused                                                               bool
-	SourceScanBlocked                                                          bool
-	BusinessConfirmedFailure                                                   bool
-	Priority                                                                   int
-	SourceStatus, SourceScanStatus, SourceLastError, SourceScanBlockReason     string
-	SourceLastSuccessfulScanAt                                                 sql.NullTime
-	SourceScanIntervalSeconds                                                  int
-	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50             sql.NullFloat64
-	ModelCheckScore                                                            sql.NullFloat64
-	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                   sql.NullFloat64
-	CacheScore                                                                 sql.NullFloat64
-	ProbeFirstTokenP95, LatestProbeFirstToken                                  sql.NullFloat64
-	BusinessLatencyAt, LatestProbeAt, LatestProbeEvidenceAt, BusinessMetricAt  sql.NullTime
-	LatencyEvaluatedAt                                                         sql.NullTime
-	LatencyStateChangedAt, PrioritySyncedAt                                    sql.NullTime
-	CacheMetricAt, CacheEvaluatedAt, CacheStateChangedAt, CachePenalizedAt     sql.NullTime
-	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures           int
-	SpeedMetricSamples, LatencyBadSnapshots, LatencyGoodSnapshots              int
-	CacheSamples, CacheBadSnapshots, CacheGoodSnapshots                        int
-	CacheInputTokens, CacheReadTokens                                          int64
-	BusinessRequests, BusinessErrors                                           int
-	ConfirmationFailures                                                       int
+	ID, ChannelID, TargetGroupID, RemoteID, RemoteName, SourceName, TargetName         string
+	State, StateReason, SourceGroup, TargetGroup, SyncStatus                           string
+	ModelCheckStatus, ModelCheckModel, ModelCheckReason                                string
+	LatencyState                                                                       string
+	CacheState                                                                         string
+	Platform, ModelsJSON, SpeedMetricModel                                             string
+	SpeedMetricSource                                                                  string
+	CacheMetricSource, CacheMetricModel, CacheMetricRequestType                        string
+	Schedulable                                                                        bool
+	ModelCheckRequired                                                                 bool
+	ModelCheckOverride                                                                 bool
+	FallbackActive                                                                     bool
+	CachePenaltyActive                                                                 bool
+	SourceUntrusted                                                                    bool
+	SourcePaused                                                                       bool
+	SourceScanBlocked                                                                  bool
+	BusinessConfirmedFailure                                                           bool
+	Priority                                                                           int
+	SourceStatus, SourceScanStatus, SourceLastError, SourceScanBlockReason             string
+	SourceLastSuccessfulScanAt                                                         sql.NullTime
+	SourceScanIntervalSeconds                                                          int
+	SourceMultiplier, TargetMultiplier, SuccessRate, FirstTokenP50                     sql.NullFloat64
+	ModelCheckScore                                                                    sql.NullFloat64
+	FirstTokenP90, BusinessFirstToken, BusinessFirstTokenP90                           sql.NullFloat64
+	CacheScore                                                                         sql.NullFloat64
+	ProbeFirstTokenP95, LatestProbeFirstToken                                          sql.NullFloat64
+	BusinessLatencyAt, LatestProbeAt, LatestProbeEvidenceAt, BusinessMetricAt          sql.NullTime
+	LatencyEvaluatedAt                                                                 sql.NullTime
+	LatencyStateChangedAt, PrioritySyncedAt                                            sql.NullTime
+	CacheMetricAt, CacheEvaluatedAt, CacheStateChangedAt, CachePenalizedAt             sql.NullTime
+	Samples, RecentSuccesses, RecoverySuccesses, ConsecutiveFailures                   int
+	SpeedMetricSamples, LatencyBadSnapshots, LatencyGoodSnapshots                      int
+	CacheSamples, CacheBadSnapshots, CacheGoodSnapshots                                int
+	CacheInputTokens, CacheReadTokens                                                  int64
+	BusinessRequests, BusinessErrors, PreviousBusinessRequests, PreviousBusinessErrors int
+	ConfirmationFailures                                                               int
 }
 
 const policyMetricWindowDays = 7
@@ -742,9 +742,11 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 			FROM (SELECT started_at,success FROM probe_runs p WHERE p.channel_id=c.id AND p.kind='RECOVERY' ORDER BY p.started_at DESC LIMIT $2) recent
 		) streak WHERE success_streak),
 		min(s.status),min(s.scan_status),max(s.last_successful_scan_at),min(s.last_error),min(s.scan_interval_seconds),
-		(SELECT max(b.window_start) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-$3 * interval '1 minute'),
-		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-$3 * interval '1 minute'),
-		(SELECT COALESCE(sum(b.errors),0) FROM metric_buckets b WHERE b.channel_id=c.id AND b.window_start>now()-$3 * interval '1 minute')
+		(SELECT max(b.window_start) FROM metric_buckets b WHERE b.managed_account_id=m.id AND b.window_start>now()-$3 * interval '1 minute'),
+		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.managed_account_id=m.id AND b.window_start>now()-$3 * interval '1 minute'),
+		(SELECT COALESCE(sum(b.errors),0) FROM metric_buckets b WHERE b.managed_account_id=m.id AND b.window_start>now()-$3 * interval '1 minute'),
+		(SELECT COALESCE(sum(b.requests),0) FROM metric_buckets b WHERE b.managed_account_id=m.id AND b.window_start>now()-($3*2) * interval '1 minute' AND b.window_start<=now()-$3 * interval '1 minute'),
+		(SELECT COALESCE(sum(b.errors),0) FROM metric_buckets b WHERE b.managed_account_id=m.id AND b.window_start>now()-($3*2) * interval '1 minute' AND b.window_start<=now()-$3 * interval '1 minute')
 		FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN source_keys k ON k.id=c.source_key_id JOIN sources s ON s.id=c.source_id JOIN targets t ON t.id=m.target_id LEFT JOIN source_groups sg ON sg.id=c.source_group_id LEFT JOIN managed_account_groups mg ON mg.managed_account_id=m.id LEFT JOIN target_groups tg ON tg.id=mg.target_group_id
 		GROUP BY m.id,c.id,sg.id ORDER BY m.created_at`, policyMetricWindowDays, recoverySuccessSamples, businessWindowMinutes)
 	if err != nil {
@@ -755,7 +757,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
 	for rows.Next() {
 		var item managedPolicyCandidate
-		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.LatestProbeEvidenceAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses, &item.SourceStatus, &item.SourceScanStatus, &item.SourceLastSuccessfulScanAt, &item.SourceLastError, &item.SourceScanIntervalSeconds, &item.BusinessMetricAt, &item.BusinessRequests, &item.BusinessErrors); err != nil {
+		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.LatestProbeEvidenceAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses, &item.SourceStatus, &item.SourceScanStatus, &item.SourceLastSuccessfulScanAt, &item.SourceLastError, &item.SourceScanIntervalSeconds, &item.BusinessMetricAt, &item.BusinessRequests, &item.BusinessErrors, &item.PreviousBusinessRequests, &item.PreviousBusinessErrors); err != nil {
 			return nil, err
 		}
 		item.FirstTokenP50, item.SpeedMetricSource = effectiveSpeedMetric(item.BusinessFirstToken, item.BusinessLatencyAt, item.ProbeFirstTokenP95, time.Now())
@@ -775,7 +777,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 		item.ConfirmationFailures = confirmationFailures
 		item.SourceScanBlockReason = sourceSchedulingBlockReason(item.SourceStatus, item.SourceScanStatus, item.SourceLastError, item.SourceLastSuccessfulScanAt, item.SourceScanIntervalSeconds, time.Now())
 		item.SourceScanBlocked = item.SourceScanBlockReason != ""
-		item.BusinessConfirmedFailure = item.BusinessRequests >= businessMinSamples && item.BusinessErrors*100 >= item.BusinessRequests*businessErrorThreshold
+		item.BusinessConfirmedFailure = businessErrorConfirmedAcrossWindows(item.BusinessRequests, item.BusinessErrors, item.PreviousBusinessRequests, item.PreviousBusinessErrors, businessMinSamples, businessErrorThreshold)
 		items = append(items, item)
 	}
 	return items, rows.Err()

@@ -529,6 +529,18 @@ func TestPolicyRejectsManagedAccountWithConfirmedBusinessFailure(t *testing.T) {
 	}
 }
 
+func TestBusinessErrorRequiresTwoConsecutiveWindows(t *testing.T) {
+	if businessErrorConfirmedAcrossWindows(2, 2, 0, 0, 5, 20) {
+		t.Fatal("a single sparse business window must not confirm failure")
+	}
+	if !businessErrorConfirmedAcrossWindows(5, 1, 5, 1, 5, 20) {
+		t.Fatal("two consecutive windows at the configured threshold should confirm failure")
+	}
+	if !businessErrorConfirmedAcrossWindows(5, 2, 5, 2, 5, 39) {
+		t.Fatal("two consecutive windows above the configured threshold should confirm failure")
+	}
+}
+
 func TestPolicyRejectsImmediateProbeFailureDespiteHealthySevenDayRate(t *testing.T) {
 	candidate := eligiblePolicyCandidate("deleted-group", .2, 120)
 	candidate.SuccessRate = sql.NullFloat64{Float64: 100, Valid: true}

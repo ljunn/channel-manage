@@ -190,9 +190,17 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	if modelsLoaded && len(models) > 0 {
 		_, _ = tx.ExecContext(ctx, `UPDATE source_keys SET models=$2::jsonb,updated_at=now() WHERE id=(SELECT source_key_id FROM channels WHERE id=$1)`, id, jsonValue(models))
 	}
-	var businessRequests, businessErrors int
-	_ = tx.QueryRowContext(ctx, `SELECT COALESCE(sum(requests),0),COALESCE(sum(errors),0) FROM metric_buckets WHERE channel_id=$1 AND window_start>now()-$2*interval '1 minute'`, id, windowMinutes).Scan(&businessRequests, &businessErrors)
-	businessConfirmed := businessRequests >= minSamples && businessErrors*100 >= businessRequests*errorThreshold
+	var businessRequests, businessErrors, previousBusinessRequests, previousBusinessErrors int
+	businessConfirmed := false
+	if !managed {
+		_ = tx.QueryRowContext(ctx, `SELECT
+			COALESCE(sum(requests) FILTER (WHERE window_start>now()-$2*interval '1 minute'),0),
+			COALESCE(sum(errors) FILTER (WHERE window_start>now()-$2*interval '1 minute'),0),
+			COALESCE(sum(requests) FILTER (WHERE window_start>now()-($2*2)*interval '1 minute' AND window_start<=now()-$2*interval '1 minute'),0),
+			COALESCE(sum(errors) FILTER (WHERE window_start>now()-($2*2)*interval '1 minute' AND window_start<=now()-$2*interval '1 minute'),0)
+			FROM metric_buckets WHERE channel_id=$1 AND managed_account_id IS NULL`, id, windowMinutes).Scan(&businessRequests, &businessErrors, &previousBusinessRequests, &previousBusinessErrors)
+		businessConfirmed = businessErrorConfirmedAcrossWindows(businessRequests, businessErrors, previousBusinessRequests, previousBusinessErrors, minSamples, errorThreshold)
+	}
 	if state == "MANUAL_HOLD" || qualityOwnsHealth {
 		// Health samples are retained, but a quality gate owns the lifecycle until
 		// it reaches a clear verdict or an administrator explicitly overrides it.
@@ -212,7 +220,7 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 			if failureReason == "" && requestErr != nil {
 				failureReason = requestErr.Error()
 			}
-			isolation := businessConfirmed || probeFailureRequiresImmediateIsolation(errorType, summary, failureReason)
+			isolation := probeFailureRequiresImmediateIsolation(errorType, summary, failureReason)
 			failureCount := `CASE WHEN $5::timestamptz IS NOT NULL AND (last_probe_at IS NULL OR last_probe_at < $5::timestamptz) THEN 1 ELSE consecutive_failures+1 END`
 			var failureBaseline any
 			if !a.policyEvidenceBaselineAt.IsZero() {

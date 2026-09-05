@@ -20,6 +20,7 @@ const (
 )
 
 type businessMetricBucket struct {
+	ManagedID  string
 	ChannelID  string
 	Window     time.Time
 	Requests   int
@@ -28,6 +29,14 @@ type businessMetricBucket struct {
 	RateLimits int
 	Durations  []int
 	FirstToken []int
+}
+
+func businessErrorConfirmed(requests, errors, minSamples, errorThreshold int) bool {
+	return requests >= minSamples && requests > 0 && errors*100 >= requests*errorThreshold
+}
+
+func businessErrorConfirmedAcrossWindows(currentRequests, currentErrors, previousRequests, previousErrors, minSamples, errorThreshold int) bool {
+	return businessErrorConfirmed(currentRequests, currentErrors, minSamples, errorThreshold) && businessErrorConfirmed(previousRequests, previousErrors, minSamples, errorThreshold)
 }
 
 type businessLatencySnapshot struct {
@@ -183,10 +192,10 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 				continue
 			}
 			window := created.UTC().Truncate(time.Minute)
-			key := binding.ChannelID + ":" + window.Format(time.RFC3339)
+			key := binding.ManagedID + ":" + window.Format(time.RFC3339)
 			bucket := buckets[key]
 			if bucket == nil {
-				bucket = &businessMetricBucket{ChannelID: binding.ChannelID, Window: window}
+				bucket = &businessMetricBucket{ManagedID: binding.ManagedID, ChannelID: binding.ChannelID, Window: window}
 				buckets[key] = bucket
 			}
 			bucket.Requests++
@@ -228,7 +237,7 @@ func (a *App) syncTargetMetrics(ctx context.Context, targetID string) error {
 	}
 	for _, bucket := range buckets {
 		firstTokenP95 := percentile(bucket.FirstToken, .95)
-		_, err = tx.ExecContext(ctx, `INSERT INTO metric_buckets(channel_id,window_start,requests,errors,timeouts,rate_limited,p50_ms,p95_ms,first_token_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(channel_id,window_start) DO UPDATE SET requests=excluded.requests,errors=excluded.errors,timeouts=excluded.timeouts,rate_limited=excluded.rate_limited,p50_ms=excluded.p50_ms,p95_ms=excluded.p95_ms,first_token_p95_ms=excluded.first_token_p95_ms`, bucket.ChannelID, bucket.Window, bucket.Requests, bucket.Errors, bucket.Timeouts, bucket.RateLimits, percentile(bucket.Durations, .5), percentile(bucket.Durations, .95), firstTokenP95)
+		_, err = tx.ExecContext(ctx, `INSERT INTO metric_buckets(managed_account_id,channel_id,window_start,requests,errors,timeouts,rate_limited,p50_ms,p95_ms,first_token_p95_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(managed_account_id,window_start) DO UPDATE SET channel_id=excluded.channel_id,requests=excluded.requests,errors=excluded.errors,timeouts=excluded.timeouts,rate_limited=excluded.rate_limited,p50_ms=excluded.p50_ms,p95_ms=excluded.p95_ms,first_token_p95_ms=excluded.first_token_p95_ms`, bucket.ManagedID, bucket.ChannelID, bucket.Window, bucket.Requests, bucket.Errors, bucket.Timeouts, bucket.RateLimits, percentile(bucket.Durations, .5), percentile(bucket.Durations, .95), firstTokenP95)
 		if err != nil {
 			return err
 		}
