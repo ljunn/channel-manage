@@ -42,6 +42,7 @@ type App struct {
 	policyEvaluationMu        sync.Mutex
 	policyEvaluationRunning   bool
 	policyEvaluationRequested bool
+	policyEvidenceBaselineAt  time.Time
 	mappingMu                 sync.RWMutex
 	mappingGroupLocks         sync.Map
 	sourceAuthLocks           sync.Map
@@ -114,11 +115,12 @@ func main() {
 	}
 	webRoot, _ := fs.Sub(embeddedWeb, "web/dist")
 	app := &App{
-		db:         db,
-		jwtSecret:  []byte(secret),
-		cryptoKey:  deriveCryptoKey(env("CREDENTIAL_ENCRYPTION_KEY", secret)),
-		web:        http.FileServer(http.FS(webRoot)),
-		httpClient: newRemoteHTTPClient(),
+		db:                       db,
+		jwtSecret:                []byte(secret),
+		cryptoKey:                deriveCryptoKey(env("CREDENTIAL_ENCRYPTION_KEY", secret)),
+		web:                      http.FileServer(http.FS(webRoot)),
+		httpClient:               newRemoteHTTPClient(),
+		policyEvidenceBaselineAt: time.Now(),
 	}
 	if err := app.seed(ctx); err != nil {
 		log.Fatalf("初始化管理员失败: %v", err)

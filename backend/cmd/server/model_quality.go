@@ -739,7 +739,7 @@ func (a *App) runModelQualityCheck(id, trigger, requestedModel string, auditCtx 
 		"output_tokens": run.OutputTokens, "total_tokens": run.TotalTokens,
 	})
 	if run.Status == modelCheckFailed || run.Status == modelCheckPassed {
-		go a.runPolicyEvaluation(context.Background())
+		a.requestPolicyEvaluation()
 	}
 }
 
@@ -1394,7 +1394,7 @@ func (a *App) updateModelQualityOverride(w http.ResponseWriter, r *http.Request,
 		return err
 	}
 	a.audit(r.Context(), "MODEL_CHECK_OVERRIDE", "channel", id, map[string]any{"enabled": *input.Enabled, "reason": reason})
-	go a.runPolicyEvaluation(context.Background())
+	a.requestPolicyEvaluation()
 	value, err := a.modelQualityStatus(r.Context(), id)
 	if err != nil {
 		return err

@@ -940,7 +940,7 @@ func (a *App) updatePolicy(w http.ResponseWriter, r *http.Request, id string) er
 		return err
 	}
 	a.audit(r.Context(), "UPDATE", "policy", id, map[string]any{"name": input.Name, "version": version, "config": input.Config})
-	go a.runPolicyEvaluation(context.Background())
+	a.requestPolicyEvaluation()
 	go a.syncPolicyModelMappings(context.Background(), scopeID)
 	writeData(w, map[string]any{"id": id, "name": input.Name, "version": version})
 	return nil
@@ -1095,7 +1095,7 @@ func (a *App) activatePolicy(w http.ResponseWriter, r *http.Request, id string) 
 		return err
 	}
 	a.audit(r.Context(), "ACTIVATE", "policy", id, map[string]int{"version": input.Version})
-	go a.runPolicyEvaluation(context.Background())
+	a.requestPolicyEvaluation()
 	var scopeID string
 	if err = a.db.QueryRowContext(r.Context(), `SELECT scope_id FROM policies WHERE id=$1`, id).Scan(&scopeID); err == nil {
 		go a.syncPolicyModelMappings(context.Background(), scopeID)

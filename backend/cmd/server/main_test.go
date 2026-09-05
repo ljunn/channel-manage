@@ -1224,7 +1224,7 @@ func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 	}
 }
 
-func TestRankManagedAccountsExcludesFirstTokenAboveStrategyLimit(t *testing.T) {
+func TestRankManagedAccountsDeprioritizesFirstTokenAboveStrategyLimit(t *testing.T) {
 	items := []managedPolicyCandidate{
 		eligiblePolicyCandidate("fast-1", .2, 1_000),
 		eligiblePolicyCandidate("fast-2", .2, 2_000),
@@ -1241,8 +1241,8 @@ func TestRankManagedAccountsExcludesFirstTokenAboveStrategyLimit(t *testing.T) {
 	if priorities["fast-1"] != 1000 || priorities["fast-5"] != 5000 {
 		t.Fatalf("unexpected normal priorities: %#v", priorities)
 	}
-	if _, exists := priorities["slow"]; exists {
-		t.Fatalf("slow candidate must not receive a scheduling priority: %#v", priorities)
+	if priorities["slow"] != fallbackPriorityStart {
+		t.Fatalf("slow candidate should receive a fallback priority: %#v", priorities)
 	}
 }
 
@@ -1268,8 +1268,39 @@ func TestPlanManagedAccountsAddsOnlyEnoughFastestSlowFallbacks(t *testing.T) {
 	if !plan.Fallback["fallback-1"] || !plan.Fallback["fallback-2"] {
 		t.Fatalf("selected slow channels were not marked as fallback: %#v", plan.Fallback)
 	}
-	if _, exists := plan.Priorities["slowest"]; exists {
-		t.Fatalf("fallback should only fill the group to five channels: %#v", plan.Priorities)
+	if plan.Priorities["slowest"] != fallbackPriorityStart+2000 || plan.Fallback["slowest"] {
+		t.Fatalf("non-selected slow channels should remain as deprioritized capacity: %#v", plan)
+	}
+}
+
+func TestManagedSchedulingEvidenceRequiresFreshPostBaselineEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	baseline := now.Add(-10 * time.Minute)
+	candidate := managedPolicyCandidate{
+		LatestProbeEvidenceAt: sql.NullTime{Time: baseline.Add(-time.Second), Valid: true},
+	}
+	if managedSchedulingEvidenceReady(candidate, baseline, now) {
+		t.Fatal("pre-baseline probe evidence must not disable scheduling")
+	}
+	candidate.LatestProbeEvidenceAt = sql.NullTime{Time: baseline.Add(time.Second), Valid: true}
+	if !managedSchedulingEvidenceReady(candidate, baseline, now) {
+		t.Fatal("post-baseline probe evidence should allow scheduling decisions")
+	}
+	candidate.LatestProbeEvidenceAt = sql.NullTime{Time: now.Add(-managedEvidenceFreshness - time.Second), Valid: true}
+	if managedSchedulingEvidenceReady(candidate, baseline, now) {
+		t.Fatal("stale probe evidence must not disable scheduling")
+	}
+}
+
+func TestPolicyRejectionReasonsDescribeBusinessFailureSeparately(t *testing.T) {
+	candidate := eligiblePolicyCandidate("business-failure", .2, 120)
+	candidate.BusinessConfirmedFailure = true
+	candidate.BusinessRequests = 10
+	candidate.BusinessErrors = 4
+	candidate.StateReason = "最近流式抽样成功"
+	reasons := policyRejectionReasons(candidate, policyConfig{MinSuccessRate: 95, MinSamples: 5})
+	if len(reasons) != 1 || reasons[0] != "近期真实业务已确认失败：错误率达到阈值：4/10（40.0%）" {
+		t.Fatalf("unexpected business failure reason: %#v", reasons)
 	}
 }
 

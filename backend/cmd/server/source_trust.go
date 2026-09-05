@@ -149,7 +149,7 @@ func (a *App) updateSourceScheduling(w http.ResponseWriter, r *http.Request, id 
 		}
 	} else {
 		go a.runRecovery(context.Background())
-		go a.runPolicyEvaluation(context.Background())
+		a.requestPolicyEvaluation()
 	}
 	writeData(w, map[string]any{"id": id, "schedulingPaused": input.Paused})
 	return nil

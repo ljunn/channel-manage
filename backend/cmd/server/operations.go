@@ -213,7 +213,13 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				failureReason = requestErr.Error()
 			}
 			isolation := businessConfirmed || probeFailureRequiresImmediateIsolation(errorType, summary, failureReason)
-			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'HEALTHY' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(failureReason, 200), isolation, confirmationFailures)
+			failureCount := `CASE WHEN $5::timestamptz IS NOT NULL AND (last_probe_at IS NULL OR last_probe_at < $5::timestamptz) THEN 1 ELSE consecutive_failures+1 END`
+			var failureBaseline any
+			if !a.policyEvidenceBaselineAt.IsZero() {
+				failureBaseline = a.policyEvidenceBaselineAt
+			}
+			query := fmt.Sprintf(`UPDATE channels SET consecutive_failures=%s,lifecycle_state=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN 'QUARANTINED' ELSE 'HEALTHY' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN 0 ELSE score END WHERE id=$1`, failureCount, failureCount, failureCount, failureCount)
+			_, err = tx.ExecContext(ctx, query, id, truncate(failureReason, 200), isolation, confirmationFailures, failureBaseline)
 		} else {
 			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures)
 		}

@@ -193,7 +193,7 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 
 	a.audit(r.Context(), "UPDATE_SOURCE_GROUP_MAPPING", "source_group", sourceGroupID, map[string]any{"target_id": input.TargetID, "created": len(created), "removed": len(removed), "kept": len(kept), "target_group_ids": input.TargetGroupIDs})
 	a.resolveEvent(r.Context(), "mapping-sync:"+sourceGroupID+":"+input.TargetID)
-	go a.runPolicyEvaluation(context.Background())
+	a.requestPolicyEvaluation()
 	writeData(w, map[string]any{"created": len(created), "removed": len(removed), "kept": len(kept), "changed": true})
 	return nil
 }
