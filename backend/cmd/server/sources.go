@@ -73,6 +73,11 @@ type sourceCredentials struct {
 	SessionID    string `json:"sessionId,omitempty"`
 }
 
+type deletedSourceManagedAccount struct {
+	TargetID, BaseURL, RemoteID, RemoteName string
+	WriteEnabled                            bool
+}
+
 func (a *App) listSources(ctx context.Context) ([]Source, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,s.recharge_url,s.status,s.manually_untrusted,s.manually_untrusted_at,s.scheduling_paused,s.scheduling_paused_at,s.value_divisor,s.username_hint,s.version,s.scan_interval_seconds,s.scan_status,s.last_scan_at,s.last_error,s.access_token_expires_at,s.last_token_refresh_at,s.token_refresh_next_at,s.token_refresh_failures,s.token_refresh_error,s.balance,s.balance_currency,s.created_at,
 		(SELECT count(*) FROM source_keys k WHERE k.source_id=s.id),
@@ -712,15 +717,20 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 		if !ok {
 			return &apiError{502, "SCHEMA_CHANGED", "分组接口返回格式不兼容"}
 		}
+		invalidGroupRecords := 0
 		for _, value := range items {
-			record, _ := value.(map[string]any)
+			record, recordOK := value.(map[string]any)
 			idNumber, ok := number(record["id"])
-			if !ok {
+			if !recordOK || !ok {
+				invalidGroupRecords++
 				continue
 			}
 			remoteID := fmt.Sprintf("%.0f", idNumber)
 			multiplier := sub2APIGroupMultiplier(record, rates, remoteID)
 			groups = append(groups, group{remoteID, text(record["name"], remoteID), text(record["description"], ""), text(record["platform"], "default"), multiplier, []string{}})
+		}
+		if invalidGroupRecords > 0 {
+			return &apiError{502, "SCHEMA_CHANGED", "分组接口包含无效分组 ID，已跳过本次同步"}
 		}
 		profileRaw, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/user/profile", session, nil)
 		if err != nil {
@@ -803,6 +813,75 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			return err
 		}
 	}
+	// A successful source scan is authoritative for its group list. Remove
+	// stale source groups before inserting the new snapshot. Keeping a deleted
+	// group leaves its generated key, channel, managed account and target binding
+	// looking alive even though the upstream has already rejected the key.
+	presentGroups := make(map[string]struct{}, len(groups))
+	for _, item := range groups {
+		presentGroups[item.RemoteID] = struct{}{}
+	}
+	staleRows, err := tx.QueryContext(ctx, `SELECT id,remote_id,name FROM source_groups WHERE source_id=$1`, source.ID)
+	if err != nil {
+		return err
+	}
+	type staleSourceGroup struct{ ID, RemoteID, Name string }
+	staleGroups := []staleSourceGroup{}
+	for staleRows.Next() {
+		var item staleSourceGroup
+		if err = staleRows.Scan(&item.ID, &item.RemoteID, &item.Name); err != nil {
+			staleRows.Close()
+			return err
+		}
+		if _, ok := presentGroups[item.RemoteID]; !ok {
+			staleGroups = append(staleGroups, item)
+		}
+	}
+	if err = staleRows.Close(); err != nil {
+		return err
+	}
+	deletedAccounts := []deletedSourceManagedAccount{}
+	for _, group := range staleGroups {
+		accountRows, queryErr := tx.QueryContext(ctx, `SELECT DISTINCT m.id,m.target_id,m.remote_id,t.base_url,t.write_enabled,m.remote_name
+			FROM managed_accounts m JOIN channels c ON c.id=m.channel_id JOIN targets t ON t.id=m.target_id
+			WHERE c.source_group_id=$1 AND m.ownership_marker LIKE 'channel-manage:%'`, group.ID)
+		if queryErr != nil {
+			return queryErr
+		}
+		accountIDs := []string{}
+		for accountRows.Next() {
+			var managedID string
+			var account deletedSourceManagedAccount
+			if err = accountRows.Scan(&managedID, &account.TargetID, &account.RemoteID, &account.BaseURL, &account.WriteEnabled, &account.RemoteName); err != nil {
+				accountRows.Close()
+				return err
+			}
+			accountIDs = append(accountIDs, managedID)
+			if account.RemoteID != "" {
+				deletedAccounts = append(deletedAccounts, account)
+			}
+		}
+		if err = accountRows.Close(); err != nil {
+			return err
+		}
+		for _, managedID := range accountIDs {
+			if _, err = tx.ExecContext(ctx, `UPDATE action_intents SET status='REJECTED',error='源分组已从源站删除',executed_at=now() WHERE managed_account_id=$1 AND status IN ('PENDING','APPROVED')`, managedID); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM metric_buckets WHERE managed_account_id=$1`, managedID); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM managed_accounts WHERE id=$1`, managedID); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM channels WHERE source_group_id=$1 AND NOT EXISTS(SELECT 1 FROM managed_accounts WHERE channel_id=channels.id)`, group.ID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM source_groups WHERE id=$1`, group.ID); err != nil {
+			return err
+		}
+	}
 	for _, item := range groups {
 		var groupID string
 		err = tx.QueryRowContext(ctx, `INSERT INTO source_groups(source_id,remote_id,name,description,multiplier,group_type,models,captured_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT(source_id,remote_id) DO UPDATE SET name=excluded.name,description=excluded.description,multiplier=excluded.multiplier,group_type=excluded.group_type,models=excluded.models,captured_at=now() RETURNING id`, source.ID, item.RemoteID, item.Name, item.Description, item.Multiplier, item.GroupType, jsonValue(item.Models)).Scan(&groupID)
@@ -840,8 +919,51 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 	if err = tx.Commit(); err != nil {
 		return err
 	}
+	if len(staleGroups) > 0 {
+		for _, group := range staleGroups {
+			a.audit(context.Background(), "AUTO_REMOVE", "source_group", group.ID, map[string]any{"source_id": source.ID, "remote_id": group.RemoteID, "name": group.Name})
+			a.resolveEvent(context.Background(), "source-group-deleted:"+group.ID)
+		}
+		if len(deletedAccounts) > 0 {
+			go a.cleanupDeletedSourceManagedAccounts(source.Name, deletedAccounts)
+		}
+	}
 	a.queueNewModelChecks(newChannelIDs)
 	return nil
+}
+
+func (a *App) cleanupDeletedSourceManagedAccounts(sourceName string, accounts []deletedSourceManagedAccount) {
+	byTarget := map[string][]deletedSourceManagedAccount{}
+	for _, account := range accounts {
+		byTarget[account.TargetID] = append(byTarget[account.TargetID], account)
+	}
+	for targetID, items := range byTarget {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		target, _, err := a.targetCredentials(ctx, targetID)
+		if err == nil && !target.WriteEnabled {
+			err = fmt.Errorf("目标节点未开启托管写入")
+		}
+		var session remoteSession
+		if err == nil {
+			session, err = a.authenticateTarget(ctx, target, true)
+		}
+		if err != nil {
+			a.openEvent(context.Background(), "P1", "ACCOUNT_CLEANUP", "源分组删除后的托管账号清理失败", fmt.Sprintf("数据源 %s 删除了源分组，但目标节点 %s 无法清理 %d 个托管账号：%s", sourceName, target.Name, len(items), userErrorMessage(err)), "source-group-account-cleanup:"+targetID)
+			cancel()
+			continue
+		}
+		failed := 0
+		for _, account := range items {
+			if err = a.deleteRemoteManagedAccountChecked(ctx, target.BaseURL, session, account.RemoteID); err != nil {
+				failed++
+				a.openEvent(context.Background(), "P1", "ACCOUNT_CLEANUP", "源分组删除后的托管账号清理失败", fmt.Sprintf("数据源 %s / 托管账号 %s（远端 %s）删除失败：%s", sourceName, account.RemoteName, account.RemoteID, userErrorMessage(err)), "source-group-account-cleanup:"+targetID+":"+account.RemoteID)
+			}
+		}
+		if failed == 0 {
+			a.resolveEvent(context.Background(), "source-group-account-cleanup:"+targetID)
+		}
+		cancel()
+	}
 }
 
 func sourceProfileBalance(profile map[string]any) (float64, bool) {

@@ -517,27 +517,58 @@ func (a *App) discoverSourceAPIBaseURL(ctx context.Context, source Source) (stri
 	if source.Platform != "SUB2API" {
 		return source.BaseURL, nil
 	}
-	value, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, "/api/v1/settings/public", remoteSession{}, nil)
-	if err != nil {
-		if remoteRouteUnavailable(err) {
-			return source.BaseURL, nil
+	// Sub2API deployments have used both /api/v1/settings/public and the
+	// unversioned/public-settings variants. Vincent currently publishes its API
+	// endpoint through this document, while the panel domain itself rejects
+	// /v1 requests. Try the known variants before falling back to the panel URL.
+	paths := []string{"/api/v1/settings/public", "/api/settings/public", "/api/v1/public/settings", "/api/v1/system/settings/public"}
+	var lastErr error
+	for _, path := range paths {
+		value, _, err := a.remoteJSON(ctx, source.BaseURL, http.MethodGet, path, remoteSession{}, nil)
+		if err != nil {
+			lastErr = err
+			if remoteRouteUnavailable(err) {
+				continue
+			}
+			continue
 		}
-		return "", err
+		data, unwrapErr := unwrapEnvelope(value, source.Platform)
+		if unwrapErr != nil {
+			lastErr = unwrapErr
+			continue
+		}
+		if publishedBase := publishedSourceAPIBase(data); publishedBase != "" {
+			normalized, validateErr := validateRemoteURL(publishedBase)
+			if validateErr != nil {
+				return "", &apiError{Status: http.StatusUnprocessableEntity, Code: "SOURCE_API_ENDPOINT_INVALID", Message: "源站发布的 API 地址无效：" + publishedBase}
+			}
+			return normalized, nil
+		}
 	}
-	data, err := unwrapEnvelope(value, source.Platform)
-	if err != nil {
-		return "", err
+	if lastErr != nil && !remoteRouteUnavailable(lastErr) {
+		return "", lastErr
 	}
-	record, _ := data.(map[string]any)
-	publishedBase := strings.TrimSpace(text(record["api_base_url"], ""))
-	if publishedBase == "" {
-		return source.BaseURL, nil
+	return source.BaseURL, nil
+}
+
+func publishedSourceAPIBase(data any) string {
+	record, ok := data.(map[string]any)
+	if !ok {
+		return ""
 	}
-	normalized, err := validateRemoteURL(publishedBase)
-	if err != nil {
-		return "", &apiError{Status: http.StatusUnprocessableEntity, Code: "SOURCE_API_ENDPOINT_INVALID", Message: "源站发布的 API 地址无效：" + publishedBase}
+	for _, key := range []string{"api_base_url", "apiBaseUrl", "api_base", "apiBase", "public_api_base_url", "publicApiBaseUrl", "api_endpoint", "apiEndpoint"} {
+		if value := strings.TrimSpace(text(record[key], "")); value != "" {
+			return value
+		}
 	}
-	return normalized, nil
+	for _, key := range []string{"settings", "public", "config"} {
+		if nested, ok := record[key]; ok {
+			if value := publishedSourceAPIBase(nested); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
 }
 
 func (a *App) createRemoteManagedAccount(ctx context.Context, targetBase string, targetSession remoteSession, sourceBase, targetPlatform, key string, models, disabledModels []string, targetGroupIDs []int, name string, rateMultiplier float64, priority, concurrency int) (string, error) {

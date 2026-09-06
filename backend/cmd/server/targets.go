@@ -33,6 +33,10 @@ type Target struct {
 	CreatedAt    time.Time  `json:"createdAt"`
 }
 
+type deletedTargetManagedAccount struct {
+	TargetID, RemoteID, RemoteName string
+}
+
 func (a *App) listTargets(ctx context.Context) ([]Target, error) {
 	rows, err := a.db.QueryContext(ctx, `SELECT t.id,t.name,t.base_url,t.key_hint,t.status,t.version,t.write_enabled,t.last_sync_at,t.last_error,t.created_at,(SELECT count(*) FROM target_groups g WHERE g.target_id=t.id),(SELECT count(*) FROM managed_accounts m WHERE m.target_id=t.id) FROM targets t ORDER BY t.created_at DESC`)
 	if err != nil {
@@ -129,17 +133,26 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 		a.targetSyncFailed(ctx, target, err)
 		return err
 	}
+	for _, record := range groups {
+		if _, ok := number(record["id"]); !ok {
+			err = &apiError{502, "SCHEMA_CHANGED", "目标分组接口包含无效分组 ID，已跳过本次同步"}
+			a.targetSyncFailed(ctx, target, err)
+			return err
+		}
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	presentGroups := make(map[string]struct{}, len(groups))
 	for _, record := range groups {
 		idNumber, ok := number(record["id"])
 		if !ok {
 			continue
 		}
 		remoteID := strconv.Itoa(int(idNumber))
+		presentGroups[remoteID] = struct{}{}
 		multiplier := sub2APIGroupMultiplier(record, nil, remoteID)
 		platform := managedPlatform(text(record["platform"], "openai"))
 		models := targetGroupProbeModels(record, platform)
@@ -148,12 +161,87 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 			return err
 		}
 	}
+	staleRows, err := tx.QueryContext(ctx, `SELECT id,remote_id,name FROM target_groups WHERE target_id=$1`, id)
+	if err != nil {
+		return err
+	}
+	type staleTargetGroup struct{ ID, RemoteID, Name string }
+	staleGroups := []staleTargetGroup{}
+	for staleRows.Next() {
+		var item staleTargetGroup
+		if err = staleRows.Scan(&item.ID, &item.RemoteID, &item.Name); err != nil {
+			staleRows.Close()
+			return err
+		}
+		if _, ok := presentGroups[item.RemoteID]; !ok {
+			staleGroups = append(staleGroups, item)
+		}
+	}
+	if err = staleRows.Close(); err != nil {
+		return err
+	}
+	affectedAccounts := map[string]deletedTargetManagedAccount{}
+	for _, group := range staleGroups {
+		accountRows, queryErr := tx.QueryContext(ctx, `SELECT DISTINCT m.id,m.remote_id,m.remote_name FROM managed_accounts m JOIN managed_account_groups mg ON mg.managed_account_id=m.id WHERE mg.target_group_id=$1 AND m.ownership_marker LIKE 'channel-manage:%'`, group.ID)
+		if queryErr != nil {
+			return queryErr
+		}
+		for accountRows.Next() {
+			var managedID, remoteID, remoteName string
+			if err = accountRows.Scan(&managedID, &remoteID, &remoteName); err != nil {
+				accountRows.Close()
+				return err
+			}
+			affectedAccounts[managedID] = deletedTargetManagedAccount{TargetID: id, RemoteID: remoteID, RemoteName: remoteName}
+		}
+		if err = accountRows.Close(); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM managed_account_groups WHERE target_group_id=$1`, group.ID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM policies WHERE scope_id=$1`, group.ID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM target_groups WHERE id=$1`, group.ID); err != nil {
+			return err
+		}
+	}
+	deletedAccounts := []deletedTargetManagedAccount{}
+	for managedID, account := range affectedAccounts {
+		var remaining bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM managed_account_groups WHERE managed_account_id=$1)`, managedID).Scan(&remaining); err != nil {
+			return err
+		}
+		if remaining {
+			continue
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE action_intents SET status='REJECTED',error='目标分组已从目标节点删除',executed_at=now() WHERE managed_account_id=$1 AND status IN ('PENDING','APPROVED')`, managedID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM metric_buckets WHERE managed_account_id=$1`, managedID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM managed_accounts WHERE id=$1`, managedID); err != nil {
+			return err
+		}
+		if account.RemoteID != "" {
+			deletedAccounts = append(deletedAccounts, account)
+		}
+	}
 	_, err = tx.ExecContext(ctx, `UPDATE targets SET status='ONLINE',version=$2,last_sync_at=now(),last_error='',updated_at=now() WHERE id=$1`, id, version)
 	if err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	for _, group := range staleGroups {
+		a.audit(context.Background(), "AUTO_REMOVE", "target_group", group.ID, map[string]any{"target_id": id, "remote_id": group.RemoteID, "name": group.Name})
+		a.resolveEvent(context.Background(), "dynamic-multiplier:"+group.ID)
+	}
+	if len(deletedAccounts) > 0 {
+		go a.cleanupDeletedTargetManagedAccounts(target, session, deletedAccounts)
 	}
 	if err = a.ensureTargetProbeModels(ctx, id); err != nil {
 		return err
@@ -171,6 +259,16 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	return nil
 }
 
+func (a *App) cleanupDeletedTargetManagedAccounts(target Target, session remoteSession, accounts []deletedTargetManagedAccount) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	for _, account := range accounts {
+		if err := a.deleteRemoteManagedAccountChecked(ctx, target.BaseURL, session, account.RemoteID); err != nil {
+			a.openEvent(context.Background(), "P1", "ACCOUNT_CLEANUP", "目标分组删除后的托管账号清理失败", fmt.Sprintf("目标节点 %s / 托管账号 %s（远端 %s）删除失败：%s", target.Name, account.RemoteName, account.RemoteID, userErrorMessage(err)), "target-group-account-cleanup:"+target.ID+":"+account.RemoteID)
+		}
+	}
+}
+
 func (a *App) targetAssetLock(targetID string) *sync.Mutex {
 	if value, ok := a.targetAssetLocks.Load(targetID); ok {
 		return value.(*sync.Mutex)
@@ -180,13 +278,13 @@ func (a *App) targetAssetLock(targetID string) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
-func (a *App) reconcileDynamicTargetGroupMultiplier(ctx context.Context, policyID, targetGroupID string, quote dynamicMultiplierQuote) error {
+func (a *App) reconcileDynamicTargetGroupMultiplier(ctx context.Context, policyID, targetGroupID string, quote dynamicMultiplierQuote) (float64, bool, error) {
 	var targetID string
 	if err := a.db.QueryRowContext(ctx, `SELECT target_id FROM target_groups WHERE id=$1`, targetGroupID).Scan(&targetID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return &apiError{404, "TARGET_GROUP_NOT_FOUND", "动态倍率对应的目标分组不存在"}
+			return 0, false, &apiError{404, "TARGET_GROUP_NOT_FOUND", "动态倍率对应的目标分组不存在"}
 		}
-		return err
+		return 0, false, err
 	}
 	assetLock := a.targetAssetLock(targetID)
 	assetLock.Lock()
@@ -195,36 +293,36 @@ func (a *App) reconcileDynamicTargetGroupMultiplier(ctx context.Context, policyI
 	var remoteID, groupName string
 	var current sql.NullFloat64
 	if err := a.db.QueryRowContext(ctx, `SELECT remote_id,name,multiplier FROM target_groups WHERE id=$1 AND target_id=$2`, targetGroupID, targetID).Scan(&remoteID, &groupName, &current); err != nil {
-		return err
+		return 0, false, err
 	}
 	if current.Valid && !rateMultiplierNeedsSync(current.Float64, true, quote.Desired) {
-		return nil
+		return current.Float64, false, nil
 	}
 	target, _, err := a.targetCredentials(ctx, targetID)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if !target.WriteEnabled {
-		return &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入，无法同步动态倍率"}
+		return 0, false, &apiError{409, "TARGET_WRITE_DISABLED", "目标节点未开启托管写入，无法同步动态倍率"}
 	}
 	requestCtx, cancel := timeoutContext(ctx)
 	defer cancel()
 	session, err := a.authenticateTarget(requestCtx, target, true)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if err = a.updateRemoteTargetGroupMultiplier(requestCtx, target.BaseURL, remoteID, session, quote.Desired); err != nil {
-		return err
+		return 0, false, err
 	}
 	if _, err = a.db.ExecContext(context.Background(), `UPDATE target_groups SET multiplier=$2,multiplier_captured_at=now(),updated_at=now() WHERE id=$1`, targetGroupID, quote.Desired); err != nil {
-		return err
+		return 0, false, err
 	}
 	a.audit(context.Background(), "SYNC_DYNAMIC_MULTIPLIER", "target_group", targetGroupID, map[string]any{
 		"policy_id": policyID, "remote_id": remoteID, "group": groupName,
 		"source_group": quote.SourceGroup, "lowest": quote.Lowest,
 		"before": nullableFloat(current), "desired": quote.Desired,
 	})
-	return nil
+	return current.Float64, true, nil
 }
 
 func (a *App) updateRemoteTargetGroupMultiplier(ctx context.Context, baseURL, remoteID string, session remoteSession, multiplier float64) error {

@@ -688,6 +688,7 @@ type policyConfig struct {
 	DynamicMultiplierEnabled bool     `json:"dynamicMultiplierEnabled"`
 	DynamicMultiplierType    string   `json:"dynamicMultiplierType"`
 	DynamicMultiplierValue   float64  `json:"dynamicMultiplierValue"`
+	DynamicMultiplierMax     float64  `json:"dynamicMultiplierMax"`
 	ProbeModel               string   `json:"probeModel"`
 	DisabledModels           []string `json:"disabledModels"`
 	CacheMode                string   `json:"cacheMode"`
@@ -702,9 +703,10 @@ type policyConfig struct {
 const defaultPolicyMaxFirstTokenMs = 10_000
 
 const (
-	dynamicMultiplierFixed   = "FIXED"
-	dynamicMultiplierPercent = "PERCENT"
-	dynamicMultiplierStep    = 0.01
+	dynamicMultiplierFixed      = "FIXED"
+	dynamicMultiplierPercent    = "PERCENT"
+	dynamicMultiplierStep       = 0.01
+	defaultDynamicMultiplierMax = 1.0
 
 	cacheModeOff            = "OFF"
 	cacheModeObserve        = "OBSERVE"
@@ -724,6 +726,9 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	}
 	if config.DynamicMultiplierValue == 0 && !config.DynamicMultiplierEnabled {
 		config.DynamicMultiplierValue = dynamicMultiplierStep
+	}
+	if config.DynamicMultiplierMax == 0 && config.DynamicMultiplierEnabled {
+		config.DynamicMultiplierMax = defaultDynamicMultiplierMax
 	}
 	if config.MinSuccessRate <= 0 {
 		config.MinSuccessRate = 95
@@ -826,6 +831,13 @@ func validateDynamicMultiplierConfig(config policyConfig) error {
 	value := config.DynamicMultiplierValue
 	if math.IsNaN(value) || math.IsInf(value, 0) || value < dynamicMultiplierStep {
 		return &apiError{400, "INVALID_DYNAMIC_MULTIPLIER_VALUE", "动态倍率上浮值不能小于 0.01"}
+	}
+	maxMultiplier := config.DynamicMultiplierMax
+	if maxMultiplier == 0 {
+		maxMultiplier = defaultDynamicMultiplierMax
+	}
+	if math.IsNaN(maxMultiplier) || math.IsInf(maxMultiplier, 0) || maxMultiplier < dynamicMultiplierStep || maxMultiplier > 10_000_000 {
+		return &apiError{400, "INVALID_DYNAMIC_MULTIPLIER_MAX", "动态倍率上限需要设置为 0.01 至 10000000"}
 	}
 	if config.DynamicMultiplierType == dynamicMultiplierPercent {
 		if value > 10_000 {
@@ -1189,7 +1201,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 	allowed := map[string]bool{
 		"shadow_mode": true, "emergency_freeze": true, "auto_approve": true,
 		"probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true,
-		"min_healthy_channels": true, "confirmation_failures": true, "metric_window_minutes": true,
+		"min_healthy_channels": true, "confirmation_failures": true, "transient_confirmation_failures": true, "metric_window_minutes": true,
 		"min_error_samples": true, "error_rate_threshold": true,
 		"balance_alert_threshold":     true,
 		modelQualityProbeModelSetting: true,
@@ -1207,6 +1219,12 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 			threshold, ok := number(value)
 			if !ok || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold <= 0 || threshold > 1000000 {
 				return &apiError{400, "INVALID_BALANCE_ALERT_THRESHOLD", "余额提醒阈值必须大于 0 且不超过 1000000"}
+			}
+		}
+		if key == "transient_confirmation_failures" {
+			threshold, ok := number(value)
+			if !ok || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 3 || threshold > 20 || math.Trunc(threshold) != threshold {
+				return &apiError{400, "INVALID_TRANSIENT_CONFIRMATION_FAILURES", "瞬时错误确认次数必须是 3 至 20 的整数"}
 			}
 		}
 		if key == modelQualityProbeModelSetting {

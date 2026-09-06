@@ -621,6 +621,39 @@ func TestSendEmailRetriesTemporaryProviderFailureWithStableIdempotencyKey(t *tes
 	}
 }
 
+func TestSendAstrBotPayloadRequiresConfirmedDelivery(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = w.Write([]byte(`{"status":"ok","data":{"sent":false,"deduplicated":false}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"ok","data":{"sent":false,"deduplicated":true}}`))
+	}))
+	defer server.Close()
+
+	app := &App{httpClient: server.Client()}
+	config := astrbotNotificationConfig{Endpoint: server.URL, APIKey: "key"}
+	payload := astrbotMultiplierSnapshotPayload{
+		Event:          "current_multiplier_snapshot",
+		GroupName:      "【GPT】福利分组",
+		Current:        "0.05x",
+		Confirmed:      true,
+		IdempotencyKey: "current-multiplier/test/request/channel",
+	}
+	if err := app.sendAstrBotPayload(context.Background(), config, payload); err == nil {
+		t.Fatal("expected an unconfirmed delivery response to fail")
+	}
+	if err := app.sendAstrBotPayload(context.Background(), config, payload); err != nil {
+		t.Fatalf("deduplicated delivery should be accepted: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
 func TestManagedObjectNameFitsNewAPITokenLimit(t *testing.T) {
 	name := managedObjectName("CCMAX自营3可外接", "svip-bug-team-250刀", "12345678")
 	if len(name) > 50 {
@@ -936,6 +969,35 @@ func TestCalculateDynamicMultiplierPercentRoundsUpByOneCent(t *testing.T) {
 	quote, ok = calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "免费", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: 0, Valid: true}}}, config)
 	if !ok || quote.Desired != dynamicMultiplierStep {
 		t.Fatalf("dynamic target multiplier must remain at least 0.01, got %#v", quote)
+	}
+}
+
+func TestCalculateDynamicMultiplierHonorsConfiguredMaximum(t *testing.T) {
+	config := policyConfig{Mode: "PRICE", DynamicMultiplierEnabled: true, DynamicMultiplierType: dynamicMultiplierFixed, DynamicMultiplierValue: .05, DynamicMultiplierMax: .10}
+	quote, ok := calculateDynamicMultiplier([]managedPolicyCandidate{{SourceGroup: "A", State: "HEALTHY", SyncStatus: "SYNCED", SourceMultiplier: sql.NullFloat64{Float64: .08, Valid: true}}}, config)
+	if !ok || quote.Desired != .10 {
+		t.Fatalf("dynamic multiplier exceeded configured maximum: %#v, ok=%v", quote, ok)
+	}
+}
+
+func TestTransientProbeFailuresUseLongerConfirmationWindow(t *testing.T) {
+	for _, reason := range []string{
+		"业务测速模型 gpt-5.6-sol：抽样请求失败 (503): Service temporarily unavailable",
+		"REMOTE_RATE_LIMITED: 远端请求失败 (429)",
+		"REMOTE_UNAVAILABLE: 远端请求失败 (503)",
+	} {
+		item := eligiblePolicyCandidate("temporary-upstream", .05, 120)
+		item.ConsecutiveFailures = 3
+		item.StateReason = reason
+		item.ConfirmationFailures = 3
+		item.TransientConfirmationFailures = 6
+		if managedProbeFailureBlocksScheduling(item) {
+			t.Fatalf("transient failure reached the normal confirmation threshold: %s", reason)
+		}
+		item.ConsecutiveFailures = 6
+		if !managedProbeFailureBlocksScheduling(item) {
+			t.Fatalf("transient failure did not reach the transient confirmation threshold: %s", reason)
+		}
 	}
 }
 

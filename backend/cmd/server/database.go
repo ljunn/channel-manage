@@ -282,6 +282,11 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		END),true)
 		FROM policies p JOIN target_groups tg ON tg.id=p.scope_id
 		WHERE v.policy_id=p.id AND COALESCE(v.config->>'probeModel','')=''`,
+		`UPDATE policy_versions v
+		SET config=jsonb_set(v.config,'{dynamicMultiplierMax}',to_jsonb(COALESCE(tg.multiplier,1.0)),true)
+		FROM policies p JOIN target_groups tg ON tg.id=p.scope_id
+		WHERE v.policy_id=p.id AND COALESCE(v.config->>'dynamicMultiplierEnabled','false')='true'
+		AND NOT (v.config ? 'dynamicMultiplierMax')`,
 		`CREATE TABLE IF NOT EXISTS action_intents (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), managed_account_id UUID REFERENCES managed_accounts(id) ON DELETE SET NULL,
 			action_type TEXT NOT NULL, before_state JSONB NOT NULL DEFAULT '{}'::jsonb, after_state JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -340,8 +345,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"probe_interval_seconds": "900", "scan_interval_seconds": "900", "max_daily_probe_cost_usd": "1",
 		"min_healthy_channels": "1", "confirmation_failures": "3", "metric_window_minutes": "5",
 		"min_error_samples": "5", "error_rate_threshold": "20",
-		"balance_alert_threshold":     "10",
-		modelQualityProbeModelSetting: "\"gpt-5.6-sol\"",
+		"transient_confirmation_failures": "6",
+		"balance_alert_threshold":         "10",
+		modelQualityProbeModelSetting:     "\"gpt-5.6-sol\"",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

@@ -63,9 +63,9 @@ func nullableTime(value sql.NullTime) any {
 }
 
 func (a *App) probeChannel(ctx context.Context, id string) error {
-	var sourceID, sourceName, sourceBase, keyName, groupName, encryptedKey, state, stateReason, modelsJSON, modelCheckStatus string
+	var sourceID, sourceName, sourcePlatform, sourceBase, keyName, groupName, encryptedKey, state, stateReason, modelsJSON, modelCheckStatus string
 	var managed, modelCheckRequired, modelCheckOverride bool
-	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models,c.model_check_required,c.model_check_status,c.model_check_override,EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id) FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON, &modelCheckRequired, &modelCheckStatus, &modelCheckOverride, &managed)
+	err := a.db.QueryRowContext(ctx, `SELECT s.id,s.name,s.platform,s.base_url,k.name,COALESCE(g.name,''),k.key_cipher,c.lifecycle_state,c.state_reason,k.models,c.model_check_required,c.model_check_status,c.model_check_override,EXISTS(SELECT 1 FROM managed_accounts m WHERE m.channel_id=c.id) FROM channels c JOIN sources s ON s.id=c.source_id JOIN source_keys k ON k.id=c.source_key_id LEFT JOIN source_groups g ON g.id=c.source_group_id WHERE c.id=$1`, id).Scan(&sourceID, &sourceName, &sourcePlatform, &sourceBase, &keyName, &groupName, &encryptedKey, &state, &stateReason, &modelsJSON, &modelCheckRequired, &modelCheckStatus, &modelCheckOverride, &managed)
 	if err == sql.ErrNoRows {
 		return &apiError{404, "CHANNEL_NOT_FOUND", "渠道不存在"}
 	}
@@ -84,6 +84,9 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	}
 	models := []string{}
 	_ = json.Unmarshal([]byte(modelsJSON), &models)
+	if publishedBase, discoverErr := a.discoverSourceAPIBaseURL(ctx, Source{ID: sourceID, Name: sourceName, Platform: sourcePlatform, BaseURL: sourceBase}); discoverErr == nil {
+		sourceBase = publishedBase
+	}
 	started := time.Now()
 	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -167,6 +170,10 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	minSamples := a.settingInt(ctx, "min_error_samples", 5)
 	errorThreshold := a.settingInt(ctx, "error_rate_threshold", 20)
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
+	transientConfirmationFailures := a.settingInt(ctx, "transient_confirmation_failures", defaultTransientConfirmationFailures)
+	if transientConfirmationFailures < confirmationFailures {
+		transientConfirmationFailures = confirmationFailures
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -221,15 +228,23 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 				failureReason = requestErr.Error()
 			}
 			isolation := probeFailureRequiresImmediateIsolation(errorType, summary, failureReason)
+			failureThreshold := confirmationFailures
+			if probeFailureIsTransient(errorType, summary, failureReason) {
+				failureThreshold = transientConfirmationFailures
+			}
 			failureCount := `CASE WHEN $5::timestamptz IS NOT NULL AND (last_probe_at IS NULL OR last_probe_at < $5::timestamptz) THEN 1 ELSE consecutive_failures+1 END`
 			var failureBaseline any
 			if !a.policyEvidenceBaselineAt.IsZero() {
 				failureBaseline = a.policyEvidenceBaselineAt
 			}
 			query := fmt.Sprintf(`UPDATE channels SET consecutive_failures=%s,lifecycle_state=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN 'QUARANTINED' ELSE 'HEALTHY' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN lifecycle_state='QUARANTINED' OR $3 OR (%s) >= $4 THEN 0 ELSE score END WHERE id=$1`, failureCount, failureCount, failureCount, failureCount)
-			_, err = tx.ExecContext(ctx, query, id, truncate(failureReason, 200), isolation, confirmationFailures, failureBaseline)
+			_, err = tx.ExecContext(ctx, query, id, truncate(failureReason, 200), isolation, failureThreshold, failureBaseline)
 		} else {
-			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, confirmationFailures)
+			failureThreshold := confirmationFailures
+			if probeFailureIsTransient(errorType, summary) {
+				failureThreshold = transientConfirmationFailures
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET consecutive_failures=consecutive_failures+1,lifecycle_state=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 'QUARANTINED' ELSE 'SUSPECT' END,state_reason=$2,last_probe_at=now(),state_changed_at=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN now() ELSE state_changed_at END,score=CASE WHEN $3 OR consecutive_failures+1 >= $4 THEN 0 ELSE score END WHERE id=$1`, id, truncate(errorType, 200), businessConfirmed, failureThreshold)
 		}
 	}
 	if err != nil {
@@ -249,10 +264,21 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 	} else if success {
 		a.evaluateSourceBalance(ctx, sourceID)
 	}
+	if managed && sourceGroupDeletedError(errorType, summary) {
+		// A probe can observe a deleted source group before the regular source
+		// scan. Trigger an authoritative scan now so stale bindings are removed
+		// without waiting for the next 15-minute maintenance cycle.
+		go a.scanSource(context.Background(), sourceID)
+	}
 	// Individual channel failures remain visible in channel and scheduling views.
 	// Only a whole target group losing all eligible accounts creates an alert.
 	a.resolveEvent(ctx, "channel-probe:"+id)
 	return requestErr
+}
+
+func sourceGroupDeletedError(values ...string) bool {
+	message := strings.ToLower(strings.Join(values, " "))
+	return strings.Contains(message, "group_deleted") || strings.Contains(message, "分组已删除")
 }
 
 func quickValidationProbeLimit(state, reason string) int {

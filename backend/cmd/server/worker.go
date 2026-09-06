@@ -16,24 +16,25 @@ import (
 )
 
 const (
-	fastProbeIntervalSeconds   = 15
-	recoverySuccessSamples     = 3
-	maxConcurrentProbes        = 6
-	maxFirstTokenMs            = 60_000
-	businessLatencyFreshness   = 15 * time.Minute
-	businessLatencyMinSamples  = 5
-	latencyBadSnapshots        = 2
-	latencyGoodSnapshots       = 3
-	latencyRecoveryHold        = 5 * time.Minute
-	cacheMetricFreshness       = 10 * time.Minute
-	cacheStateRecoveryHold     = 15 * time.Minute
-	priorityChangeCooldown     = 5 * time.Minute
-	managedActionRetryCooldown = 5 * time.Minute
-	fallbackRebuildCooldown    = 15 * time.Minute
-	managedEvidenceFreshness   = 30 * time.Minute
-	tokenRefreshCheckInterval  = time.Minute
-	tokenRefreshLead           = 10 * time.Minute
-	tokenRefreshFallback       = 30 * time.Minute
+	fastProbeIntervalSeconds             = 15
+	recoverySuccessSamples               = 3
+	maxConcurrentProbes                  = 6
+	maxFirstTokenMs                      = 60_000
+	businessLatencyFreshness             = 15 * time.Minute
+	businessLatencyMinSamples            = 5
+	latencyBadSnapshots                  = 2
+	latencyGoodSnapshots                 = 3
+	latencyRecoveryHold                  = 5 * time.Minute
+	cacheMetricFreshness                 = 10 * time.Minute
+	cacheStateRecoveryHold               = 15 * time.Minute
+	priorityChangeCooldown               = 5 * time.Minute
+	managedActionRetryCooldown           = 5 * time.Minute
+	fallbackRebuildCooldown              = 15 * time.Minute
+	managedEvidenceFreshness             = 30 * time.Minute
+	tokenRefreshCheckInterval            = time.Minute
+	tokenRefreshLead                     = 10 * time.Minute
+	tokenRefreshFallback                 = 30 * time.Minute
+	defaultTransientConfirmationFailures = 6
 )
 
 const (
@@ -360,6 +361,16 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 	if isSlowFirstTokenQuarantine(item.State, item.StateReason) {
 		return slowRecoveryIntervalSeconds(item.ConsecutiveFailures, item.RecoverySuccesses)
 	}
+	if probeFailureIsTransient(item.StateReason) {
+		switch {
+		case item.ConsecutiveFailures <= 3:
+			return 60
+		case item.ConsecutiveFailures <= 6:
+			return 300
+		default:
+			return 900
+		}
+	}
 	if item.RecentSuccesses > 0 || item.ConsecutiveFailures <= 3 {
 		return fastProbeIntervalSeconds
 	}
@@ -476,11 +487,17 @@ func (a *App) evaluateManagedAccounts(ctx context.Context) error {
 				detail := "目标分组没有可用于计算动态倍率的健康托管账号；系统保留 Sub2API 当前倍率，等待渠道恢复或数据源刷新。"
 				a.openEvent(ctx, "P1", "DYNAMIC_MULTIPLIER", "动态倍率计算失败", detail, dynamicMultiplierEventKey(policy.ScopeID))
 			} else if !shadow && !frozen {
-				if err = a.reconcileDynamicTargetGroupMultiplier(ctx, policy.ID, policy.ScopeID, quote); err != nil {
+				var changed bool
+				var before float64
+				before, changed, err = a.reconcileDynamicTargetGroupMultiplier(ctx, policy.ID, policy.ScopeID, quote)
+				if err != nil {
 					detail := fmt.Sprintf("最低价分组 %s 为 %.6fx，计划将目标倍率调整为 %.6fx，但写入 Sub2API 失败：%s", quote.SourceGroup, quote.Lowest, quote.Desired, userErrorMessage(err))
 					a.openEvent(ctx, "P1", "DYNAMIC_MULTIPLIER", "动态倍率同步失败", detail, dynamicMultiplierEventKey(policy.ScopeID))
 				} else {
 					a.resolveEvent(ctx, dynamicMultiplierEventKey(policy.ScopeID))
+					if changed {
+						go a.notifyDynamicMultiplierChange(context.Background(), policy.ScopeID, before, quote.Desired)
+					}
 					groupItems = candidatesWithTargetMultiplier(groupItems, quote.Desired)
 				}
 			}
@@ -608,6 +625,7 @@ func calculateDynamicMultiplier(items []managedPolicyCandidate, config policyCon
 		quote.Desired = quote.Lowest + config.DynamicMultiplierValue
 		quote.Desired = math.Round(quote.Desired*1_000_000) / 1_000_000
 	}
+	quote.Desired = math.Min(quote.Desired, config.DynamicMultiplierMax)
 	if math.IsNaN(quote.Desired) || math.IsInf(quote.Desired, 0) || quote.Desired <= 0 || quote.Desired > 10_000_000 {
 		return dynamicMultiplierQuote{}, false
 	}
@@ -732,6 +750,7 @@ type managedPolicyCandidate struct {
 	CacheInputTokens, CacheReadTokens                                                  int64
 	BusinessRequests, BusinessErrors, PreviousBusinessRequests, PreviousBusinessErrors int
 	ConfirmationFailures                                                               int
+	TransientConfirmationFailures                                                      int
 }
 
 const policyMetricWindowDays = 7
@@ -775,6 +794,10 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	defer rows.Close()
 	items := []managedPolicyCandidate{}
 	confirmationFailures := a.settingInt(ctx, "confirmation_failures", 3)
+	transientConfirmationFailures := a.settingInt(ctx, "transient_confirmation_failures", defaultTransientConfirmationFailures)
+	if transientConfirmationFailures < confirmationFailures {
+		transientConfirmationFailures = confirmationFailures
+	}
 	for rows.Next() {
 		var item managedPolicyCandidate
 		if err := rows.Scan(&item.ID, &item.ChannelID, &item.TargetGroupID, &item.RemoteID, &item.RemoteName, &item.SourceName, &item.TargetName, &item.Schedulable, &item.FallbackActive, &item.Priority, &item.SyncStatus, &item.State, &item.StateReason, &item.ModelCheckRequired, &item.ModelCheckStatus, &item.ModelCheckOverride, &item.ModelCheckScore, &item.ModelCheckReason, &item.ModelCheckModel, &item.ConsecutiveFailures, &item.SourceGroup, &item.TargetGroup, &item.SourceMultiplier, &item.TargetMultiplier, &item.Platform, &item.ModelsJSON, &item.SourceUntrusted, &item.SourcePaused, &item.Samples, &item.SuccessRate, &item.BusinessFirstToken, &item.BusinessFirstTokenP90, &item.SpeedMetricSamples, &item.BusinessLatencyAt, &item.SpeedMetricModel, &item.CacheState, &item.CacheScore, &item.CacheSamples, &item.CacheInputTokens, &item.CacheReadTokens, &item.CacheMetricSource, &item.CacheMetricModel, &item.CacheMetricRequestType, &item.CacheMetricAt, &item.CacheBadSnapshots, &item.CacheGoodSnapshots, &item.CacheEvaluatedAt, &item.CacheStateChangedAt, &item.CachePenaltyActive, &item.CachePenalizedAt, &item.LatencyState, &item.LatencyBadSnapshots, &item.LatencyGoodSnapshots, &item.LatencyEvaluatedAt, &item.LatencyStateChangedAt, &item.PrioritySyncedAt, &item.LatestProbeFirstToken, &item.LatestProbeAt, &item.LatestProbeEvidenceAt, &item.ProbeFirstTokenP95, &item.RecentSuccesses, &item.RecoverySuccesses, &item.SourceStatus, &item.SourceScanStatus, &item.SourceLastSuccessfulScanAt, &item.SourceLastError, &item.SourceScanIntervalSeconds, &item.BusinessMetricAt, &item.BusinessRequests, &item.BusinessErrors, &item.PreviousBusinessRequests, &item.PreviousBusinessErrors); err != nil {
@@ -795,6 +818,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 			item.CacheState = cacheStateUnknown
 		}
 		item.ConfirmationFailures = confirmationFailures
+		item.TransientConfirmationFailures = transientConfirmationFailures
 		item.SourceScanBlockReason = sourceSchedulingBlockReason(item.SourceStatus, item.SourceScanStatus, item.SourceLastError, item.SourceLastSuccessfulScanAt, item.SourceScanIntervalSeconds, time.Now())
 		item.SourceScanBlocked = item.SourceScanBlockReason != ""
 		item.BusinessConfirmedFailure = businessErrorConfirmedAcrossWindows(item.BusinessRequests, item.BusinessErrors, item.PreviousBusinessRequests, item.PreviousBusinessErrors, businessMinSamples, businessErrorThreshold)
@@ -1283,6 +1307,9 @@ func managedProbeFailureBlocksScheduling(item managedPolicyCandidate) bool {
 		return true
 	}
 	limit := item.ConfirmationFailures
+	if probeFailureIsTransient(item.StateReason) && item.TransientConfirmationFailures > limit {
+		limit = item.TransientConfirmationFailures
+	}
 	if limit < 1 {
 		limit = 3
 	}
@@ -1312,6 +1339,29 @@ func probeFailureRequiresImmediateIsolation(values ...string) bool {
 		"forbidden", "invalid token", "token expired", "401", "403", "probe_model_unavailable",
 	} {
 		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// 429 and 5xx responses usually describe a temporary upstream condition. They
+// should be confirmed over a longer window than account/group/auth failures.
+// The detailed response remains in state_reason for operators.
+func probeFailureIsTransient(values ...string) bool {
+	message := strings.ToLower(strings.Join(values, " "))
+	for _, marker := range []string{
+		"抽样请求失败 (408)", "抽样请求失败 (429)", "抽样请求失败 (500)",
+		"抽样请求失败 (502)", "抽样请求失败 (503)", "抽样请求失败 (504)",
+		"远端请求失败 (408)", "远端请求失败 (429)", "远端请求失败 (500)",
+		"远端请求失败 (502)", "远端请求失败 (503)", "远端请求失败 (504)",
+		"remote_rate_limited", "remote_unavailable",
+		"temporarily unavailable", "service temporarily unavailable",
+		"no available upstream account", "no available accounts",
+		"upstream providers are temporarily cooling", "upstream service temporarily unavailable",
+		"database error",
+	} {
+		if strings.Contains(message, strings.ToLower(marker)) {
 			return true
 		}
 	}
@@ -1454,6 +1504,9 @@ func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bo
 
 func unconfirmedProbeFailure(item managedPolicyCandidate) bool {
 	limit := item.ConfirmationFailures
+	if probeFailureIsTransient(item.StateReason) && item.TransientConfirmationFailures > limit {
+		limit = item.TransientConfirmationFailures
+	}
 	if limit < 1 {
 		limit = 3
 	}

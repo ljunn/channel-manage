@@ -16,6 +16,8 @@ services:
   app:
     image: ${CHANNEL_MANAGE_IMAGE:-ghcr.io/ljunn/channel-manage:latest}
     container_name: channel-manage-app
+    extra_hosts:
+      - "bot.junliai.org:67.21.95.202"
     depends_on:
       postgres: { condition: service_healthy }
     environment:
