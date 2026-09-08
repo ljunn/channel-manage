@@ -246,6 +246,7 @@ func (a *App) syncTarget(ctx context.Context, id string) error {
 	if err = a.ensureTargetProbeModels(ctx, id); err != nil {
 		return err
 	}
+	go a.reconcileModelChecks(context.Background(), "")
 	a.resolveEvent(ctx, "target-sync:"+id)
 	a.resolveEvent(ctx, "target-rate-limit:"+id)
 	go func() {
@@ -678,13 +679,15 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	}()
 
 	type mappingAccount struct {
-		id, remoteID, platform, sourceID, sourceName, sourcePlatform, sourceBase, modelsJSON, currentHash string
-		encryptedKey                                                                                      []byte
-		disabledModels                                                                                    []string
-		mapping                                                                                           map[string]string
-		desiredHash                                                                                       string
+		id, remoteID, platform, sourceID, sourceName, sourcePlatform, sourceBase, modelsJSON, currentHash, currentRetryHash string
+		encryptedKey                                                                                                        []byte
+		disabledModels                                                                                                      []string
+		mapping                                                                                                             map[string]string
+		desiredHash                                                                                                         string
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,tg.platform,s.id,s.name,s.platform,s.base_url,k.models,m.model_mapping_hash,k.key_cipher,COALESCE((
+	retryCodes := a.loadPoolModeRetryStatusCodes(ctx)
+	retryHash := poolModeRetryStatusCodesHash(retryCodes)
+	rows, err := a.db.QueryContext(ctx, `SELECT m.id,m.remote_id,tg.platform,s.id,s.name,s.platform,s.base_url,k.models,m.model_mapping_hash,m.pool_mode_retry_status_codes_hash,k.key_cipher,COALESCE((
 			SELECT v.config FROM policies p JOIN policy_versions v ON v.policy_id=p.id AND v.version=p.active_version
 			WHERE p.scope_type='TARGET_GROUP' AND p.scope_id=tg.id AND p.status='ACTIVE' LIMIT 1
 		),'{}'::jsonb)
@@ -703,7 +706,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 	for rows.Next() {
 		var item mappingAccount
 		var configData string
-		if err = rows.Scan(&item.id, &item.remoteID, &item.platform, &item.sourceID, &item.sourceName, &item.sourcePlatform, &item.sourceBase, &item.modelsJSON, &item.currentHash, &item.encryptedKey, &configData); err != nil {
+		if err = rows.Scan(&item.id, &item.remoteID, &item.platform, &item.sourceID, &item.sourceName, &item.sourcePlatform, &item.sourceBase, &item.modelsJSON, &item.currentHash, &item.currentRetryHash, &item.encryptedKey, &configData); err != nil {
 			break
 		}
 		var config policyConfig
@@ -711,7 +714,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 		item.disabledModels = normalizePolicyConfig(config).DisabledModels
 		item.mapping = modelMappingForPolicy(item.platform, decodeModels(item.modelsJSON), item.disabledModels)
 		item.desiredHash = managedAccountConfigHash(item.platform, item.mapping)
-		if item.desiredHash == item.currentHash {
+		if item.desiredHash == item.currentHash && item.currentRetryHash == retryHash {
 			continue
 		}
 		items = append(items, item)
@@ -768,7 +771,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 			"model_mapping":                item.mapping,
 			"pool_mode":                    true,
 			"pool_mode_retry_count":        3,
-			"pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504},
+			"pool_mode_retry_status_codes": retryCodes,
 		}
 		if err = a.syncTargetAccountFields(ctx, target.BaseURL, item.remoteID, session, map[string]any{"credentials": credentials}); err != nil {
 			failed++
@@ -776,7 +779,7 @@ func (a *App) syncManagedAccountModelMappings(ctx context.Context, target Target
 			continue
 		}
 		corrected++
-		_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET model_mapping_hash=$2,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, item.id, item.desiredHash)
+		_, _ = a.db.ExecContext(context.Background(), `UPDATE managed_accounts SET model_mapping_hash=$2,pool_mode_retry_status_codes_hash=$3,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, item.id, item.desiredHash, retryHash)
 		a.audit(context.Background(), "RECONCILE_MODEL_MAPPING", "managed_account", item.id, map[string]any{"remote_id": item.remoteID, "platform": item.platform, "models": len(item.mapping)})
 	}
 	if corrected > 0 {
@@ -830,7 +833,7 @@ func (a *App) replaceManagedAccountPlatform(ctx context.Context, target Target, 
 			return fmt.Errorf("恢复新账号调度状态失败: %w", err)
 		}
 	}
-	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,rate_multiplier=$6,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPolicy(platform, models, disabledModels)), rateMultiplier)
+	result, err := a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$5,pool_mode_retry_status_codes_hash=$6,rate_multiplier=$7,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1 AND remote_id=$4`, managedID, newRemoteID, platform, oldRemoteID, managedAccountConfigHash(platform, modelMappingForPolicy(platform, models, disabledModels)), poolModeRetryStatusCodesHash(a.loadPoolModeRetryStatusCodes(ctx)), rateMultiplier)
 	if err != nil {
 		return fmt.Errorf("保存新账号关联失败: %w", err)
 	}

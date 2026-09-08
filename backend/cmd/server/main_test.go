@@ -203,6 +203,10 @@ func TestCreateRemoteManagedAccountsCreatesOneAccountPerTargetGroup(t *testing.T
 			t.Fatalf("account %d platform=%v, want target group platform %s", index, request["platform"], targetGroup.Platform)
 		}
 		credentials := request["credentials"].(map[string]any)
+		retryCodes, ok := credentials["pool_mode_retry_status_codes"].([]any)
+		if !ok || len(retryCodes) != 3 || int(retryCodes[0].(float64)) != 401 || int(retryCodes[1].(float64)) != 403 || int(retryCodes[2].(float64)) != 429 {
+			t.Fatalf("account %d retry status codes=%v, want [401 403 429]", index, credentials["pool_mode_retry_status_codes"])
+		}
 		expectedBaseURL := "https://source.example/v1"
 		if targetGroup.Platform == "anthropic" {
 			expectedBaseURL = "https://source.example"

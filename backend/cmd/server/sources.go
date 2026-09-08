@@ -928,6 +928,7 @@ func (a *App) collectSource(ctx context.Context, source Source, session remoteSe
 			go a.cleanupDeletedSourceManagedAccounts(source.Name, deletedAccounts)
 		}
 	}
+	go a.reconcileModelChecks(context.Background(), source.ID)
 	a.queueNewModelChecks(newChannelIDs)
 	return nil
 }
@@ -1048,6 +1049,7 @@ func (a *App) addSourceKey(w http.ResponseWriter, r *http.Request, sourceID stri
 	if err != nil {
 		return err
 	}
+	go a.reconcileModelChecks(context.Background(), sourceID)
 	a.queueNewModelChecks(newChannelIDs)
 	writeData(w, map[string]any{"id": id})
 	return nil

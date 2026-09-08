@@ -1203,8 +1203,9 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		"probe_interval_seconds": true, "scan_interval_seconds": true, "max_daily_probe_cost_usd": true,
 		"min_healthy_channels": true, "confirmation_failures": true, "transient_confirmation_failures": true, "metric_window_minutes": true,
 		"min_error_samples": true, "error_rate_threshold": true,
-		"balance_alert_threshold":     true,
-		modelQualityProbeModelSetting: true,
+		"balance_alert_threshold":       true,
+		modelQualityProbeModelSetting:   true,
+		poolModeRetryStatusCodesSetting: true,
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1238,6 +1239,21 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 			}
 			value = normalized
 		}
+		if key == poolModeRetryStatusCodesSetting {
+			configured, ok := value.(string)
+			if !ok {
+				return &apiError{400, "INVALID_POOL_MODE_RETRY_STATUS_CODES", "同账号重试状态码必须是文本"}
+			}
+			trimmed := strings.TrimSpace(configured)
+			if trimmed != "" {
+				codes, validationErr := parsePoolModeRetryStatusCodes(trimmed)
+				if validationErr != nil {
+					return validationErr
+				}
+				trimmed = formatPoolModeRetryStatusCodes(codes)
+			}
+			value = trimmed
+		}
 		if _, err = tx.ExecContext(r.Context(), `INSERT INTO settings(key,value,updated_at) VALUES($1,$2,now()) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=now()`, key, jsonValue(value)); err != nil {
 			return err
 		}
@@ -1246,6 +1262,9 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	a.audit(r.Context(), "UPDATE", "settings", "global", input)
+	if _, changed := input[poolModeRetryStatusCodesSetting]; changed {
+		go a.refreshPoolModeRetryStatusCodes()
+	}
 	settings, err := a.getSettings(r.Context())
 	if err != nil {
 		return err

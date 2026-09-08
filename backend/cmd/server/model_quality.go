@@ -47,6 +47,7 @@ const (
 	modelCheckPassed  = "PASSED"
 	modelCheckFailed  = "FAILED"
 	modelCheckUnknown = "UNKNOWN"
+	modelCheckSkipped = "SKIPPED"
 
 	modelCheckTriggerNew    = "NEW_CHANNEL"
 	modelCheckTriggerManual = "MANUAL"
@@ -536,6 +537,129 @@ func (a *App) queueNewModelChecks(ids []string) {
 	}
 }
 
+// Model capability checks are meaningful for OpenAI-compatible target groups
+// only. Gemini, Kiro and other provider-specific groups already have their own
+// configured business probe model and must not be sent the global GPT check.
+// A channel can be attached to more than one target group, so one OpenAI
+// mapping keeps the check enabled for the channel.
+func (a *App) modelQualityScope(ctx context.Context, channelID string) (mapped, applies bool, err error) {
+	err = a.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM managed_accounts m
+			JOIN managed_account_groups mag ON mag.managed_account_id=m.id
+			JOIN target_groups tg ON tg.id=mag.target_group_id
+			WHERE m.channel_id=$1
+		), EXISTS(
+			SELECT 1 FROM managed_accounts m
+			JOIN managed_account_groups mag ON mag.managed_account_id=m.id
+			JOIN target_groups tg ON tg.id=mag.target_group_id
+			WHERE m.channel_id=$1 AND lower(tg.platform)='openai'
+		)`, channelID).Scan(&mapped, &applies)
+	return
+}
+
+func (a *App) skipNonOpenAIModelCheck(ctx context.Context, channelID string) error {
+	_, err := a.db.ExecContext(ctx, `
+		UPDATE channels SET
+			model_check_required=false,
+			model_check_status=$2,
+			model_check_model='',
+			model_check_score=NULL,
+			model_check_reason=$3,
+			model_check_version='',
+			model_check_trigger='',
+			model_check_at=now(),
+			model_check_started_at=NULL,
+			lifecycle_state=CASE
+				WHEN lifecycle_state<>'MANUAL_HOLD' AND (
+					state_reason LIKE '等待模型能力检测%'
+					OR state_reason LIKE '模型能力检测进行中%'
+					OR state_reason LIKE '模型能力检测不通过%'
+					OR state_reason LIKE '模型能力检测失败%'
+				) THEN 'VALIDATING'
+				ELSE lifecycle_state
+			END,
+			state_reason=CASE
+				WHEN lifecycle_state<>'MANUAL_HOLD' AND (
+					state_reason LIKE '等待模型能力检测%'
+					OR state_reason LIKE '模型能力检测进行中%'
+					OR state_reason LIKE '模型能力检测不通过%'
+					OR state_reason LIKE '模型能力检测失败%'
+				) THEN $4
+				ELSE state_reason
+			END,
+			state_changed_at=CASE
+				WHEN lifecycle_state<>'MANUAL_HOLD' AND (
+					state_reason LIKE '等待模型能力检测%'
+					OR state_reason LIKE '模型能力检测进行中%'
+					OR state_reason LIKE '模型能力检测不通过%'
+					OR state_reason LIKE '模型能力检测失败%'
+				) THEN now()
+				ELSE state_changed_at
+			END
+		WHERE id=$1 AND model_check_status<>'RUNNING'`, channelID, modelCheckSkipped,
+		"非 OpenAI 目标分组，已跳过模型能力检测", "非 OpenAI 目标分组，等待健康验证")
+	return err
+}
+
+// Reconcile channels after a mapping change. A previously skipped channel is
+// promoted back to a pending check if an OpenAI target group is added; a
+// channel that loses its last OpenAI mapping is released from the gate.
+func (a *App) reconcileModelChecks(ctx context.Context, sourceID string) {
+	query := `SELECT id FROM channels`
+	args := []any{}
+	if strings.TrimSpace(sourceID) != "" {
+		query += ` WHERE source_id=$1`
+		args = append(args, sourceID)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := a.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		log.Printf("读取渠道模型检测范围失败: %v", err)
+		return
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			log.Printf("读取渠道模型检测范围失败: %v", err)
+			return
+		}
+		mapped, applies, scopeErr := a.modelQualityScope(ctx, id)
+		if scopeErr != nil {
+			log.Printf("读取渠道 %s 模型检测范围失败: %v", id, scopeErr)
+			continue
+		}
+		if !mapped {
+			continue
+		}
+		if !applies {
+			if err = a.skipNonOpenAIModelCheck(ctx, id); err != nil {
+				log.Printf("跳过渠道 %s 模型能力检测失败: %v", id, err)
+			}
+			continue
+		}
+		var status string
+		if err = a.db.QueryRowContext(ctx, `SELECT model_check_status FROM channels WHERE id=$1`, id).Scan(&status); err != nil {
+			continue
+		}
+		if status != modelCheckSkipped {
+			continue
+		}
+		result, updateErr := a.db.ExecContext(ctx, `UPDATE channels SET model_check_required=true,model_check_status='PENDING',model_check_reason='模型能力检测排队中',model_check_score=NULL,model_check_model='',model_check_version=$2,model_check_trigger='NEW_CHANNEL',model_check_at=NULL,model_check_started_at=NULL WHERE id=$1 AND model_check_status='SKIPPED' AND model_check_override=false`, id, modelQualityVersion)
+		if updateErr == nil {
+			if count, _ := result.RowsAffected(); count > 0 {
+				ids = append(ids, id)
+			}
+		}
+	}
+	if err = rows.Err(); err != nil {
+		log.Printf("读取渠道模型检测范围失败: %v", err)
+	}
+	a.queueNewModelChecks(ids)
+}
+
 // Pending checks remain durable until a worker actually acquires an execution
 // slot. This recovery path is deliberately limited to NEW_CHANNEL rows; it
 // never turns a completed or technical-unknown result into an automatic rerun.
@@ -618,6 +742,25 @@ func (a *App) startModelQualityCheck(ctx context.Context, id, trigger, requested
 	}
 	if trigger == modelCheckTriggerNew && currentOverride {
 		return &apiError{409, "MODEL_CHECK_OVERRIDDEN", "该渠道已人工放行，系统不会重复执行新渠道自动检测"}
+	}
+	mapped, applies, scopeErr := a.modelQualityScope(ctx, id)
+	if scopeErr != nil {
+		return scopeErr
+	}
+	if !mapped {
+		// A source channel can be discovered before it is mapped to a target
+		// group. Leave the durable PENDING marker in place until that mapping
+		// supplies the provider context.
+		if trigger == modelCheckTriggerNew {
+			return nil
+		}
+		return &apiError{409, "MODEL_CHECK_NOT_APPLICABLE", "该渠道尚未绑定目标分组，暂时无法确定模型检测范围"}
+	}
+	if !applies {
+		if trigger == modelCheckTriggerNew {
+			return a.skipNonOpenAIModelCheck(ctx, id)
+		}
+		return &apiError{409, "MODEL_CHECK_NOT_APPLICABLE", "该渠道绑定的目标分组不启用模型能力检测"}
 	}
 
 	// Reserve the in-process slot before changing the durable state. If the

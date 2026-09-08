@@ -278,6 +278,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 	defer tx.Rollback()
 	result := make([]map[string]any, 0, len(sourceGroups)*len(targetGroups))
 	newChannelIDs := make([]string, 0, len(created))
+	retryStatusHash := poolModeRetryStatusCodesHash(a.loadPoolModeRetryStatusCodes(ctx))
 	for _, item := range created {
 		keyID := uuid.NewString()
 		encryptedKey, encryptErr := a.encryptSecret([]byte(item.Key.Key))
@@ -297,7 +298,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		for _, account := range item.Accounts {
 			managedID := uuid.NewString()
 			mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, item.Models, account.TargetGroup.DisabledModels))
-			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, item.SourceGroup.Multiplier, "channel-manage:"+managedID, mappingHash)
+			_, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash,pool_mode_retry_status_codes_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11,$12)`, managedID, input.TargetID, channelID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, input.Priority, input.Concurrency, item.SourceGroup.Multiplier, "channel-manage:"+managedID, mappingHash, retryStatusHash)
 			if err != nil {
 				return nil, err
 			}
@@ -311,6 +312,7 @@ func (a *App) executeSourceDeployment(ctx context.Context, sourceID string, inpu
 		return nil, err
 	}
 	committed = true
+	go a.reconcileModelChecks(context.Background(), sourceID)
 	a.queueNewModelChecks(newChannelIDs)
 	for _, item := range result {
 		a.audit(ctx, "AUTO_DEPLOY", "managed_account", item["managedAccountId"].(string), map[string]any{"source_id": sourceID, "source_group_id": item["sourceGroupId"], "target_id": input.TargetID, "target_group_id": item["targetGroupId"]})
@@ -584,7 +586,7 @@ func (a *App) createRemoteManagedAccountWithMappingIdempotent(ctx context.Contex
 	if len(modelMap) == 0 {
 		return "", &apiError{409, "NO_ALLOWED_MODELS", "账号没有可复用的模型映射"}
 	}
-	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": []int{401, 408, 429, 500, 502, 503, 504}}, "group_ids": targetGroupIDs, "rate_multiplier": rateMultiplier, "priority": priority, "concurrency": concurrency, "schedulable": false}
+	payload := map[string]any{"name": name, "platform": managedPlatform(targetPlatform), "type": "apikey", "credentials": map[string]any{"api_key": key, "base_url": accountBaseURL(sourceBase, targetPlatform), "model_mapping": modelMap, "pool_mode": true, "pool_mode_retry_count": 3, "pool_mode_retry_status_codes": a.loadPoolModeRetryStatusCodes(ctx)}, "group_ids": targetGroupIDs, "rate_multiplier": rateMultiplier, "priority": priority, "concurrency": concurrency, "schedulable": false}
 	createSession := targetSession
 	createSession.IdempotencyKey = idempotencyKey
 	value, _, err := a.remoteJSON(ctx, targetBase, http.MethodPost, "/api/v1/admin/accounts", createSession, payload)

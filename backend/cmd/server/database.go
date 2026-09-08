@@ -177,6 +177,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		`ALTER TABLE managed_accounts ALTER COLUMN priority SET DEFAULT 1000`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'openai'`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS model_mapping_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS pool_mode_retry_status_codes_hash TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS rate_multiplier NUMERIC(14,6)`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS business_first_token_ms INT`,
 		`ALTER TABLE managed_accounts ADD COLUMN IF NOT EXISTS business_first_token_p90_ms INT`,
@@ -235,6 +236,59 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			managed_account_id UUID NOT NULL REFERENCES managed_accounts(id) ON DELETE CASCADE,
 			target_group_id UUID NOT NULL REFERENCES target_groups(id) ON DELETE RESTRICT,
 			PRIMARY KEY(managed_account_id, target_group_id)
+		)`,
+		// Model capability checks apply only to channels mapped to at least one
+		// OpenAI target group. Release older Gemini/Kiro and other provider
+		// channels that were incorrectly held by the global GPT check.
+		`UPDATE channels c SET
+			model_check_required=false,
+			model_check_status='SKIPPED',
+			model_check_model='',
+			model_check_score=NULL,
+			model_check_reason='非 OpenAI 目标分组，已跳过模型能力检测',
+			model_check_version='',
+			model_check_trigger='',
+			model_check_at=now(),
+			model_check_started_at=NULL,
+			lifecycle_state=CASE
+				WHEN c.lifecycle_state<>'MANUAL_HOLD' AND (
+					c.state_reason LIKE '等待模型能力检测%'
+					OR c.state_reason LIKE '模型能力检测进行中%'
+					OR c.state_reason LIKE '模型能力检测不通过%'
+					OR c.state_reason LIKE '模型能力检测失败%'
+				) THEN 'VALIDATING'
+				ELSE c.lifecycle_state
+			END,
+			state_reason=CASE
+				WHEN c.lifecycle_state<>'MANUAL_HOLD' AND (
+					c.state_reason LIKE '等待模型能力检测%'
+					OR c.state_reason LIKE '模型能力检测进行中%'
+					OR c.state_reason LIKE '模型能力检测不通过%'
+					OR c.state_reason LIKE '模型能力检测失败%'
+				) THEN '非 OpenAI 目标分组，等待健康验证'
+				ELSE c.state_reason
+			END,
+			state_changed_at=CASE
+				WHEN c.lifecycle_state<>'MANUAL_HOLD' AND (
+					c.state_reason LIKE '等待模型能力检测%'
+					OR c.state_reason LIKE '模型能力检测进行中%'
+					OR c.state_reason LIKE '模型能力检测不通过%'
+					OR c.state_reason LIKE '模型能力检测失败%'
+				) THEN now()
+				ELSE c.state_changed_at
+			END
+		WHERE EXISTS (
+			SELECT 1 FROM managed_accounts m
+			JOIN managed_account_groups mag ON mag.managed_account_id=m.id
+			JOIN target_groups tg ON tg.id=mag.target_group_id
+			WHERE m.channel_id=c.id
+		)
+		AND c.model_check_status<>'RUNNING'
+		AND NOT EXISTS (
+			SELECT 1 FROM managed_accounts m
+			JOIN managed_account_groups mag ON mag.managed_account_id=m.id
+			JOIN target_groups tg ON tg.id=mag.target_group_id
+			WHERE m.channel_id=c.id AND lower(tg.platform)='openai'
 		)`,
 		`CREATE TABLE IF NOT EXISTS deployment_jobs (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), source_id UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -348,6 +402,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"transient_confirmation_failures": "6",
 		"balance_alert_threshold":         "10",
 		modelQualityProbeModelSetting:     "\"gpt-5.6-sol\"",
+		poolModeRetryStatusCodesSetting:   "\"401,403,429\"",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

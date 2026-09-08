@@ -193,6 +193,7 @@ func (a *App) updateSourceGroupMapping(w http.ResponseWriter, r *http.Request, s
 
 	a.audit(r.Context(), "UPDATE_SOURCE_GROUP_MAPPING", "source_group", sourceGroupID, map[string]any{"target_id": input.TargetID, "created": len(created), "removed": len(removed), "kept": len(kept), "target_group_ids": input.TargetGroupIDs})
 	a.resolveEvent(r.Context(), "mapping-sync:"+sourceGroupID+":"+input.TargetID)
+	go a.reconcileModelChecks(context.Background(), sourceID)
 	a.requestPolicyEvaluation()
 	writeData(w, map[string]any{"created": len(created), "removed": len(removed), "kept": len(kept), "changed": true})
 	return nil
@@ -259,10 +260,11 @@ func (a *App) commitSourceGroupMapping(ctx context.Context, targetID string, cha
 		return err
 	}
 	defer tx.Rollback()
+	retryStatusHash := poolModeRetryStatusCodesHash(a.loadPoolModeRetryStatusCodes(ctx))
 	for _, account := range created {
 		managedID := uuid.NewString()
 		mappingHash := managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels))
-		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, channel.SourceMultiplier, "channel-manage:"+managedID, mappingHash); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_accounts(id,target_id,channel_id,remote_id,remote_name,platform,priority,concurrency,rate_multiplier,schedulable,ownership_marker,sync_status,model_mapping_hash,pool_mode_retry_status_codes_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,$10,'SYNCED',$11,$12)`, managedID, targetID, channel.ID, account.RemoteID, account.RemoteName, account.TargetGroup.Platform, priority, concurrency, channel.SourceMultiplier, "channel-manage:"+managedID, mappingHash, retryStatusHash); err != nil {
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO managed_account_groups(managed_account_id,target_group_id) VALUES($1,$2)`, managedID, account.TargetGroup.ID); err != nil {
@@ -330,7 +332,8 @@ func (a *App) restoreDeletedMappingAccounts(ctx context.Context, target Target, 
 				failures = append(failures, account.TargetGroup.Name+": 恢复调度失败")
 			}
 		}
-		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,rate_multiplier=$5,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels)), rateMultiplier); err != nil {
+		retryStatusHash := poolModeRetryStatusCodesHash(a.loadPoolModeRetryStatusCodes(ctx))
+		if _, err = a.db.ExecContext(ctx, `UPDATE managed_accounts SET remote_id=$2,platform=$3,model_mapping_hash=$4,pool_mode_retry_status_codes_hash=$5,rate_multiplier=$6,sync_status='SYNCED',last_error='',updated_at=now() WHERE id=$1`, account.ID, remoteID, account.TargetGroup.Platform, managedAccountConfigHash(account.TargetGroup.Platform, modelMappingForPolicy(account.TargetGroup.Platform, models, account.TargetGroup.DisabledModels)), retryStatusHash, rateMultiplier); err != nil {
 			failures = append(failures, account.TargetGroup.Name+": 保存恢复账号失败")
 		}
 	}
