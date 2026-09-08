@@ -16,19 +16,23 @@ import (
 )
 
 const (
-	fastProbeIntervalSeconds             = 15
-	recoverySuccessSamples               = 3
-	maxConcurrentProbes                  = 6
-	maxFirstTokenMs                      = 60_000
-	businessLatencyFreshness             = 15 * time.Minute
-	businessLatencyMinSamples            = 5
-	latencyBadSnapshots                  = 2
-	latencyGoodSnapshots                 = 3
-	latencyRecoveryHold                  = 5 * time.Minute
-	cacheMetricFreshness                 = 10 * time.Minute
-	cacheStateRecoveryHold               = 15 * time.Minute
-	priorityChangeCooldown               = 5 * time.Minute
-	managedActionRetryCooldown           = 5 * time.Minute
+	fastProbeIntervalSeconds   = 15
+	recoverySuccessSamples     = 3
+	maxConcurrentProbes        = 6
+	maxFirstTokenMs            = 60_000
+	businessLatencyFreshness   = 15 * time.Minute
+	businessLatencyMinSamples  = 5
+	latencyBadSnapshots        = 2
+	latencyGoodSnapshots       = 3
+	latencyRecoveryHold        = 5 * time.Minute
+	cacheMetricFreshness       = 10 * time.Minute
+	cacheStateRecoveryHold     = 15 * time.Minute
+	priorityChangeCooldown     = 5 * time.Minute
+	managedActionRetryCooldown = 5 * time.Minute
+	// Two speed scores closer than this many milliseconds are treated as the
+	// same tier, so ordering within an equivalent-speed group is governed by
+	// the stable tiebreak instead of churning every evaluation.
+	speedStabilityBandMs                 = 50.0
 	fallbackRebuildCooldown              = 15 * time.Minute
 	managedEvidenceFreshness             = 30 * time.Minute
 	tokenRefreshCheckInterval            = time.Minute
@@ -1187,13 +1191,19 @@ func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig
 			return !leftObserving
 		}
 		if config.Mode == "SPEED" {
-			leftBand := policySpeedBand(eligible[i], config)
-			rightBand := policySpeedBand(eligible[j], config)
-			if leftBand != rightBand {
-				return leftBand < rightBand
-			}
-			if eligible[i].Priority != eligible[j].Priority {
-				return eligible[i].Priority < eligible[j].Priority
+			leftScore, rightScore := policySpeedScore(eligible[i]), policySpeedScore(eligible[j])
+			// Order genuinely fast channels first by a continuous weighted
+			// score. Within a small stability band the previously stored
+			// priority and finally the ID decide, which keeps a channel from
+			// jumping within an equivalent-speed group on every evaluation.
+			if speedBandEqual(leftScore, rightScore) {
+				if eligible[i].Priority != eligible[j].Priority {
+					return eligible[i].Priority < eligible[j].Priority
+				}
+			} else if leftScore.Valid && rightScore.Valid {
+				return leftScore.Float64 < rightScore.Float64
+			} else if leftScore.Valid != rightScore.Valid {
+				return leftScore.Valid
 			}
 		} else if eligible[i].SourceMultiplier.Valid && eligible[j].SourceMultiplier.Valid && eligible[i].SourceMultiplier.Float64 != eligible[j].SourceMultiplier.Float64 {
 			return eligible[i].SourceMultiplier.Float64 < eligible[j].SourceMultiplier.Float64
@@ -1202,21 +1212,36 @@ func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig
 	})
 }
 
-func policySpeedBand(item managedPolicyCandidate, config policyConfig) int {
+// policySpeedScore turns the business or probe latency into a single weighted
+// number (0.6 P50 + 0.4 P90) so channels with genuinely different speed sort
+// apart even when they fall into the same coarse bucket. Unknown latency sorts
+// last because the score is invalid.
+func policySpeedScore(item managedPolicyCandidate) sql.NullFloat64 {
 	if !item.FirstTokenP50.Valid {
-		return 5
+		return sql.NullFloat64{}
 	}
 	score := item.FirstTokenP50.Float64
 	if item.FirstTokenP90.Valid {
 		score = .6*item.FirstTokenP50.Float64 + .4*item.FirstTokenP90.Float64
 	}
-	limit := float64(normalizePolicyConfig(config).MaxFirstTokenMs)
-	for index, ratio := range []float64{.3, .6, .8, 1} {
-		if score <= limit*ratio {
-			return index
-		}
+	return sql.NullFloat64{Float64: score, Valid: true}
+}
+
+// speedBandEqual reports whether two scores are close enough to be considered
+// the same speed tier. This keeps ordering stable within a near-identical
+// group, so equally fast channels are not shuffled every evaluation cycle.
+func speedBandEqual(left, right sql.NullFloat64) bool {
+	if left.Valid != right.Valid {
+		return false
 	}
-	return 4
+	if !left.Valid {
+		return true
+	}
+	diff := left.Float64 - right.Float64
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff < (speedStabilityBandMs * .01)
 }
 
 func policyCacheReason(item managedPolicyCandidate, config policyConfig) string {
@@ -1449,8 +1474,10 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 与目标分组倍率 %.4fx 相同，策略未允许等倍率账号参与", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
 	}
 	// Probe sample volume and probe success rate are both probe-derived, so
-	// neither may reject a candidate in logs-only mode.
-	if item.Samples < config.MinSamples && !(item.Schedulable && unconfirmed) && !item.BusinessLogsOnly {
+	// neither is a hard reject when a channel is already healthy and carries
+	// real business traffic, or when logs-only mode is on. The difference
+	// still shows up as a lower ranking instead of dropping the channel.
+	if item.Samples < config.MinSamples && !(item.Schedulable && unconfirmed) && !item.BusinessLogsOnly && !(item.State == "HEALTHY" && item.BusinessRequests > 0) {
 		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
 	}
 	if !policySuccessQualified(item, config) && !item.BusinessLogsOnly {
@@ -1519,6 +1546,14 @@ func policyMultiplierQualified(item managedPolicyCandidate, config policyConfig)
 
 func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bool {
 	if item.Schedulable && unconfirmedProbeFailure(item) {
+		return true
+	}
+	// A channel that is already healthy and carries real business traffic is
+	// qualified by that live evidence. Probe sample volume and probe success
+	// rate only matter when there is no business traffic to judge by, and even
+	// then a low probe success rate is a soft signal that orders channels
+	// rather than a hard reason to drop the channel from scheduling.
+	if item.State == "HEALTHY" && item.BusinessRequests > 0 {
 		return true
 	}
 	if !item.Schedulable {

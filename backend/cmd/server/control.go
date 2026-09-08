@@ -745,8 +745,8 @@ func normalizePolicyConfig(config policyConfig) policyConfig {
 	if config.PriorityStart < 1 {
 		config.PriorityStart = 1000
 	}
-	if config.PriorityStep < 1000 {
-		config.PriorityStep = 1000
+	if config.PriorityStep < 100 {
+		config.PriorityStep = 100
 	}
 	if config.CacheMode != cacheModeObserve && config.CacheMode != cacheModeDeprioritize {
 		config.CacheMode = cacheModeOff
@@ -787,8 +787,8 @@ func (a *App) validatePolicyProbeModel(ctx context.Context, scopeID string, conf
 	if config.PriorityStart < 1 || config.PriorityStart > 1_000_000 {
 		return config, &apiError{400, "INVALID_PRIORITY_START", "优先级起点需要设置为 1 至 1000000"}
 	}
-	if config.PriorityStep < 1000 || config.PriorityStep > 1_000_000 {
-		return config, &apiError{400, "INVALID_PRIORITY_STEP", "优先级间隔需要设置为 1000 至 1000000"}
+	if config.PriorityStep < 100 || config.PriorityStep > 1_000_000 {
+		return config, &apiError{400, "INVALID_PRIORITY_STEP", "优先级间隔需要设置为 100 至 1000000"}
 	}
 	if config.CacheMinRequests < 1 || config.CacheMinRequests > 10000 {
 		return config, &apiError{400, "INVALID_CACHE_REQUESTS", "缓存最少请求数需要设置为 1 至 10000"}

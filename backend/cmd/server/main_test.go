@@ -1298,7 +1298,7 @@ func TestRankManagedAccountsByPriceFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 120),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "PRICE", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["cheap"] != 1000 || priorities["middle"] != 2000 || priorities["expensive"] != 3000 {
+	if priorities["cheap"] != 1000 || priorities["middle"] != 1100 || priorities["expensive"] != 1200 {
 		t.Fatalf("unexpected price ranking: %#v", priorities)
 	}
 }
@@ -1310,7 +1310,7 @@ func TestRankManagedAccountsBySpeedFromPriority1000(t *testing.T) {
 		eligiblePolicyCandidate("middle", .5, 5_000),
 	}
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["fast"] != 1000 || priorities["middle"] != 2000 || priorities["slow"] != 3000 {
+	if priorities["fast"] != 1000 || priorities["middle"] != 1100 || priorities["slow"] != 1200 {
 		t.Fatalf("unexpected speed ranking: %#v", priorities)
 	}
 }
@@ -1329,7 +1329,7 @@ func TestRankManagedAccountsDeprioritizesFirstTokenAboveStrategyLimit(t *testing
 	slow := eligiblePolicyCandidate("slow", .1, 12_000)
 	items = append(items, slow)
 	priorities := rankManagedAccounts(items, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: 10_000, MinAvailableChannels: 5})
-	if priorities["fast-1"] != 1000 || priorities["fast-5"] != 5000 {
+	if priorities["fast-1"] != 1000 || priorities["fast-5"] != 1400 {
 		t.Fatalf("unexpected normal priorities: %#v", priorities)
 	}
 	if priorities["slow"] != fallbackPriorityStart {
@@ -1427,7 +1427,7 @@ func TestRankManagedAccountsBySpeedPutsUnknownBusinessLatencyLast(t *testing.T) 
 	unknown.FirstTokenP50 = sql.NullFloat64{}
 	unknown.FirstTokenP90 = sql.NullFloat64{}
 	priorities := rankManagedAccounts([]managedPolicyCandidate{unknown, known}, policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5})
-	if priorities["known"] != 1000 || priorities["unknown"] != 2000 {
+	if priorities["known"] != 1000 || priorities["unknown"] != 1100 {
 		t.Fatalf("unknown real-business latency was not ranked last: %#v", priorities)
 	}
 }
