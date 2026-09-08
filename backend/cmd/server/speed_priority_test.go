@@ -160,3 +160,56 @@ func TestBusinessConfirmedFailureStillRejectsDespiteRelaxation(t *testing.T) {
 		t.Fatal("a business-confirmed failure was allowed to schedule")
 	}
 }
+
+// sync_status describes the control plane: it turns FAILED when writing
+// schedulable/priority/multiplier or the model mapping to the target node
+// failed. That must not park a channel that is demonstrably still serving
+// requests, because live traffic proves the remote account exists and works.
+func TestSyncFailedKeepsSchedulingWhenBusinessTrafficProvesTheAccountWorks(t *testing.T) {
+	config := policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: defaultPolicyMaxFirstTokenMs}
+	item := speedRankCandidate("sync-failed-with-traffic", 400, 500, 1000)
+	item.SyncStatus = "FAILED"
+	item.BusinessRequests = 180
+	item.BusinessErrors = 2
+
+	if syncStatusBlocksScheduling(item) {
+		t.Fatal("sync FAILED blocked a channel that is carrying real business traffic")
+	}
+	if reasons := policyRejectionReasons(item, config); len(reasons) != 0 {
+		t.Fatalf("sync FAILED rejected a channel with live traffic: %v", reasons)
+	}
+	// It must also be allowed to take a real scheduling slot.
+	priorities := planManagedAccounts([]managedPolicyCandidate{item}, normalizePolicyConfig(config)).Priorities
+	if _, planned := priorities[item.ID]; !planned {
+		t.Fatalf("sync FAILED channel with traffic was left out of the plan: %#v", priorities)
+	}
+}
+
+// With no business traffic there is no evidence the remote account still
+// exists, which is the genuinely fatal cause behind a FAILED status, so the
+// channel stays out of scheduling.
+func TestSyncFailedStillBlocksWithoutBusinessTraffic(t *testing.T) {
+	config := policyConfig{Mode: "SPEED", MinSuccessRate: 95, MinSamples: 5, MaxFirstTokenMs: defaultPolicyMaxFirstTokenMs}
+	item := speedRankCandidate("sync-failed-idle", 400, 500, 1000)
+	item.SyncStatus = "FAILED"
+	item.BusinessRequests = 0
+
+	if !syncStatusBlocksScheduling(item) {
+		t.Fatal("sync FAILED without any business traffic was allowed to schedule")
+	}
+	reasons := policyRejectionReasons(item, config)
+	if len(reasons) == 0 {
+		t.Fatal("sync FAILED without traffic produced no rejection reason")
+	}
+}
+
+func TestSyncedAndEmptyStatusNeverBlockScheduling(t *testing.T) {
+	for _, status := range []string{"", "SYNCED"} {
+		item := speedRankCandidate("status-"+status, 400, 500, 1000)
+		item.SyncStatus = status
+		item.BusinessRequests = 0
+		if syncStatusBlocksScheduling(item) {
+			t.Fatalf("status %q blocked scheduling", status)
+		}
+	}
+}

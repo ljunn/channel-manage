@@ -385,7 +385,7 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || (item.SyncStatus != "" && item.SyncStatus != "SYNCED") || item.BusinessConfirmedFailure || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || syncStatusBlocksScheduling(item) || item.BusinessConfirmedFailure || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
 		return false
 	}
 	// A probe is the recovery mechanism in logs-only mode, so a probe-derived
@@ -643,7 +643,7 @@ func calculateDynamicMultiplier(items []managedPolicyCandidate, config policyCon
 
 func dynamicMultiplierCandidate(item managedPolicyCandidate, config policyConfig) bool {
 	config = normalizePolicyConfig(config)
-	if !item.SourceMultiplier.Valid || item.State != "HEALTHY" || item.SyncStatus != "SYNCED" {
+	if !item.SourceMultiplier.Valid || item.State != "HEALTHY" || syncStatusBlocksScheduling(item) {
 		return false
 	}
 	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || item.State == "MANUAL_HOLD" {
@@ -1212,6 +1212,22 @@ func sortPolicyCandidates(eligible []managedPolicyCandidate, config policyConfig
 	})
 }
 
+// syncStatusBlocksScheduling reports whether a non-SYNCED managed account must
+// stay out of scheduling. sync_status describes the control plane: it turns
+// FAILED when this system could not write schedulable/priority/multiplier or
+// the model mapping to the target node. That says nothing about whether the
+// channel can still serve requests, so live business traffic overrides it.
+//
+// Real traffic is also the evidence that the remote account still exists, which
+// is the one genuinely fatal cause behind a FAILED status. A deleted remote
+// account cannot carry traffic, so it stays blocked here.
+func syncStatusBlocksScheduling(item managedPolicyCandidate) bool {
+	if item.SyncStatus == "" || item.SyncStatus == "SYNCED" {
+		return false
+	}
+	return item.BusinessRequests <= 0
+}
+
 // policySpeedScore turns the business or probe latency into a single weighted
 // number (0.6 P50 + 0.4 P90) so channels with genuinely different speed sort
 // apart even when they fall into the same coarse bucket. Unknown latency sorts
@@ -1423,8 +1439,8 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	if item.SourcePaused {
 		reasons = append(reasons, "数据源已人工暂停调度")
 	}
-	if item.SyncStatus != "" && item.SyncStatus != "SYNCED" {
-		reasons = append(reasons, "托管账号同步状态为 "+item.SyncStatus+"，暂停调度")
+	if syncStatusBlocksScheduling(item) {
+		reasons = append(reasons, "托管账号同步状态为 "+item.SyncStatus+"，且没有真实业务流量，暂停调度")
 	}
 	if item.SourceScanBlocked {
 		reasons = append(reasons, item.SourceScanBlockReason)
