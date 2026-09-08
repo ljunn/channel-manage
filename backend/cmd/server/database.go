@@ -403,6 +403,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		"balance_alert_threshold":         "10",
 		modelQualityProbeModelSetting:     "\"gpt-5.6-sol\"",
 		poolModeRetryStatusCodesSetting:   "\"401,403,429\"",
+		"business_logs_only":              "false",
 	}
 	for key, value := range defaults {
 		if _, err := db.ExecContext(ctx, `INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING`, key, value); err != nil {

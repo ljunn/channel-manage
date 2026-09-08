@@ -381,7 +381,12 @@ func fastProbeIntervalFor(item managedPolicyCandidate) int {
 }
 
 func candidateCanRecoverWithProbe(item managedPolicyCandidate, config policyConfig) bool {
-	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || (item.SyncStatus != "" && item.SyncStatus != "SYNCED") || item.BusinessConfirmedFailure || probeFailureRequiresImmediateIsolation(item.StateReason) || item.State == "MANUAL_HOLD" || modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || (item.SyncStatus != "" && item.SyncStatus != "SYNCED") || item.BusinessConfirmedFailure || item.State == "MANUAL_HOLD" || !policyMultiplierQualified(item, config) || !policyHasAllowedModels(item, config) {
+		return false
+	}
+	// A probe is the recovery mechanism in logs-only mode, so a probe-derived
+	// hold must not be the thing that stops it from running.
+	if !item.BusinessLogsOnly && (probeFailureRequiresImmediateIsolation(item.StateReason) || modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride)) {
 		return false
 	}
 	return item.LatencyState == latencyStateSlow || item.Samples < config.MinSamples || item.State != "HEALTHY" || !policySuccessQualified(item, config)
@@ -640,7 +645,7 @@ func dynamicMultiplierCandidate(item managedPolicyCandidate, config policyConfig
 	if item.SourceUntrusted || item.SourcePaused || item.SourceScanBlocked || item.State == "MANUAL_HOLD" {
 		return false
 	}
-	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
+	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) && !item.BusinessLogsOnly {
 		return false
 	}
 	if !policyHasAllowedModels(item, config) || item.LatencyState == latencyStateSlow {
@@ -751,6 +756,10 @@ type managedPolicyCandidate struct {
 	BusinessRequests, BusinessErrors, PreviousBusinessRequests, PreviousBusinessErrors int
 	ConfirmationFailures                                                               int
 	TransientConfirmationFailures                                                      int
+	// BusinessLogsOnly suppresses every probe-derived negative gate: the
+	// candidate is judged solely on business-log evidence while a successful
+	// probe may still clear a probe-derived hold.
+	BusinessLogsOnly bool
 }
 
 const policyMetricWindowDays = 7
@@ -762,6 +771,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 	}
 	businessMinSamples := a.settingInt(ctx, "min_error_samples", 5)
 	businessErrorThreshold := a.settingInt(ctx, "error_rate_threshold", 20)
+	businessLogsOnly := a.businessLogsOnly(ctx)
 	rows, err := a.db.QueryContext(ctx, `SELECT m.id,c.id,COALESCE(min(tg.id::text),''),m.remote_id,m.remote_name,min(s.name),min(t.name),m.schedulable,m.fallback_active,m.priority,m.sync_status,c.lifecycle_state,c.state_reason,c.model_check_required,c.model_check_status,c.model_check_override,c.model_check_score,c.model_check_reason,c.model_check_model,c.consecutive_failures,COALESCE(sg.name,''),COALESCE(string_agg(tg.name,'、' ORDER BY tg.name),''),sg.multiplier,min(tg.multiplier),m.platform,min(k.models::text),bool_or(s.manually_untrusted),bool_or(s.scheduling_paused),
 		(SELECT count(*) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
 		(SELECT avg(CASE WHEN p.success THEN 100.0 ELSE 0 END) FROM probe_runs p WHERE p.channel_id=c.id AND p.started_at>now()-$1 * interval '1 day'),
@@ -822,6 +832,7 @@ func (a *App) managedPolicyCandidates(ctx context.Context) ([]managedPolicyCandi
 		item.SourceScanBlockReason = sourceSchedulingBlockReason(item.SourceStatus, item.SourceScanStatus, item.SourceLastError, item.SourceLastSuccessfulScanAt, item.SourceScanIntervalSeconds, time.Now())
 		item.SourceScanBlocked = item.SourceScanBlockReason != ""
 		item.BusinessConfirmedFailure = businessErrorConfirmedAcrossWindows(item.BusinessRequests, item.BusinessErrors, item.PreviousBusinessRequests, item.PreviousBusinessErrors, businessMinSamples, businessErrorThreshold)
+		item.BusinessLogsOnly = businessLogsOnly
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -1018,6 +1029,11 @@ func nextManagedLatencyState(item managedPolicyCandidate, config policyConfig, n
 	bad := p50 > limit || p90 > limit
 	severe := requiredBadSnapshots == latencyBadSnapshots && (p50 >= 1.5*limit || p90 >= 1.5*limit)
 	good := p50 < .8*limit && p90 < .8*limit
+	if item.BusinessLogsOnly && !useBusiness && !good {
+		// A probe observation may only lift a slow hold in logs-only mode. A bad
+		// or middling probe sample leaves the business-derived state untouched.
+		return before, false
+	}
 	item.LatencyEvaluatedAt = sql.NullTime{Time: observationAt, Valid: true}
 	switch {
 	case bad:
@@ -1303,6 +1319,11 @@ func sourceScanErrorRequiresAction(message string) bool {
 }
 
 func managedProbeFailureBlocksScheduling(item managedPolicyCandidate) bool {
+	// In logs-only mode the probe is used purely for recovery and never blocks
+	// scheduling on its own; a confirmed business-log failure still does.
+	if item.BusinessLogsOnly {
+		return item.BusinessConfirmedFailure
+	}
 	if item.BusinessConfirmedFailure || probeFailureRequiresImmediateIsolation(item.StateReason) {
 		return true
 	}
@@ -1383,7 +1404,7 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	if item.SourceScanBlocked {
 		reasons = append(reasons, item.SourceScanBlockReason)
 	}
-	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) {
+	if modelQualityBlocksSchedulingFor(item.ModelCheckStatus, item.ModelCheckRequired, item.ModelCheckOverride) && !item.BusinessLogsOnly {
 		switch item.ModelCheckStatus {
 		case modelCheckPending:
 			reasons = append(reasons, "等待模型能力检测")
@@ -1398,7 +1419,9 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 		}
 	}
 	unconfirmed := unconfirmedProbeFailure(item)
-	if item.State != "HEALTHY" && !unconfirmed {
+	// A non-HEALTHY state produced by a probe is not a rejection reason in
+	// logs-only mode; a manual hold still is.
+	if item.State != "HEALTHY" && !unconfirmed && (!item.BusinessLogsOnly || item.State == "MANUAL_HOLD") {
 		reasons = append(reasons, "渠道状态为 "+item.State+"："+item.StateReason)
 	}
 	if !policyHasAllowedModels(item, config) {
@@ -1425,10 +1448,12 @@ func policyRejectionReasons(item managedPolicyCandidate, config policyConfig) []
 	} else if !config.AllowEqualMultiplier && item.SourceMultiplier.Float64 >= item.TargetMultiplier.Float64-multiplierComparisonTolerance {
 		reasons = append(reasons, fmt.Sprintf("源分组倍率 %.4fx 与目标分组倍率 %.4fx 相同，策略未允许等倍率账号参与", item.SourceMultiplier.Float64, item.TargetMultiplier.Float64))
 	}
-	if item.Samples < config.MinSamples && !(item.Schedulable && unconfirmed) {
+	// Probe sample volume and probe success rate are both probe-derived, so
+	// neither may reject a candidate in logs-only mode.
+	if item.Samples < config.MinSamples && !(item.Schedulable && unconfirmed) && !item.BusinessLogsOnly {
 		reasons = append(reasons, fmt.Sprintf("有效样本 %d 少于 %d", item.Samples, config.MinSamples))
 	}
-	if !policySuccessQualified(item, config) {
+	if !policySuccessQualified(item, config) && !item.BusinessLogsOnly {
 		actual := "暂无"
 		if item.SuccessRate.Valid {
 			actual = fmt.Sprintf("%.1f%%", item.SuccessRate.Float64)
@@ -1503,6 +1528,11 @@ func policySuccessQualified(item managedPolicyCandidate, config policyConfig) bo
 }
 
 func unconfirmedProbeFailure(item managedPolicyCandidate) bool {
+	// In logs-only mode a probe sample is never enough to qualify a channel on
+	// its own; only business-log evidence may do so.
+	if item.BusinessLogsOnly {
+		return false
+	}
 	limit := item.ConfirmationFailures
 	if probeFailureIsTransient(item.StateReason) && item.TransientConfirmationFailures > limit {
 		limit = item.TransientConfirmationFailures

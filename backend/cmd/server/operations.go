@@ -208,10 +208,17 @@ func (a *App) probeChannel(ctx context.Context, id string) error {
 			FROM metric_buckets WHERE channel_id=$1 AND managed_account_id IS NULL`, id, windowMinutes).Scan(&businessRequests, &businessErrors, &previousBusinessRequests, &previousBusinessErrors)
 		businessConfirmed = businessErrorConfirmedAcrossWindows(businessRequests, businessErrors, previousBusinessRequests, previousBusinessErrors, minSamples, errorThreshold)
 	}
-	if state == "MANUAL_HOLD" || qualityOwnsHealth {
-		// Health samples are retained, but a quality gate owns the lifecycle until
-		// it reaches a clear verdict or an administrator explicitly overrides it.
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+	logsOnly := a.businessLogsOnly(ctx)
+	if state == "MANUAL_HOLD" || qualityOwnsHealth || logsOnly {
+		// A probe in logs-only mode is a pure recovery signal: it records the
+		// sample but never drives a negative lifecycle transition. Business-log
+		// evidence and manual holds keep ownership. A successful sample is still
+		// allowed to clear a probe-derived hold and restore the channel.
+		if success {
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason=$2,score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=CASE WHEN lifecycle_state='HEALTHY' THEN state_changed_at ELSE now() END WHERE id=$1 AND lifecycle_state<>'MANUAL_HOLD'`, id, "最近流式抽样成功")
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+		}
 	} else if slowFirstToken && !managed {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='QUARANTINED',state_reason=$2,score=0,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, slowFirstTokenReason(latency))
 	} else if success && skippedActiveProbe {
@@ -759,7 +766,7 @@ func (a *App) updateChannelState(w http.ResponseWriter, r *http.Request, id, act
 		} else if err != nil {
 			return err
 		}
-		if modelQualityBlocksSchedulingFor(qualityStatus, qualityRequired, qualityOverride) {
+		if modelQualityBlocksSchedulingFor(qualityStatus, qualityRequired, qualityOverride) && !a.businessLogsOnly(r.Context()) {
 			return &apiError{409, "MODEL_CHECK_REQUIRED", "该渠道仍受模型能力检测闸门限制，请先手动检测或人工强制通过"}
 		}
 		_, err := a.db.ExecContext(r.Context(), `UPDATE channels SET lifecycle_state='VALIDATING',state_reason='等待重新验证',consecutive_failures=0,state_changed_at=now() WHERE id=$1`, id)

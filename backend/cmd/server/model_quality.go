@@ -523,6 +523,11 @@ func (a *App) modelQualitySemaphore() chan struct{} {
 }
 
 func (a *App) queueNewModelChecks(ids []string) {
+	// Logs-only mode drops the automatic new-channel gate entirely. An operator
+	// can still start a check by hand from the channel radar.
+	if len(ids) > 0 && a.businessLogsOnly(context.Background()) {
+		return
+	}
 	for _, id := range ids {
 		id := id
 		go func() {

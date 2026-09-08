@@ -1206,6 +1206,7 @@ func (a *App) saveSettings(w http.ResponseWriter, r *http.Request) error {
 		"balance_alert_threshold":       true,
 		modelQualityProbeModelSetting:   true,
 		poolModeRetryStatusCodesSetting: true,
+		"business_logs_only":            true,
 	}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1302,6 +1303,17 @@ func (a *App) settingFloat(ctx context.Context, key string, fallback float64) fl
 	value, err := strconv.ParseFloat(strings.Trim(raw, `"`), 64)
 	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
+	}
+	return value
+}
+
+// businessLogsOnly reports whether active probing and the model-capability gate
+// must not produce negative judgments. Probes still run and recover a channel
+// on success, but decisions are driven by real business log evidence.
+func (a *App) businessLogsOnly(ctx context.Context) bool {
+	value, err := a.settingBool(ctx, "business_logs_only")
+	if err != nil {
+		return false
 	}
 	return value
 }

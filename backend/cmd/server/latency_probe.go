@@ -177,8 +177,15 @@ func (a *App) probeSlowFirstTokenRecovery(ctx context.Context, id, sourceID, sou
 		}
 	}
 	recovered := success && recoverySuccesses >= recoverySuccessSamples
-	if currentState == "MANUAL_HOLD" || qualityOwnsHealth {
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+	logsOnly := a.businessLogsOnly(ctx)
+	if currentState == "MANUAL_HOLD" || qualityOwnsHealth || logsOnly {
+		// In logs-only mode the probe only recovers: it clears a probe-derived
+		// slow hold on success and never pairs a failed sample with a quarantine.
+		if recovered {
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason=$2,score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, fmt.Sprintf("真实业务首 Token 连续 %d 次抽样通过，已恢复", recoverySuccessSamples))
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE channels SET last_probe_at=now() WHERE id=$1`, id)
+		}
 	} else if recovered {
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET lifecycle_state='HEALTHY',state_reason=$2,score=100,consecutive_failures=0,last_probe_at=now(),state_changed_at=now() WHERE id=$1`, id, fmt.Sprintf("真实业务首 Token 连续 %d 次抽样通过，已恢复", recoverySuccessSamples))
 	} else if success {
